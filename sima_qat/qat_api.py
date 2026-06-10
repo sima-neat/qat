@@ -32,13 +32,24 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 import torch
 from packaging import version
 
-if (version.parse(torch.__version__) < version.parse("2.3.0") or 
-    version.parse(torch.__version__) >= version.parse("2.4.0")):
-    raise RuntimeError(f"Sima QAT only supports torch version 2.3.0 or 2.3.1, found {torch.__version__}")
+if (version.parse(torch.__version__) < version.parse("2.3.0") or
+    version.parse(torch.__version__) >= version.parse("2.9.0")):
+    raise RuntimeError(f"Sima QAT only supports torch version 2.3.x through 2.8.x, found {torch.__version__}")
 
 from torch import optim, nn, utils, Tensor
 
-from torch._export import capture_pre_autograd_graph
+try:
+    # torch <= 2.4: pre-autograd capture lives here.
+    from torch._export import capture_pre_autograd_graph as _capture_pre_autograd_graph
+
+    def _export_training_graph(mod, inputs):
+        return _capture_pre_autograd_graph(mod, inputs)
+except ImportError:
+    # torch >= 2.5: capture_pre_autograd_graph was removed in favor of export_for_training.
+    from torch.export import export_for_training as _export_for_training
+
+    def _export_training_graph(mod, inputs):
+        return _export_for_training(mod, inputs).module()
 from torch.ao.quantization.quantize_pt2e import (
   prepare_qat_pt2e,
   convert_pt2e,
@@ -91,7 +102,7 @@ def sima_prepare_qat_model(input_graph: nn.Module, inputs: Tuple, device: torch.
     # We have to move things to the CPU to do the scaffolding. We will return the model to the proper
     # device when we are done.
     input_graph.to("cpu")
-    m = capture_pre_autograd_graph(input_graph, inputs)
+    m = _export_training_graph(input_graph, inputs)
     m = replace_dropout(m)
 
     cfg = get_sima_quantization_config(is_qat=True)
@@ -103,6 +114,27 @@ def sima_prepare_qat_model(input_graph: nn.Module, inputs: Tuple, device: torch.
     sima_mod = check_graph_nodes(sima_mod, device)
 
     return sima_mod
+
+
+def _ensure_bn_tracking_meta(gm: GraphModule) -> None:
+    """torch >= 2.8 `convert_pt2e` QAT bn-folding reads `node.meta["source_fn_stack"]`
+    on the BatchNorm `num_batches_tracked += 1` in-place add nodes, but graphs produced
+    by `export_for_training` don't always populate it -> KeyError. Those nodes have the
+    shape `aten.add_.Tensor(get_attr, 1)`; tag them so torch's loop erases them (its
+    intent for BN tracking nodes)."""
+    if not hasattr(gm, "graph"):
+        return
+    bn_tag = [("bn_num_batches_tracked", torch.nn.modules.batchnorm.BatchNorm2d)]
+    for node in gm.graph.nodes:
+        if (
+            node.op == "call_function"
+            and node.target == torch.ops.aten.add_.Tensor
+            and len(node.args) >= 2
+            and getattr(node.args[0], "op", None) == "get_attr"
+            and node.args[1] == 1
+            and "source_fn_stack" not in node.meta
+        ):
+            node.meta["source_fn_stack"] = bn_tag
 
 
 def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
@@ -123,6 +155,7 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
     if not isinstance(qat_model, GraphModule):
         return qat_model
     print(f"Removing QAT scaffold and quantizing network ...")
+    _ensure_bn_tracking_meta(qat_model)
     m = convert_pt2e(qat_model, use_reference_representation=False)
     sima_mod = SimaQatWrapper(source=m, label='fq')
     # We must call eval() to invoke internal functions to put the GraphModule in eval state. Once we are

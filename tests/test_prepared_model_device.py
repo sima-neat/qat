@@ -114,7 +114,7 @@ def test_prepared_model_device(model: torch.nn.Module):
     prepared_model.train(False)
             
     finalized_model = sima_finalize_qat_model(prepared_model)
-    post_export_model = sima_export_onnx(qat_model=finalized_model, inputs=example_inputs, output_file='exported_model.onnx', device='cuda')
+    post_export_model = sima_export_onnx(qat_model=finalized_model, inputs=example_inputs, output_file='prepared_model_device.onnx', device='cuda')
     
     for n in post_export_model.graph.nodes:
         #check for parameters not being in the same device as the model

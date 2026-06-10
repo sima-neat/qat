@@ -30,10 +30,11 @@
 import copy
 import torch
 
-from sima_qat.qat_api import (sima_prepare_qat_model, 
-                              sima_finalize_qat_model, 
-                              sima_export_onnx, 
-                              convert_pt2e, 
+from sima_qat.qat_api import (sima_prepare_qat_model,
+                              sima_finalize_qat_model,
+                              sima_export_onnx,
+                              convert_pt2e,
+                              _ensure_bn_tracking_meta,
                               SimaQatWrapper)
 
 import pytest
@@ -51,6 +52,7 @@ class Model(torch.nn.Module):
 
 def sima_finalize_qat_model_no_bn_replacement(qat_model: torch.fx.GraphModule) -> torch.nn.Module:
     assert isinstance(qat_model, torch.nn.Module)
+    _ensure_bn_tracking_meta(qat_model)
     m = convert_pt2e(qat_model, use_reference_representation=False)
     sima_mod = SimaQatWrapper(source=m, label='fq')
     sima_mod.eval()
@@ -82,4 +84,4 @@ def test_batchnorm_replacement(model: torch.nn.Module):
     for node in converted_model_replaced_bn.graph.nodes:
         assert (node.target not in [torch.ops.aten._native_batch_norm_legit_no_training.default])
     
-    sima_export_onnx(converted_model_replaced_bn, example_inputs, 'test_export.onnx')
+    sima_export_onnx(converted_model_replaced_bn, example_inputs, 'batchnorm_replacement.onnx')

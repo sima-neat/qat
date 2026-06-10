@@ -77,10 +77,10 @@ def test_fatten_dropout(model: torch.nn.Module):
 
     converted_model = sima_finalize_qat_model(prepared_model)
 
-    sima_export_onnx(converted_model, example_inputs, 'test_export.onnx')
+    sima_export_onnx(converted_model, example_inputs, 'flatten_dropout.onnx')
 
     #check if onnx model has two consecutive QDQs because of dropout not being handled
-    model = onnx.load('test_export.onnx')
+    model = onnx.load('flatten_dropout.onnx')
     for node in model.graph.node:
         if node.op_type == 'DequantizeLinear':
             is_last_node = any(node.output[0] == x.name for x in list(model.graph.output))

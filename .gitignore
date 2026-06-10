@@ -1,0 +1,5 @@
+*.pyc
+*.log
+*.onnx
+data/
+exported_models/

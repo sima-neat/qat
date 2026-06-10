@@ -40,7 +40,16 @@ from torch.onnx import (
 )
 
 
-from torch.onnx._internal import _beartype, jit_utils, registration
+from torch.onnx._internal import jit_utils, registration
+try:
+    from torch.onnx._internal import _beartype
+except ImportError:
+    # torch >= 2.x removed the internal beartype shim; it was only runtime type
+    # checking on the symbolic functions, so a no-op passthrough is fine.
+    class _beartype:  # noqa: N801
+        @staticmethod
+        def beartype(fn):
+            return fn
 
 
 # Q/DQ operators in ONNX had a major revision at Opset 13. Opset 19 was the next revision,
@@ -88,7 +97,7 @@ def fake_quantize_per_tensor_affine(
 
 
 @_onnx_symbolic("quantized_decomposed::dequantize_per_tensor")
-@symbolic_helper.parse_args("v", "v", "v", "i", "i", "v")
+@symbolic_helper.parse_args("v", "v", "v", "i", "i", "v", "v")
 @_beartype.beartype
 def fake_dequantize_per_tensor_affine(
     g: jit_utils.GraphContext,
@@ -98,6 +107,7 @@ def fake_dequantize_per_tensor_affine(
     quant_min=-128,
     quant_max=127,
     dtype=torch.dtype,
+    out_dtype=None,  # added in torch 2.4 (quantized_decomposed::dequantize_per_tensor); unused here
 ):
     if quant_min == 0:
         zero_point = g.op("Cast", zero_point, to_i=_C_onnx.TensorProtoDataType.UINT8)
@@ -118,7 +128,7 @@ def fake_dequantize_per_tensor_affine(
 
 
 @_onnx_symbolic("quantized_decomposed::dequantize_per_channel")
-@symbolic_helper.parse_args("v", "v", "v", "i", "i", "i", "v")
+@symbolic_helper.parse_args("v", "v", "v", "i", "i", "i", "v", "v")
 @_beartype.beartype
 def fake_quantize_per_channel_affine(
     g: jit_utils.GraphContext,
@@ -129,6 +139,7 @@ def fake_quantize_per_channel_affine(
     quant_min=-128,
     quant_max=127,
     dtype=torch.dtype,
+    out_dtype=None,  # added in torch 2.4 (quantized_decomposed::dequantize_per_channel); unused here
 ):
     # NOTE: (0, 127) is allowed as special case. PyTorch restricts activations to be in the range (0, 127).
     #   https://github.com/pytorch/pytorch/blob/b34b192d6b97325c9f78e5995c48c8498ede34bd/torch/ao/quantization/observer.py#L1422

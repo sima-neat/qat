@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import copy
 import operator
+import warnings
 import functools
 import itertools
 
@@ -86,11 +87,39 @@ from torch.ao.quantization.quantizer.xnnpack_quantizer import (
     _get_module_type_filter,
     _get_not_module_type_or_name_filter,
 )
-from torch.ao.quantization.pt2e.utils import (
-    _conv1d_bn_example_inputs,
-    _conv2d_bn_example_inputs,
-    get_aten_graph_module,
-)
+try:
+    from torch.ao.quantization.pt2e.utils import (
+        _conv1d_bn_example_inputs,
+        _conv2d_bn_example_inputs,
+    )
+except ImportError:
+    # torch >= 2.5 turned these conv-bn example inputs into function-local variables,
+    # so they are no longer importable. They are stable constants -- define them inline.
+    _conv1d_bn_example_inputs = (
+        torch.randn(1, 1, 3),  # x
+        torch.randn(1, 1, 1),  # conv_weight
+        torch.randn(1),        # conv_bias
+        torch.randn(1),        # bn_weight
+        torch.randn(1),        # bn_bias
+        torch.randn(1),        # bn_running_mean
+        torch.randn(1),        # bn_running_var
+    )
+    _conv2d_bn_example_inputs = (
+        torch.randn(1, 1, 3, 3),  # x
+        torch.randn(1, 1, 1, 1),  # conv_weight
+        torch.randn(1),           # conv_bias
+        torch.randn(1),           # bn_weight
+        torch.randn(1),           # bn_bias
+        torch.randn(1),           # bn_running_mean
+        torch.randn(1),           # bn_running_var
+    )
+try:
+    from torch.ao.quantization.pt2e.utils import get_aten_graph_module
+except ImportError:
+    # Renamed in torch 2.4.x
+    from torch.ao.quantization.pt2e.utils import (
+        _get_aten_graph_module_for_pattern as get_aten_graph_module,
+    )
 from torch.fx.passes.utils.matcher_with_name_node_map_utils import (
     SubgraphMatcherWithNameNodeMap,
 )
@@ -382,11 +411,19 @@ class SimaQuantizer(Quantizer):
         if quantization_config is None:
             return model
 
+        ops = []
         if quantization_config.is_qat:
-            for op in self.STATIC_QAT_ONLY_OPS:
-                OP_TO_ANNOTATOR[op](model, quantization_config, filter_fn)
-        for op in self.STATIC_OPS:
-            OP_TO_ANNOTATOR[op](model, quantization_config, filter_fn)
+            ops += self.STATIC_QAT_ONLY_OPS
+        ops += self.STATIC_OPS
+        for op in ops:
+            annotator = OP_TO_ANNOTATOR.get(op)
+            if annotator is None:
+                # Some built-in annotators (e.g. 'max_pool2d') were dropped from the
+                # reference xnnpack quantizer in newer torch. They are shared-qspec
+                # pass-throughs, so skipping leaves the surrounding Q/DQ intact.
+                warnings.warn(f"No annotator registered for '{op}'; skipping.")
+                continue
+            annotator(model, quantization_config, filter_fn)
         return model
 
     def _annotate_for_static_quantization_config(

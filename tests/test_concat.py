@@ -76,10 +76,16 @@ def test_concat(model: torch.nn.Module):
                 scales.append(node.args[1])
 
                 cat_node = [n for n in node.users][0]
-                q_node = [n for n in cat_node.users][0]
-                dq_node = [n for n in q_node.users][0]
+                # On newer torch a graph-terminal cat feeds 'output' directly with no
+                # output re-quantization, so only walk the cat -> quantize -> dequantize
+                # chain when it actually exists.
+                for q_node in cat_node.users:
+                    if 'quantize_per_tensor' not in q_node.name or 'dequantize' in q_node.name:
+                        continue
+                    for dq_node in q_node.users:
+                        if 'dequantize_per_tensor' in dq_node.name and dq_node.args[1] not in scales:
+                            scales.append(dq_node.args[1])
 
-                if dq_node.args[1] not in scales:
-                    scales.append(dq_node.args[1])
-
+    # Concat must preserve distinct per-input quantization scales (not collapse them).
+    assert len(scales) >= 2
     assert not all(x == scales[0] for x in scales)
