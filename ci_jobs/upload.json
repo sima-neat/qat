@@ -1,0 +1,8 @@
+{
+    "files": [
+      {
+        "pattern": "dist/*.whl",
+        "target": "sima-pypi-group/swml-qat/"
+      }
+    ]
+  }

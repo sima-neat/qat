@@ -1,0 +1,78 @@
+#!groovy
+library('sima-jenkins-lib')
+
+def packageStage () {
+  utils.record('pacakge.log') {
+    utils.setPythonBuildEnv([]){
+      sh """#!/bin/bash -ex
+                  rm -rf build dist swml-qat.egg-info || true
+                  python3 setup.py bdist_wheel
+              """
+      archiveArtifacts artifacts: "dist/*.whl", fingerprint: true
+      stash(name: 'dist', includes: 'dist/*.whl')
+    }
+  } // package.log
+} // Package
+
+def testStage() {
+  utils.installArtifactoryCreds('jenkins_user_artifactory')
+  if(!params.PACKAGE_ONLY) {
+    utils.record('test.log') {
+      sh """#!/bin/bash -ex
+            rm -rf .tox
+            tox -v --installpkg dist/*.whl -e premerge
+          """
+      junit healthScaleFactor: 100.0, allowEmptyResults: false, keepLongStdio: true, testResults: "junit-premerge.xml"
+    } // utils.record
+  } // if
+} // testStage
+
+def main() {
+  properties([
+          parameters([
+                  booleanParam(
+                          name: "PACKAGE_ONLY",
+                          defaultValue: utils.isTagBuild(),
+                          description: 'Only package don\'t run tests'
+                  )
+          ])
+  ])
+  node('mla-general-scl') {
+    container("mla-general-scl") {
+      stage("Checkout") {
+        utils.checkoutBitbucket()
+        utils.setBuildMetadataFromVersionIn("VERSION.in")
+      }
+
+      stage ("Package") {
+        packageStage()
+      } // Package
+
+      stage ("Test"){
+        testStage()
+      }
+
+      stage("Upload Python Package") {
+        def art_server = Artifactory.server "sima-artifacts"
+        def rtPip      = Artifactory.newPipBuild()
+        def buildInfo
+        rtPip.resolver repo: 'sima-pypi-group', server: art_server
+        uploadSpec = readFile 'ci_jobs/upload.json'
+        buildInfo = Artifactory.newBuildInfo()
+        buildInfo.env.capture = true
+        art_server.upload buildInfo: buildInfo, spec: uploadSpec
+        art_server.publishBuildInfo buildInfo
+      } // Upload Python Package
+    } // container mla-general-scl
+  } // node
+} // main
+
+utils.job_wrapper({
+  try {
+    main()
+  } catch(e) {
+    if (currentBuild.result == "UNSTABLE" || currentBuild.result == "FAILURE")
+      return
+    error(e)
+  } 
+}, 240)
