@@ -13,11 +13,11 @@ Activate the QAT extension environment first:
 activate-qat
 ```
 
-If QAT is not installed, use the Neat artifact package for the host architecture:
+If QAT is not installed, use the SDK-versioned extension package for the host architecture:
 
 ```bash
-sima-cli neat install qat/tools/qat/amd64
-sima-cli neat install qat/tools/qat/arm64
+sima-cli install -v 2.1.2 tools/qat/amd64
+sima-cli install -v 2.1.2 tools/qat/arm64
 ```
 
 ## Workflow
