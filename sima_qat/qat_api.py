@@ -69,6 +69,24 @@ device_modifier_ops = [
 ]
 
 
+def _get_module_device(module: nn.Module) -> torch.device:
+    for tensor in list(module.parameters()) + list(module.buffers()):
+        return tensor.device
+    return torch.device("cpu")
+
+
+def _move_value_to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, Tensor):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_move_value_to_device(v, device) for v in value)
+    if isinstance(value, list):
+        return [_move_value_to_device(v, device) for v in value]
+    if isinstance(value, dict):
+        return {k: _move_value_to_device(v, device) for k, v in value.items()}
+    return value
+
+
 def sima_prepare_qat_model(input_graph: nn.Module, inputs: Tuple, device: torch.device) -> GraphModule:
     """This function is the first transformation needed to perform QAT on a Pytorch model. It takes an
     eager-mode reference to the ML model and produces an FX version of the graph with special annotations
@@ -155,9 +173,11 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
     if not isinstance(qat_model, GraphModule):
         return qat_model
     print(f"Removing QAT scaffold and quantizing network ...")
+    device = _get_module_device(qat_model)
     _ensure_bn_tracking_meta(qat_model)
     m = convert_pt2e(qat_model, use_reference_representation=False)
     sima_mod = SimaQatWrapper(source=m, label='fq')
+    sima_mod.to(device)
     # We must call eval() to invoke internal functions to put the GraphModule in eval state. Once we are
     # in FQ mode, we always remain in eval mode.
     sima_mod.eval()
@@ -166,7 +186,8 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
 
 
 def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: str, input_names: Optional[List[str]] = None, 
-                     output_names: Optional[List[str]] = None, device: torch.device = 'cuda') -> GraphModule:
+                     output_names: Optional[List[str]] = None,
+                     device: Optional[Union[str, torch.device]] = None) -> GraphModule:
     """This function exports a finalized QAT model to ONNX format.
 
     Args:
@@ -176,13 +197,23 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
         output_file: the path name of the .onnx file to generate.
         input_names: a list of tensor names used to label the ONNX model inputs.
         output_names: a list of tensor names used to label the ONNX model outputs.
+        device: optional device to restore the returned model to after CPU ONNX export.
+            If unset, the model returns to its original device.
     """
     if not isinstance(qat_model, nn.Module):
         raise RuntimeError(f"Input graph to export function must be of type nn.Module, found {type(qat_model)}")
-    qat_model = check_graph_nodes(qat_model, device='cpu')
+
+    original_device = _get_module_device(qat_model)
+    restore_device = torch.device(device) if device is not None else original_device
+    export_device_arg = "cpu"
+    export_device = torch.device(export_device_arg)
+
+    qat_model.to(export_device)
+    export_inputs = _move_value_to_device(inputs, export_device)
+    qat_model = check_graph_nodes(qat_model, device=export_device_arg)
     torch.onnx.export(
         qat_model,
-        inputs[0],
+        export_inputs[0],
         output_file,
         export_params=True,
         opset_version=17,
@@ -190,7 +221,11 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
         input_names = input_names,
         output_names = output_names,
     )
-    qat_model = check_graph_nodes(qat_model, device=device)
+
+    if restore_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Cannot restore exported QAT model to CUDA because CUDA is unavailable.")
+    qat_model.to(restore_device)
+    qat_model = check_graph_nodes(qat_model, device=str(restore_device))
     return qat_model
 
 class SimaQatWrapper(GraphModule):
@@ -233,7 +268,10 @@ class SimaQatWrapper(GraphModule):
         # We use a buffer to store which phase of QAT the current model is in. The phase is
         # set whenever the Sima QAT API is invoked incrementally.
         state_id = self._tag_to_id[label]
-        self.register_buffer("qat_state", torch.tensor([state_id], dtype=torch.int8))
+        self.register_buffer(
+            "qat_state",
+            torch.tensor([state_id], dtype=torch.int8, device=_get_module_device(self)),
+        )
 
     def train(self, use_train: bool = True) -> 'SimaQatWrapper':
         """This function emulates the behavior of train() on nn.Module.

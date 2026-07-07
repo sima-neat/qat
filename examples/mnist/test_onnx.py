@@ -27,9 +27,9 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
-""" Script to load a generated ONNX file and run test samples through it.
-    Dataset loading and iteration uses skimage.io; the rest of 
-    the inference path uses only numpy / sklearn / onnxruntime.
+"""Script to load a generated ONNX file and run MNIST samples through it.
+
+    Dataset loading uses torchvision; the inference path uses numpy and onnxruntime.
 """
 import sys
 import os
@@ -45,7 +45,6 @@ from tqdm import tqdm
 import onnx
 import onnxruntime
 import numpy as np
-import cv2
 
 from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST

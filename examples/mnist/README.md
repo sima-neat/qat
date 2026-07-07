@@ -1,4 +1,4 @@
-# MNIST Classifer example 
+# MNIST Classifier example
 
 This folder contains the following helper files:
 ```

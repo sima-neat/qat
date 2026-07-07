@@ -32,9 +32,9 @@
     Executes the ONNX file in onnxruntime / numpy. 
 """
 import os
+
 import torch
 import torchvision.datasets as datasets
-from torchvision.datasets import ImageNet
 import torchvision.transforms as transforms
 import onnx
 import logging
@@ -48,26 +48,40 @@ from typing import Callable, Dict, List, Iterable
 
 from sima_qat.misc import find_latest_file_string
 
-import lightning as L
+from imagenet_dataset import (
+    apply_imagenet_target_transform,
+    limit_samples_by_class,
+    set_dataset_samples,
+)
+
+import pytorch_lightning as L
+
 
 # Helper class to iterate over ImageNet samples
 class ImageNetIterator(object):
-    """Helper class to iterate over samples in the ImageNet dataset."""
-    
-    def __init__(self, ds_root: str, split: str = 'val') -> None:
+    """Helper class to iterate over ImageNet-style split folders."""
+
+    def __init__(self, ds_root: str, split: str = 'val', samples_limit: int | None = None) -> None:
         transform = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
-        assert os.path.isdir(ds_root)
+        split_dir = os.path.join(ds_root, split)
+        if not os.path.isdir(split_dir):
+            raise FileNotFoundError(
+                f"ImageNet split directory not found: {split_dir}. "
+                f"Expected a dataset layout like {ds_root}/train and {ds_root}/val."
+            )
 
-        self.imagenet_dataset = ImageNet(
-            root=ds_root,
-            split=split,
-            transform=transform,
-        )
+        self.imagenet_dataset = datasets.ImageFolder(split_dir, transform=transform)
+        apply_imagenet_target_transform(self.imagenet_dataset)
+        if samples_limit is not None:
+            set_dataset_samples(
+                self.imagenet_dataset,
+                limit_samples_by_class(self.imagenet_dataset.samples, samples_limit),
+            )
 
     def __len__(self) -> int:
         return len(self.imagenet_dataset)
@@ -157,6 +171,7 @@ def get_args() -> Namespace:
     parser.add_argument("--onnx", type=str, required=False, default=recent_onnx_file, help="The ONNX file containing the ImageNet Model.")
     parser.add_argument("--dsroot", type=str, required=False, default='.', help="Directory for the root of the dataset.")
     parser.add_argument('--split', type=str, default='val', help="Dataset split (test or val).")
+    parser.add_argument('--samples-limit', type=int, default=None, help='Limit evaluation samples to size N')
     parser.add_argument('-v', '--verbosity', type=str, default='INFO', help='Logging verbosity level')
     return parser.parse_args()
 
@@ -165,6 +180,9 @@ def get_args() -> Namespace:
 def main():
     args = get_args()
     logging.getLogger().setLevel(args.verbosity)
+
+    if not args.onnx:
+        raise FileNotFoundError("No ONNX file found. Pass --onnx or run training/export first.")
 
     # Set the global seed to replicate results.
     L.seed_everything(42)
@@ -181,7 +199,7 @@ def main():
     # Load dataset and run accuracy test
     dsroot = os.path.abspath(args.dsroot)
     logging.info(f"Using ImageNet dataset at: {dsroot}")
-    dataset_test = ImageNetIterator(ds_root=dsroot, split=args.split)
+    dataset_test = ImageNetIterator(ds_root=dsroot, split=args.split, samples_limit=args.samples_limit)
 
     ort_session = onnxruntime.InferenceSession(onnxf, sess_opts=None)
     acc = run_accuracy_test(ort_session, dataset_test)

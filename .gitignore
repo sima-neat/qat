@@ -3,3 +3,12 @@
 *.onnx
 data/
 exported_models/
+build/
+dist/
+*.egg-info/
+sima_qat/VERSION
+examples/*/MNIST/
+examples/*/checkpoints/
+examples/*/lightning_logs/
+examples/*/prepare_p2e_graph.txt
+examples/*/post_p2e_graph.txt

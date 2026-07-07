@@ -1,109 +1,142 @@
-# ImageNet Classifer example 
+# ImageNet Classifier Example
 
-This folder contains the following helper files:
-```
+This example fine-tunes a pretrained torchvision ImageNet classifier with the SiMa QAT
+prepare/finalize/export flow, then validates the exported ONNX model with ONNXRuntime.
+
+Files:
+
+```text
 imagenet/
-├── README.md
-├── imagenet_lit.py
-├── train.py
-├── test_onnx.py
-└── export_onnx.py
+  README.md
+  imagenet_lit.py      # Lightning module with QAT hooks
+  train.py             # train / checkpoint / optional export
+  export_onnx.py       # export the latest or selected checkpoint
+  test_onnx.py         # validate an ONNX model on an ImageFolder split
 ```
 
-This example can be used to train any of classifiers available on Torchvision with the ImageNet dataset. 
+## Dataset Layout
 
-## File Descriptions
+The scripts expect an ImageFolder-style dataset root:
 
-- **README.md** : Provides an overview of the example, file structure and descriptions, instructions on usage.
-- **imagenet_lit.py** : Contains the main Lightning module implementation for training and validating the ImageNet Torchvision model using PyTorch Lightning.
-- **train.py**: Script to train the ImageNet Torchvision model. It leverages the Lightning module defined in imagenet_lit.py.
-- **test_onnx.py** : Script to test the ONNX model. This evaluates the exported ONNX model's performance on the test set.
-- **export_onnx.py** : Script to export the the last trained Pytorch checkpoint into the ONNX format, which can be used for running inference on different platforms supporting ONNX.
+```text
+<data-root>/
+  train/
+    <class_name>/
+      image.JPEG
+  val/
+    <class_name>/
+      image.JPEG
+```
 
+For full ImageNet-2012, pass the ImageNet root with `-d /data/imagenet` or
+`--dsroot /data/imagenet`. The training script reads `<data-root>/train`, and
+`test_onnx.py --split val` reads `<data-root>/val`.
 
-## Train ImageNet Torchvision model using QAT
-The training process for the ImageNet Torchvision model uses PyTorch Lightning to streamline the training, checkpointing, and model export. Below is an overview of the key steps involved:
+For a small smoke test, Imagenette already uses this layout and can be downloaded locally:
 
-* Dataset Preparation - 
-Before using this example, it is required to download ImageNet 2012 dataset in a directory and place the split files under the respective train, test, val folders. 
+```bash
+cd examples/imagenet
+mkdir -p data
+curl -L -o data/imagenette2-160.tgz https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-160.tgz
+tar -xzf data/imagenette2-160.tgz -C data
+```
 
-* Training the Model - 
-The training is managed by PyTorch Lightning's Trainer class, which simplifies the training loop, logging, and checkpointing.
-The script `train.py` starts the training process, leveraging the `imagenet_lit.py` pyTorch lightning module, which defines the model, training, validation steps, and metrics.
+## Quick CUDA Smoke Test
 
-* QAT User API Usage -
-The user can directly leverage the `imagenet_lit.py` pyTorch lightning module which internally calls the QAT user APIs. 
-    - The `on_train_start()` hook calls the `sima_prepare_qat_model()` which any Pytorch nn.Module and prepares it for QAT training. 
-    - The `on_train_end()` hook calls the `sima_finalize_qat_model()` which takes a trained QAT model and converts it to a quantized model. It becomes inference-only after this point. 
-    - The `on_fit_end()` hook calls the `sima_export_onnx()` which finalized QAT model and exports a ONNX graph for the same.
+```bash
+cd examples/imagenet
 
-* Training Script Arguments - 
-The training process can be customized using various command-line arguments defined in `train.py`. These arguments allow you to control key aspects of the training, such as the number of epochs, batch size, dataset location, and more. 
+python train.py --model resnet18 -d data/imagenette2-160 -b 64 --device cuda \
+  --samples-limit 64 --epochs 1 --workers 4 --export-on-end
+python export_onnx.py --model resnet18 --device cuda
+python test_onnx.py --onnx exported_ckpt_resnet18_onnx_model.onnx \
+  --dsroot data/imagenette2-160 --split val --samples-limit 50
+```
 
-The Arguments can be found using the `--help` command as below:
-`python train.py --help`
+For a longer smoke run, raise `--samples-limit` to `500`. The Imagenette WNID
+folders are remapped to ImageNet-1K target IDs before training and evaluation.
+For the full ImageNet dataset, use the same commands with `-d /data/imagenet`
+and `--dsroot /data/imagenet`.
 
-Below are the descriptions of the arguments:
+## QAT Flow
 
-| Argument                | Default Value | Description                                                                                                           | Example Usage                     |
-|-------------------------|---------------|-----------------------------------------------------------------------------------------------------------------------|-----------------------------------|
-| `-e, --epochs`          | `10`          | The number of epochs to train the model (i.e., how many times the entire dataset is passed through the model).       | `--epochs 20`                     |
-| `-b, --batch`           | `16`          | Specifies the batch size, which is the number of training samples used in each training iteration. NOTE: Increase the batch size accordingly, as lower batch size may take a really long time to train.                  | `--batch 32`                      |
-| `-d, --data`            | `"."`         | The path where the dataset is located. If not present, the dataset can be downloaded to this path with `--download`. | `--data /path/to/dataset`        |
-| `--model`            | `resnet18`           | The torchvision Imagenet Model to be trained, the pre-trained model is loaded from torchvision.                                      | `--model model_name`                      |
-| `--device`              | `"cpu"`       | The device to use for training: `"mps"` for Apple Silicon GPUs, `"cuda"` for NVIDIA GPUs, or `"cpu"` for CPU.      | `--device cuda`                   |
-| `--samples-limit`       | `1281167`       | Limits the number of training samples used. Useful for testing or debugging with a smaller dataset.                  | `--samples-limit 10000`          |
-| `--export-on-end`       | `False`           | Export the trained model to ONNX format at the end of training.                                                     | `--export-on-end`                 |
-| `--disable-qat`         | `False`           | Disable Quantization Aware Training (QAT), which prepares the model for quantization during training.               | `--disable-qat`                   |
-| `--resume`              | `False`          | Resume training from the most recent checkpoint if available, allowing for interrupted training sessions to continue. | `--resume`                        |
+The Lightning module wires QAT into standard training hooks:
 
-* Example Usage - 
-`python train.py --export-on-end -b 100 --device cuda -d /data/imagenet`
+- `on_train_start()` calls `sima_prepare_qat_model()` to capture the torchvision model and insert QAT scaffolding.
+- `on_train_end()` calls `sima_finalize_qat_model()` to convert the trained graph to inference-only fake-quant form.
+- `on_fit_end()` calls `sima_export_onnx()` when `--export-on-end` is set.
 
-* Checkpoints - 
-During training, the script automatically saves checkpoints at various stages to allow for model recovery and resuming training. These checkpoints are stored in the **checkpoints/** directory by default. 
+`export_onnx.py` can also re-export the latest checkpoint after training.
 
-* ONNX Model Export -
-Once training is complete, the trained model is exported to the ONNX format for compatibility with various inference engines and platforms.
-The script handles this, exporting the final model as `exported_model.onnx`, which is saved in the project directory or a specified location. This format allows for easy deployment in environments that support ONNX.
+## Training Arguments
 
+Run `python train.py --help` for the current CLI.
 
-## Test QAT ONNX model
-The `test_onnx.py` script is used to test a trained ImageNet torchvision model saved in the ONNX format.  
+| Argument | Default | Description |
+|---|---:|---|
+| `-e, --epochs` | `10` | Training epochs. |
+| `-b, --batch` | `1` | Batch size. Use a larger value on CUDA for faster smoke runs. |
+| `-d, --data` | `.` | Dataset root containing `train/` and `val/`. |
+| `--device` | `cpu` | Lightning accelerator/device selector such as `cpu` or `cuda`. |
+| `--model` | `resnet18` | Torchvision ImageNet model name. |
+| `--samples-limit` | `1281167` | Limit training samples with class-balanced selection; useful for smoke tests. |
+| `--workers` | `4` | DataLoader worker processes for train and validation. |
+| `--export-on-end` | `False` | Export ONNX at the end of `trainer.fit()`. |
+| `--disable-qat` | `False` | Train a float baseline instead of QAT. |
+| `--resume` | `False` | Resume from the latest checkpoint under `checkpoints/`. |
 
-Below are the command-line arguments for this script:
+## ONNX Validation Arguments
 
-| Argument                | Default Value       | Description                                                                                                    | Example Usage                        |
-|-------------------------|---------------------|----------------------------------------------------------------------------------------------------------------|--------------------------------------|
-| `--onnx`                | `recent_onnx_file`  | The path to the ONNX file containing the trained ImageNet Torchvision model. The script finds the most recent onnx file and sets it to the name `recent_onnx_file`.                                                 | `--onnx /path/to/model.onnx`         |
-| `--dsroot`              | `.`                 | The root directory of the dataset, used for testing the model.                                                 | `--dsroot /path/to/dataset`          |                       |
-| `--split`              | `val`                 | Dataset split (test or val) to be used for testing.                                                 | `--split val`          |                       |
-| `-v, --verbosity`       | `INFO`              | Sets the logging verbosity level (e.g., DEBUG, INFO, WARNING, ERROR).                                          | `--verbosity DEBUG`                  |
+Run `python test_onnx.py --help` for the current CLI.
 
-The Arguments can also be found using the `--help` command as below:
-`python test_onnx.py --help`
+| Argument | Default | Description |
+|---|---:|---|
+| `--onnx` | latest ONNX | ONNX model to validate. |
+| `--dsroot` | `.` | Dataset root containing split directories. |
+| `--split` | `val` | Dataset split folder to evaluate. |
+| `--samples-limit` | unset | Limit evaluation samples with class-balanced selection; useful for quick smoke tests. |
+| `-v, --verbosity` | `INFO` | Logging level. |
 
-* Example Usage - 
-`python test_onnx.py --dsroot /data/imagenet` 
+Example:
 
+```bash
+python test_onnx.py --onnx exported_ckpt_resnet18_onnx_model.onnx --dsroot data/imagenette2-160 --split val --samples-limit 50
+```
 
-## Export any trained checkpoint to ONNX
-The `export_onnx.py` script is used to export the most recent checkpoint of the trained model to an ONNX file. 
+## Checkpoint Export Arguments
 
-Below are the command-line arguments for this script:
+Run `python export_onnx.py --help` for the current CLI.
 
-| Argument                | Default Value       | Description                                                                                                      | Example Usage                        |
-|-------------------------|---------------------|------------------------------------------------------------------------------------------------------------------|--------------------------------------|
-| `--model`            | required       | Model name to search for in checkpoint files.                                      | `--model model_name`    |
-| `-c, --ckpt`            | `latest_ckpt`       | The path to the checkpoint file to be loaded and exported as an ONNX model.                                      | `--ckpt /path/to/checkpoint.ckpt`    |
-| `--device`              | `cpu`               | The device to use for exporting the model. Options include `"cpu"`, `"cuda"`, `"mps"` for Apple GPUs, etc.        | `--device cuda`                      |
+| Argument | Default | Description |
+|---|---:|---|
+| `--model` | required | Model name used to find the latest matching checkpoint. |
+| `--device` | `cpu` | Device to restore the model to after CPU ONNX export. |
+| `-c, --ckpt` | latest matching checkpoint | Explicit checkpoint path. |
 
-The Arguments can also be found using the `--help` command as below:
-`python export_onnx.py --help`
+Example:
 
-* Example Usage - 
-`python export_onnx.py --model resnet18`
+```bash
+python export_onnx.py --model resnet18 --device cuda
+```
 
+## Expected Warnings
 
-## DEBUGGING TIPS
-- In case you want to check any device related information or take a look at the QAT scaffolded model or the finalized QAT model and your model is in the form of an torch fx graph, you can use the `{fx_graph_model}.graph.print_tabular()` utility function which displays information about the model nodes and arguments. 
+These warnings are expected in the current PyTorch/PT2E path:
+
+- `No annotator registered for 'max_pool2d'; skipping.` Max-pool has no trainable
+  weights and is left unannotated while surrounding tensors remain quantized.
+- `erase_node(batch_norm_*) on an already erased node.` This comes from PyTorch
+  FX/PT2E batchnorm cleanup during `convert_pt2e()` on ResNet-style graphs.
+  PyTorch is attempting to erase batchnorm bookkeeping nodes that were already
+  removed. It is noisy but non-fatal when the run continues to
+  `Generating graph dump to file: post_p2e_graph.txt`, ONNX export, and
+  ONNXRuntime validation.
+- Torchvision `pretrained` deprecation warnings are from the current example model
+  constructor and do not affect QAT export.
+
+## Debugging Tips
+
+- Use `--samples-limit` on `train.py` and `test_onnx.py` for fast class-balanced smoke tests.
+- Use `--workers 4` or lower if the dataloader is noisy or the machine has few CPU cores.
+- Generated graph dumps are written as `prepare_p2e_graph.txt` and `post_p2e_graph.txt`.
+- For an FX graph object, `{fx_graph_model}.graph.print_tabular()` prints node-level details.

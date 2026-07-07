@@ -1,0 +1,19 @@
+{
+  "sdk_version": "2.1.2",
+  "python_version": "3.12.3",
+  "system_dependencies": {
+    "ubuntu": [
+      "build-essential",
+      "curl",
+      "libbz2-dev",
+      "libffi-dev",
+      "liblzma-dev",
+      "libreadline-dev",
+      "libsqlite3-dev",
+      "libssl-dev",
+      "tk-dev",
+      "xz-utils",
+      "zlib1g-dev"
+    ]
+  }
+}

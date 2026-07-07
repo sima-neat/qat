@@ -50,8 +50,14 @@ from imagenet_lit import ImageNet_Model_Trainer
 
 
 def run_export(args: Namespace):
-    """ Run the training regimen.
-    """
+    """Export a trained ImageNet checkpoint to ONNX."""
+    if not args.ckpt:
+        raise FileNotFoundError(
+            f"No checkpoint found for model '{args.model}'. "
+            "Run training first or pass --ckpt /path/to/checkpoint.ckpt."
+        )
+
+    L.seed_everything(42)
     print(f"Loading checkpoint file: {args.ckpt}")
     classifier = ImageNet_Model_Trainer.load_from_checkpoint(args.ckpt)
     classifier.to(args.device)
@@ -84,28 +90,19 @@ def find_latest_file_string(root_path: str, model_name: str, tag_str: str='.ckpt
     return most_recent_file
 
 def get_args():
-    parser = argparse.ArgumentParser(description="Download ONNX file for most recent checkpoint")
-    # Add model name as an argument
+    parser = argparse.ArgumentParser(description="Export the most recent ImageNet checkpoint to ONNX")
     parser.add_argument('--model', type=str, required=True, help='Model name to search for in checkpoint files')
     parser.add_argument('--device', type=str, default="cpu", help='Device to use')
-    
-    # Parse arguments initially to get the model name
-    all_args, unknown = parser.parse_known_args()
-    
-    # Find the latest checkpoint based on model_name
-    latest_ckpt = find_latest_file_string('.', model_name=all_args.model)
-    
-    # Re-parse arguments, this time adding the checkpoint as default
-    parser.add_argument('-c', '--ckpt', type=str, default=latest_ckpt, help='Checkpoint to load')
+    parser.add_argument('-c', '--ckpt', type=str, default=None, help='Checkpoint to load')
     all_args = parser.parse_args()
+
+    if all_args.ckpt is None:
+        all_args.ckpt = find_latest_file_string('.', model_name=all_args.model)
 
     return all_args
 
 
 if __name__ == "__main__":
-    # Set the global seed to prevent headaches.
-    L.seed_everything(42)
     run_args = get_args()
-
     run_export(run_args)
 

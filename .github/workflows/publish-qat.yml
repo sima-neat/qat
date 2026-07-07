@@ -1,0 +1,112 @@
+name: Publish QAT
+
+run-name: Publish QAT from ${{ github.ref_name }}
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  resolve-vulcan-config:
+    name: Resolve Vulcan Config
+    uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@main
+    with:
+      vulcan_env: ${{ vars.VULCAN_ENV || 'production' }}
+
+  package-qat:
+    name: Package QAT (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+          - arch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: true
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel setuptools pyyaml
+
+      - name: Build QAT package
+        run: |
+          set -euo pipefail
+          ./scripts/generate_api_docs.py
+          ./scripts/build_qat_bundle.sh --target-arch "${{ matrix.arch }}" --output-dir "dist/${{ matrix.arch }}"
+          ls -la "dist/${{ matrix.arch }}"
+
+      - name: Upload QAT package
+        uses: actions/upload-artifact@v7
+        with:
+          name: qat-extension-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}/*
+          if-no-files-found: error
+          retention-days: 3
+
+  publish-qat:
+    name: Publish QAT to Vulcan (${{ matrix.arch }})
+    needs:
+      - resolve-vulcan-config
+      - package-qat
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+          - arch: arm64
+    uses: sima-neat/.github/.github/workflows/vulcan-publish-artifacts.yml@main
+    with:
+      aws_region: ${{ needs.resolve-vulcan-config.outputs.aws_region }}
+      environment_name: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
+      bucket: ${{ needs.resolve-vulcan-config.outputs.artifact_bucket }}
+      role_to_assume: ${{ needs.resolve-vulcan-config.outputs.artifact_publisher_role_arn }}
+      sse_kms_key_id: ${{ needs.resolve-vulcan-config.outputs.artifact_kms_key_id }}
+      cloudfront_distribution_id: ${{ needs.resolve-vulcan-config.outputs.artifact_cloudfront_distribution_id }}
+      artifact_folder: tools/qat/${{ matrix.arch }}
+      artifact_pattern: qat-extension-${{ matrix.arch }}
+      artifact_glob: "*"
+      min_artifact_count: 4
+      publish_manifest: true
+
+  update-latest:
+    name: Update Vulcan Latest Tag
+    needs:
+      - resolve-vulcan-config
+      - publish-qat
+    uses: sima-neat/.github/.github/workflows/vulcan-update-latest-artifacts.yml@main
+    with:
+      aws_region: ${{ needs.resolve-vulcan-config.outputs.aws_region }}
+      environment_name: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
+      bucket: ${{ needs.resolve-vulcan-config.outputs.artifact_bucket }}
+      role_to_assume: ${{ needs.resolve-vulcan-config.outputs.artifact_publisher_role_arn }}
+      sse_kms_key_id: ${{ needs.resolve-vulcan-config.outputs.artifact_kms_key_id }}
+      artifact_folder: tools/qat/amd64
+      validate_manifest: true
