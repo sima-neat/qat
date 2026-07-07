@@ -129,15 +129,19 @@ tox -e smoke
 
 Generated ONNX models, graph dumps, checkpoints, example datasets, and Lightning logs are gitignored.
 
-## SDK Extension Package
+## Neat Artifact Package
 
-QAT extension bundles follow the same SDK-versioned install pattern as other SDK extensions:
+QAT extension bundles are published to Vulcan as independent Neat artifacts:
 
 ```bash
 # amd64 host
-sima-cli install -v 2.1.2 tools/qat/amd64
+sima-cli neat install qat/amd64
 # arm64 host
-sima-cli install -v 2.1.2 tools/qat/arm64
+sima-cli neat install qat/arm64
+
+# tagged or branch-specific versions
+sima-cli neat install qat/amd64@v1.0.0
+sima-cli neat install qat/amd64@develop
 ```
 
 The installer creates a separate QAT virtual environment under `/sdk-extensions/qat`,
