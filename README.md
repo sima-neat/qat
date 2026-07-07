@@ -152,14 +152,18 @@ Generated API reference docs live under `docs/generated/` and are linked from th
 
 ## Layout
 
-```
-sima_qat/            # the package
-  qat_api.py         # public API: prepare / finalize / export
-  sima_quantizer.py  # SiMa PT2E quantizer (annotators, fusion patterns)
-  onnx_ops.py        # custom ONNX symbolic functions for Q/DQ ops
-examples/            # MNIST and ImageNet training + export examples
-tests/               # unit tests + end_to_end model tests
-docs/generated/      # generated API reference docs
-skills/              # agent playbooks for common QAT workflows
-setup_env.sh         # one-shot venv + dependency bootstrap
+```text
+sima_qat/                         # Python package
+  qat_api.py                      # public API: prepare / finalize / export
+  sima_quantizer.py               # SiMa PT2E quantizer
+  onnx_ops.py                     # custom ONNX symbolic functions for Q/DQ ops
+  misc.py                         # shared helper utilities
+examples/                         # MNIST and ImageNet training + export examples
+tests/                            # unit, smoke, and end_to_end tests
+docs/generated/                   # generated API reference docs
+skills/qat_prepare_export/        # QAT workflow skill/playbook
+scripts/                          # bundle, install, metadata, and docs generation scripts
+.github/workflows/                # GitHub Actions publishing workflow
+setup.py                          # Python package metadata/build entry point
+setup_env.sh                      # one-shot venv + dependency bootstrap
 ```
