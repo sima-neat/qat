@@ -149,7 +149,7 @@ class MNIST_Trainer(L.LightningModule):
         m = sima_prepare_qat_model(input_graph=self.mnist_model, inputs=self.dummy_inputs, device=self.device)
         # Now replace our model
         setattr(self, 'mnist_model', m)
-        self._dump_fx_graph('prepare_p2e_graph.txt')
+        self._dump_fx_graph('prepare_fx_qat_graph.txt')
 
     def _finalize_qat_model(self) -> None:
         self.train(False)
@@ -158,7 +158,7 @@ class MNIST_Trainer(L.LightningModule):
             m = sima_finalize_qat_model(self.mnist_model)
             # Now replace our model
             setattr(self, 'mnist_model', m)
-            self._dump_fx_graph('post_p2e_graph.txt')
+            self._dump_fx_graph('final_fx_qat_graph.txt')
         return
 
     def on_fit_end(self) -> None:

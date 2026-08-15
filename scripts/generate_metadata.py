@@ -27,6 +27,7 @@ def main() -> int:
     parser.add_argument("--description", default="SiMa.ai NEAT QAT extension")
     parser.add_argument("--host-os", default="linux")
     parser.add_argument("--installer-script", default="install_qat_wheels.sh")
+    parser.add_argument("--smoke-test", default="smoke_test_qat.py")
     parser.add_argument("--source-manifest", default="source.json")
     parser.add_argument("--wheel-manifest", default="manifest.txt")
     args = parser.parse_args()
@@ -46,7 +47,11 @@ def main() -> int:
     wheel_manifest = artifacts_dir / args.wheel_manifest
     wheel_manifest.write_text("".join(f"{path.name}\n" for path in wheel_artifacts), encoding="utf-8")
 
-    resources = [path.name for path in wheel_artifacts] + [wheel_manifest.name, installer.name]
+    smoke_test = artifacts_dir / args.smoke_test
+    if not smoke_test.is_file():
+        raise SystemExit(f"Smoke test not found: {smoke_test}")
+
+    resources = [path.name for path in wheel_artifacts] + [wheel_manifest.name, installer.name, smoke_test.name]
     source_manifest = artifacts_dir / args.source_manifest
     if source_manifest.is_file():
         resources.append(source_manifest.name)
@@ -72,14 +77,14 @@ def main() -> int:
         "selectable-resources": [],
         "size": {
             "download": human_mb(total_download_bytes),
-            "install": "4 GB",
+            "install": human_mb(total_download_bytes),
         },
         "installation": {
             "script": f"bash ./{installer.name}",
             "post-message": (
                 "[bold green]Successfully installed QAT.[/bold green]\n\n"
-                "Run [green]activate-qat[/green] to enter the QAT environment and "
-                "[green]deactivate-qat[/green] to leave it."
+                "Run [green]activate-model-compiler[/green] to use QAT in the shared "
+                "Model Compiler environment. Reinstall QAT after Model Compiler updates."
             ),
         },
     }

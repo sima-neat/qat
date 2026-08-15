@@ -27,65 +27,138 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
-import copy
-import torch
-
-from sima_qat.qat_api import (sima_prepare_qat_model, 
-                              sima_finalize_qat_model, 
-                              sima_export_onnx)
-
+import numpy as np
+import onnx
+import onnxruntime
 import pytest
+import torch
+from onnx import numpy_helper
+from torch import nn
+
+from sima_qat.qat_api import (
+    sima_export_onnx,
+    sima_finalize_qat_model,
+    sima_prepare_qat_model,
+)
 
 
-class Model(torch.nn.Module):
+class ConcatModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = torch.nn.Conv2d(10, 10, (1, 1))
-        self.conv2 = torch.nn.Conv2d(10, 10, (1, 1))
-        self.conv2.weight = torch.nn.Parameter(self.conv1.weight + 1.)
-        self.conv2.bias = torch.nn.Parameter(self.conv1.bias + 1.)
-    
-    def forward(self, x):
-        x1 = self.conv1(x)
-        x2 = self.conv2(x)
-        x = torch.cat([x1, x2])
-        return x
+        self.low_range = nn.Conv2d(2, 2, kernel_size=1)
+        self.high_range = nn.Conv2d(2, 2, kernel_size=1)
+        self.output = nn.Conv2d(4, 2, kernel_size=1)
+        with torch.no_grad():
+            self.low_range.weight.fill_(0.05)
+            self.low_range.bias.zero_()
+            self.high_range.weight.fill_(2.0)
+            self.high_range.bias.fill_(4.0)
+
+    def forward(self, inputs):
+        low = self.low_range(inputs)
+        high = self.high_range(inputs)
+        return self.output(torch.cat((low, high), dim=1))
+
+
+def _onnx_value_maps(model):
+    producers = {
+        output: node
+        for node in model.graph.node
+        for output in node.output
+    }
+    initializers = {
+        initializer.name: initializer
+        for initializer in model.graph.initializer
+    }
+    constants = {}
+    for node in model.graph.node:
+        if node.op_type != "Constant" or len(node.output) != 1:
+            continue
+        value = next(
+            (
+                attribute.t
+                for attribute in node.attribute
+                if attribute.name == "value"
+            ),
+            None,
+        )
+        if value is not None:
+            constants[node.output[0]] = value
+    return producers, {**constants, **initializers}
+
+
+def _identity_root(value, producers):
+    seen = set()
+    while value not in seen:
+        seen.add(value)
+        producer = producers.get(value)
+        if (
+            producer is None
+            or producer.op_type != "Identity"
+            or len(producer.input) != 1
+        ):
+            return value
+        value = producer.input[0]
+    raise AssertionError("Identity cycle found in ONNX graph.")
 
 
 @pytest.mark.regression
-@pytest.mark.parametrize("model", [Model()])
-def test_concat(model: torch.nn.Module):
-    input_tensor = torch.randn(1, 10, 16, 16)
-    model(input_tensor)
-    example_inputs = (input_tensor, )
+def test_concat_keeps_independent_input_scales_and_runs_in_onnxruntime(tmp_path):
+    torch.manual_seed(17)
+    example_inputs = (torch.randn(2, 2, 6, 6),)
+    prepared = sima_prepare_qat_model(ConcatModel(), example_inputs, "cpu")
+    for multiplier in (1.0, 2.0, 3.0):
+        prepared(example_inputs[0] * multiplier)
+    finalized = sima_finalize_qat_model(prepared)
 
-    prepared_model = sima_prepare_qat_model(model, example_inputs, 'cpu')
+    output_file = tmp_path / "concat.onnx"
+    sima_export_onnx(
+        finalized,
+        example_inputs,
+        str(output_file),
+        input_names=["input"],
+        output_names=["output"],
+    )
 
-    prepared_model(example_inputs[0])
+    model = onnx.load(str(output_file))
+    onnx.checker.check_model(model)
+    concat_nodes = [node for node in model.graph.node if node.op_type == "Concat"]
+    assert len(concat_nodes) == 1
+    concat = concat_nodes[0]
+    assert len(concat.input) == 2
 
-    prepared_model.cpu()
+    producers, tensors = _onnx_value_maps(model)
+    input_scales = []
+    for concat_input in concat.input:
+        dequantize = producers.get(concat_input)
+        assert dequantize is not None
+        assert dequantize.op_type == "DequantizeLinear"
+        scale_name = _identity_root(dequantize.input[1], producers)
+        assert scale_name in tensors
+        scale = np.asarray(numpy_helper.to_array(tensors[scale_name])).reshape(-1)
+        assert scale.size == 1
+        input_scales.append(float(scale[0]))
 
-    converted_model = sima_finalize_qat_model(prepared_model)
+    assert not np.isclose(input_scales[0], input_scales[1])
+    assert any(
+        node.op_type == "QuantizeLinear"
+        and node.input[0] == concat.output[0]
+        for node in model.graph.node
+    )
 
-    scales = []
-    for node in converted_model.graph.nodes:
-
-        if 'dequantize_per_tensor' in node.name:
-
-            if 'cat' in [n.name for n in node.users]:
-                scales.append(node.args[1])
-
-                cat_node = [n for n in node.users][0]
-                # On newer torch a graph-terminal cat feeds 'output' directly with no
-                # output re-quantization, so only walk the cat -> quantize -> dequantize
-                # chain when it actually exists.
-                for q_node in cat_node.users:
-                    if 'quantize_per_tensor' not in q_node.name or 'dequantize' in q_node.name:
-                        continue
-                    for dq_node in q_node.users:
-                        if 'dequantize_per_tensor' in dq_node.name and dq_node.args[1] not in scales:
-                            scales.append(dq_node.args[1])
-
-    # Concat must preserve distinct per-input quantization scales (not collapse them).
-    assert len(scales) >= 2
-    assert not all(x == scales[0] for x in scales)
+    session_options = onnxruntime.SessionOptions()
+    session_options.graph_optimization_level = (
+        onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
+    )
+    session = onnxruntime.InferenceSession(
+        str(output_file),
+        sess_options=session_options,
+        providers=["CPUExecutionProvider"],
+    )
+    ort_output = session.run(
+        None,
+        {"input": example_inputs[0].numpy()},
+    )[0]
+    with torch.no_grad():
+        torch_output = finalized(example_inputs[0]).numpy()
+    np.testing.assert_allclose(ort_output, torch_output, rtol=0, atol=1e-6)

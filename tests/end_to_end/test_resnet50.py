@@ -106,13 +106,11 @@ def _build_full_dataloaders(args: Namespace):
 
 
 class _GpuCIFAR10Trainer(cc.CIFAR10_Trainer):
-    """Trainer that trains on GPU but finalizes/exports on CPU.
+    """Trainer that keeps finalization and ONNX validation on CPU.
 
-    convert_pt2e() requires a single-device module, but the prepared GraphModule keeps some
-    lifted constant tensors on CPU even after Lightning moves the parameters to CUDA. Unifying
-    on CPU before finalize/export sidesteps that (finalize + ONNX export are cheap on CPU).
+    Training remains on GPU. Moving the finalized model to CPU keeps the
+    exported runtime comparison independent of CUDA availability.
     """
-
     def _finalize_qat_model(self) -> None:
         self.classifier_model = self.classifier_model.to('cpu')
         super()._finalize_qat_model()

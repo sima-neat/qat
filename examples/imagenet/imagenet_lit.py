@@ -155,7 +155,7 @@ class ImageNet_Model_Trainer(L.LightningModule):
         m = sima_prepare_qat_model(input_graph=self.imagenet_model, inputs=self.dummy_inputs, device=self.device_train)
         # Now replace our model
         setattr(self, 'imagenet_model', m)
-        self._dump_fx_graph('prepare_p2e_graph.txt')
+        self._dump_fx_graph('prepare_fx_qat_graph.txt')
         
     def _finalize_qat_model(self) -> None:
         self.train(False)
@@ -164,7 +164,7 @@ class ImageNet_Model_Trainer(L.LightningModule):
             m = sima_finalize_qat_model(self.imagenet_model)
             # Now replace our model
             setattr(self, 'imagenet_model', m)
-            self._dump_fx_graph('post_p2e_graph.txt')
+            self._dump_fx_graph('final_fx_qat_graph.txt')
         return
 
     def on_fit_end(self) -> None:

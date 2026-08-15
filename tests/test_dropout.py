@@ -27,43 +27,59 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
-import copy
-import torch
-
-from sima_qat.qat_api import (sima_prepare_qat_model, 
-                              sima_finalize_qat_model, 
-                              sima_export_onnx)
-
 import pytest
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.ao.quantization import disable_observer
+
+from sima_qat.qat_api import sima_finalize_qat_model, sima_prepare_qat_model
 
 
-class Model(torch.nn.Module):
+class DropoutModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = torch.nn.Conv2d(3, 10, (1, 1))
-        self.dropout1 = torch.nn.Dropout()
-        self.conv2 = torch.nn.Conv2d(10, 10, (1, 1))
-        self.dropout2 = torch.nn.Dropout()
-    
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.dropout1(x)
-        y = self.conv2(x)
-        y = self.dropout2(y)
-        return x + y
+        self.conv1 = nn.Conv2d(3, 4, kernel_size=1)
+        self.dropout = nn.Dropout(p=0.75)
+        self.conv2 = nn.Conv2d(4, 4, kernel_size=1)
+
+    def forward(self, inputs):
+        outputs = self.dropout(self.conv1(inputs))
+        outputs = F.dropout(outputs, p=0.5, training=self.training)
+        return self.conv2(outputs)
 
 
 @pytest.mark.regression
-@pytest.mark.parametrize("model", [Model()])
-def test_dropout(model: torch.nn.Module):
-    input_tensor = torch.randn(1, 3, 224, 224)
-    example_inputs = (input_tensor, )
+def test_module_and_functional_dropout_are_absent_from_prepared_model():
+    model = DropoutModel()
+    example_inputs = (torch.randn(2, 3, 6, 6),)
+    prepared = sima_prepare_qat_model(model, example_inputs, "cpu")
 
-    prepared_model = sima_prepare_qat_model(model, example_inputs, 'cpu')
+    assert isinstance(model.dropout, nn.Dropout)
+    assert not any(
+        isinstance(module, nn.modules.dropout._DropoutNd)
+        for module in prepared.modules()
+    )
+    assert not any(
+        node.op == "call_function"
+        and node.target
+        in {
+            F.dropout,
+            F.dropout1d,
+            F.dropout2d,
+            F.dropout3d,
+            F.alpha_dropout,
+            F.feature_alpha_dropout,
+        }
+        for node in prepared.graph.nodes
+    )
 
-    prepared_model(example_inputs[0][0])
+    prepared.train()
+    prepared(example_inputs[0])
+    prepared.apply(disable_observer)
+    outputs_1 = prepared(example_inputs[0])
+    outputs_2 = prepared(example_inputs[0])
+    torch.testing.assert_close(outputs_1, outputs_2, rtol=0, atol=0)
 
-    prepared_model.cpu()
-
-    for node in prepared_model.graph.nodes:
-        assert (node.target not in [torch.ops.aten.dropout.default])
+    finalized = sima_finalize_qat_model(prepared)
+    assert torch.isfinite(finalized(example_inputs[0])).all()

@@ -35,6 +35,42 @@ if [[ ! -f "$SOURCE_JSON" ]]; then
   exit 1
 fi
 
+resolve_build_python() {
+  local candidate=""
+
+  if [[ -n "${QAT_BUILD_PYTHON:-}" ]]; then
+    if [[ -x "$QAT_BUILD_PYTHON" ]] && "$QAT_BUILD_PYTHON" -c 'import setuptools, wheel, yaml' >/dev/null 2>&1; then
+      printf '%s\n' "$QAT_BUILD_PYTHON"
+      return 0
+    fi
+    return 1
+  fi
+
+  candidate="$(command -v python3 2>/dev/null || true)"
+  if [[ -n "$candidate" ]] && "$candidate" -c 'import setuptools, wheel, yaml' >/dev/null 2>&1; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  for candidate in \
+    /sdk-extensions/model-compiler/bin/python \
+    /sdk-add-on/model-compiler/bin/python \
+    "$HOME/sdk-extensions/model-compiler/bin/python"
+  do
+    if [[ -x "$candidate" ]] && "$candidate" -c 'import setuptools, wheel, yaml' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! BUILD_PYTHON="$(resolve_build_python)"; then
+  echo "No Python with setuptools, wheel, and PyYAML was found. Activate Model Compiler first." >&2
+  exit 1
+fi
+
+
 normalize_target_arch() {
   local raw="$1"
   raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
@@ -58,7 +94,7 @@ if [[ -z "$TARGET_ARCH" ]]; then
   exit 1
 fi
 
-SDK_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("sdk_version", ""))' "$SOURCE_JSON")"
+SDK_VERSION="$("$BUILD_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("sdk_version", ""))' "$SOURCE_JSON")"
 if [[ "$BUNDLE_VERSION_EXPLICIT" == "0" ]]; then
   GIT_TAG="$(git -C "$REPO_ROOT" tag --points-at HEAD 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
   if [[ -n "$GIT_TAG" ]]; then
@@ -80,21 +116,36 @@ if [[ "$BUNDLE_VERSION" == *"short-hash"* ]]; then
   BUNDLE_VERSION="${BUNDLE_VERSION//short-hash/$GIT_SHORT_HASH}"
 fi
 
-rm -rf "$REPO_ROOT/build" "$REPO_ROOT/dist"
+BUILD_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sima-qat-build.XXXXXX")"
+cleanup() {
+  case "$BUILD_ROOT" in
+    "${TMPDIR:-/tmp}"/sima-qat-build.*) rm -rf -- "$BUILD_ROOT" ;;
+    *) echo "Refusing to remove unexpected build directory: $BUILD_ROOT" >&2 ;;
+  esac
+}
+trap cleanup EXIT
+BUILD_DIST="$BUILD_ROOT/dist"
+BUILD_EGG_INFO="$BUILD_ROOT/egg-info"
+mkdir -p "$BUILD_DIST" "$BUILD_EGG_INFO"
 (
   cd "$REPO_ROOT"
-  python3 setup.py bdist_wheel
+  "$BUILD_PYTHON" setup.py \
+    egg_info --egg-base "$BUILD_EGG_INFO" \
+    build --build-base "$BUILD_ROOT/build" \
+    bdist_wheel --dist-dir "$BUILD_DIST" --bdist-dir "$BUILD_ROOT/bdist"
 )
 
 mkdir -p "$OUTPUT_DIR"
 echo "Cleaning generated QAT bundle artifacts from: $OUTPUT_DIR"
 find "$OUTPUT_DIR" -maxdepth 1 -type f \( -name '*.whl' -o -name 'manifest.txt' -o -name 'metadata.json' -o -name 'source.json' -o -name 'install_qat_wheels.sh' \) -delete
+find "$OUTPUT_DIR" -maxdepth 1 -type f -name 'smoke_test_qat.py' -delete
 
-cp "$REPO_ROOT"/dist/*.whl "$OUTPUT_DIR/"
+cp "$BUILD_DIST"/*.whl "$OUTPUT_DIR/"
 cp "$SCRIPT_DIR/install_qat_wheels.sh" "$OUTPUT_DIR/"
+cp "$SCRIPT_DIR/smoke_test_qat.py" "$OUTPUT_DIR/"
 cp "$SOURCE_JSON" "$OUTPUT_DIR/source.json"
 
-python3 "$SCRIPT_DIR/generate_metadata.py" \
+"$BUILD_PYTHON" "$SCRIPT_DIR/generate_metadata.py" \
   --artifacts-dir "$OUTPUT_DIR" \
   --output "$OUTPUT_DIR/metadata.json" \
   --version "$BUNDLE_VERSION" \

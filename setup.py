@@ -68,7 +68,7 @@ docs_require = list()
 #tests_require = list()
 
 tests_require = [
-    "pytest==7.0.0",
+    "pytest>=7,<10",
     "pytest-cov",
     "pytest-timeout",
     "pytest-randomly",
@@ -90,7 +90,7 @@ setuptools.setup(
         'tests': tests_require,
         'dev': docs_require + tests_require,
     },
-    python_requires='>=3.10',
+    python_requires='>=3.12,<3.13',
     name='sima-qat',
     version=get_version('sima_qat'),
     author='SiMa.ai',
@@ -98,11 +98,11 @@ setuptools.setup(
     description='SiMa.ai QAT implementation',
     long_description=long_description,
     url='https://sima.ai',
-    packages=setuptools.find_packages(),
+    packages=setuptools.find_packages(exclude=("tests", "tests.*")),
     package_data={'sima_qat': ['VERSION']},
     license='Proprietary',
     classifiers=[
-        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.12',
         'Operating System :: OS Independent',
     ],
 )

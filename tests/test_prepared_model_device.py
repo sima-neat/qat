@@ -27,97 +27,78 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
-import torch
-from torch import nn, Tensor
-
-from sima_qat.qat_api import (sima_prepare_qat_model, 
-                              sima_finalize_qat_model, 
-                              sima_export_onnx,
-                              check_graph_nodes, 
-                              device_modifier_ops)
-
+import onnx
 import pytest
+import torch
+from torch import nn
 
-def stochastic_depth(input: Tensor, p: float, mode: str, training: bool = True) -> Tensor:
-    """
-    Implements the Stochastic Depth from `"Deep Networks with Stochastic Depth"
-    <https://arxiv.org/abs/1603.09382>`_ used for randomly dropping residual
-    branches of residual architectures.
-
-    Args:
-        input (Tensor[N, ...]): The input tensor or arbitrary dimensions with the first one
-                    being its batch i.e. a batch with ``N`` rows.
-        p (float): probability of the input to be zeroed.
-        mode (str): ``"batch"`` or ``"row"``.
-                    ``"batch"`` randomly zeroes the entire input, ``"row"`` zeroes
-                    randomly selected rows from the batch.
-        training: apply stochastic depth if is ``True``. Default: ``True``
-
-    Returns:
-        Tensor[N, ...]: The randomly zeroed tensor.
-    """
-    if p < 0.0 or p > 1.0:
-        raise ValueError(f"drop probability has to be between 0 and 1, but got {p}")
-    if mode not in ["batch", "row"]:
-        raise ValueError(f"mode has to be either 'batch' or 'row', but got {mode}")
-    if not training or p == 0.0:
-        return input
-
-    survival_rate = 1.0 - p
-    if mode == "row":
-        size = [input.shape[0]] + [1] * (input.ndim - 1)
-    else:
-        size = [1] * input.ndim
-    noise = torch.empty(size, dtype=input.dtype, device=input.device)
-    noise = noise.bernoulli_(survival_rate)
-    if survival_rate > 0.0:
-        noise.div_(survival_rate)
-    return input * noise
+from sima_qat.qat_api import (
+    sima_export_onnx,
+    sima_finalize_qat_model,
+    sima_prepare_qat_model,
+)
 
 
-class CheckDeviceModel(torch.nn.Module):
+class CheckDeviceModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 2, kernel_size=1)
+        self.register_buffer("offset", torch.tensor(0.25))
 
-    def __init__(self, p: float, mode: str):
-        super(CheckDeviceModel, self).__init__()
-        self.p = p
-        self.mode = mode
-        
+    def forward(self, inputs):
+        return self.conv(inputs) + self.offset
 
-    def forward(self, input):
-        return stochastic_depth(input, self.p, self.mode, self.training)
+
+def _assert_all_state_on_cpu(model):
+    tensors = (*model.parameters(), *model.buffers())
+    assert tensors
+    assert all(tensor.device == torch.device("cpu") for tensor in tensors)
 
 
 @pytest.mark.regression
-@pytest.mark.parametrize("model", [CheckDeviceModel(p=0.05, mode="row")])
-def test_prepared_model_device(model: torch.nn.Module):
-    
-    example_inputs = (torch.randn(1, 3, 224, 224),)
-    prepared_model = sima_prepare_qat_model(model, example_inputs, 'cpu')
-    
-    for n in prepared_model.graph.nodes:
-        #check for parameters not being in the same device as the model
-        if n.target in device_modifier_ops:
-            n_kwargs = dict(n.kwargs)
-            assert n_kwargs['device'] is 'cpu'
-    
-    prepared_model = check_graph_nodes(prepared_model, 'cuda')
+def test_prepare_finalize_and_export_restore_requested_cpu_device(tmp_path):
+    example_inputs = (torch.randn(2, 2, 4, 4),)
+    prepared = sima_prepare_qat_model(
+        CheckDeviceModel(),
+        example_inputs,
+        torch.device("cpu"),
+    )
+    _assert_all_state_on_cpu(prepared)
+    prepared(example_inputs[0])
 
-    for n in prepared_model.graph.nodes:
-        #check for parameters not being in the same device as the model
-        if n.target in device_modifier_ops:
-            n_kwargs = dict(n.kwargs)
-            assert n_kwargs['device'] is 'cuda'
-    
-    prepared_model.train(True)
-    prepared_model = check_graph_nodes(prepared_model, 'cpu')
-    prepared_model(example_inputs[0])
-    prepared_model.train(False)
-            
-    finalized_model = sima_finalize_qat_model(prepared_model)
-    post_export_model = sima_export_onnx(qat_model=finalized_model, inputs=example_inputs, output_file='prepared_model_device.onnx', device='cuda')
-    
-    for n in post_export_model.graph.nodes:
-        #check for parameters not being in the same device as the model
-        if n.target in device_modifier_ops:
-            n_kwargs = dict(n.kwargs)
-            assert n_kwargs['device'] is 'cuda'
+    finalized = sima_finalize_qat_model(prepared)
+    _assert_all_state_on_cpu(finalized)
+    output_file = tmp_path / "prepared_model_device.onnx"
+    returned = sima_export_onnx(
+        qat_model=finalized,
+        inputs=example_inputs,
+        output_file=str(output_file),
+        device=torch.device("cpu"),
+    )
+
+    assert returned is finalized
+    _assert_all_state_on_cpu(returned)
+    onnx.checker.check_model(onnx.load(str(output_file)))
+
+
+@pytest.mark.regression
+def test_unavailable_cuda_is_rejected_before_prepare_or_export(monkeypatch, tmp_path):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    example_inputs = (torch.randn(2, 2, 4, 4),)
+
+    with pytest.raises(RuntimeError, match="CUDA was requested"):
+        sima_prepare_qat_model(CheckDeviceModel(), example_inputs, "cuda")
+
+    prepared = sima_prepare_qat_model(CheckDeviceModel(), example_inputs, "cpu")
+    prepared(example_inputs[0])
+    finalized = sima_finalize_qat_model(prepared)
+    output_file = tmp_path / "must_not_exist.onnx"
+    with pytest.raises(RuntimeError, match="CUDA was requested"):
+        sima_export_onnx(
+            finalized,
+            example_inputs,
+            str(output_file),
+            device="cuda",
+        )
+    assert not output_file.exists()
+    _assert_all_state_on_cpu(finalized)

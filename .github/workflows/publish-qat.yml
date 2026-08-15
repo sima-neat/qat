@@ -30,8 +30,100 @@ jobs:
     with:
       vulcan_env: ${{ vars.VULCAN_ENV || 'dev' }}
 
+  validate-qat:
+    name: Validate QAT (Python 3.12.3 / Torch 2.3.1 CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      QAT_BUNDLE_DIR: ${{ runner.temp }}/qat-bundle
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: true
+          fetch-depth: 0
+
+      - name: Set up Python 3.12.3
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.3'
+
+      - name: Install exact Model Compiler CPU baseline
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip wheel setuptools pyyaml
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.3.1 torchvision==0.18.1
+          python -m pip install \
+            numpy==1.26.4 onnx==1.17.0 onnxruntime==1.21.1 \
+            pytorch-lightning==2.4.0 'pytest>=7,<10'
+          python - <<'PY'
+          import importlib.metadata as metadata
+          import sys
+
+          assert sys.version_info[:3] == (3, 12, 3), sys.version
+          expected = {
+              'numpy': '1.26.4',
+              'torch': '2.3.1',
+              'torchvision': '0.18.1',
+              'onnx': '1.17.0',
+              'onnxruntime': '1.21.1',
+              'pytorch-lightning': '2.4.0',
+          }
+          for name, expected_version in expected.items():
+              actual = metadata.version(name)
+              assert actual.split('+', 1)[0] == expected_version, (name, actual)
+          PY
+          python -m pip check
+
+      - name: Run Dynamo-free FX/QDQ regression suite
+        run: python -m pytest -q -o addopts= tests --ignore=tests/end_to_end
+
+      - name: Build acceptance bundle
+        run: |
+          set -euo pipefail
+          bash scripts/build_qat_bundle.sh \
+            --target-arch amd64 \
+            --output-dir "$QAT_BUNDLE_DIR" \
+            --bundle-version "ci-${GITHUB_SHA::12}"
+
+      - name: Inspect and install built wheel without dependencies
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import zipfile
+
+          bundle = Path(os.environ['QAT_BUNDLE_DIR'])
+          wheels = list(bundle.glob('*.whl'))
+          assert len(wheels) == 1, wheels
+          with zipfile.ZipFile(wheels[0]) as archive:
+              leaked = [
+                  name
+                  for name in archive.namelist()
+                  if name == 'tests' or name.startswith('tests/')
+              ]
+          assert not leaked, leaked
+          PY
+          wheels=("$QAT_BUNDLE_DIR"/*.whl)
+          [[ ${#wheels[@]} -eq 1 ]]
+          python -m pip install --no-deps --force-reinstall "${wheels[0]}"
+
+      - name: Run installed-wheel smoke outside checkout
+        run: |
+          set -euo pipefail
+          smoke_dir="$(mktemp -d "$RUNNER_TEMP/qat-smoke.XXXXXX")"
+          expected_prefix="$(python -c 'import sys; print(sys.prefix)')"
+          cd "$smoke_dir"
+          python "$QAT_BUNDLE_DIR/smoke_test_qat.py" \
+            --expected-prefix "$expected_prefix"
+          python -m pip check
+
   package-qat:
     name: Package QAT (${{ matrix.arch }})
+    needs: validate-qat
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -50,7 +142,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.12'
+          python-version: '3.12.3'
 
       - name: Install build dependencies
         run: |

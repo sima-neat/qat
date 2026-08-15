@@ -5,154 +5,142 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUNDLE_DIR="$SCRIPT_DIR"
 SOURCE_JSON="$BUNDLE_DIR/source.json"
 WHEEL_MANIFEST="$BUNDLE_DIR/manifest.txt"
-EXTRA_INDEX_URL="${EXTRA_INDEX_URL:-https://pypi.org/simple}"
+SMOKE_TEST="$BUNDLE_DIR/smoke_test_qat.py"
 
-read_source_json_field() {
-  local expr="$1"
-  python3 -c '
-import json, sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    doc = json.load(f)
-expr = sys.argv[2]
-if expr == "python_version":
-    value = doc.get("python_version", "")
-    print(value if isinstance(value, str) else "")
-' "$SOURCE_JSON" "$expr"
-}
+find_model_compiler_dir() {
+  local candidate=""
 
-normalize_python_version() {
-  local raw="$1"
-  raw="$(echo "$raw" | tr -d "[:space:]")"
-  if [[ "$raw" =~ ^[0-9]+\.[0-9]+$ ]]; then
-    echo "$raw"
+  if [[ -n "${QAT_MODEL_COMPILER_DIR:-}" ]]; then
+    printf '%s\n' "$QAT_MODEL_COMPILER_DIR"
     return 0
   fi
-  if [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "$(echo "$raw" | awk -F. '{print $1"."$2}')"
-    return 0
-  fi
-  return 1
-}
 
-resolve_python_cmd() {
-  local py_mm="$1"
-  local major="${py_mm%%.*}"
-  local minor="${py_mm##*.}"
-  local cmd=""
-
-  for candidate in "python${major}.${minor}" "python${major}" python3; do
-    if command -v "$candidate" >/dev/null 2>&1; then
-      cmd="$candidate"
-      if "$cmd" -c "import sys; raise SystemExit(0 if (sys.version_info.major, sys.version_info.minor)==(${major},${minor}) else 1)" >/dev/null 2>&1; then
-        echo "$cmd"
-        return 0
-      fi
+  for candidate in \
+    /sdk-extensions/model-compiler \
+    /sdk-add-on/model-compiler \
+    "$HOME/sdk-extensions/model-compiler"
+  do
+    if [[ -x "$candidate/bin/python" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
     fi
   done
-
-  if command -v pyenv >/dev/null 2>&1; then
-    local target_version="$py_mm"
-    local latest_patch=""
-    latest_patch="$(pyenv install --list 2>/dev/null | sed 's/^[[:space:]]*//' | grep -E "^${py_mm//./\.}\.[0-9]+$" | sort -V | tail -n1 || true)"
-    if [[ -n "$latest_patch" ]]; then
-      target_version="$latest_patch"
-    fi
-    pyenv install -s "$target_version"
-    echo "${PYENV_ROOT:-$HOME/.pyenv}/versions/$target_version/bin/python"
-    return 0
-  fi
-
   return 1
 }
 
-reset_venv_dir() {
-  local venv_dir="$1"
-  case "$venv_dir" in
-    /sdk-extensions/qat|/sdk-add-on/qat|"$HOME"/sdk-extensions/qat) ;;
-    *)
-      echo "Refusing to reset unexpected QAT venv path: $venv_dir" >&2
-      return 1
-      ;;
-  esac
-  rm -rf "$venv_dir"
-}
+validate_model_compiler_environment() {
+  local model_compiler_dir="$1"
 
-configure_shell_helpers() {
-  local qat_dir="$1"
-  local target_file=""
-  if [[ -f "$HOME/.bashrc" || ! -f "$HOME/.bash_profile" ]]; then
-    target_file="$HOME/.bashrc"
-  else
-    target_file="$HOME/.bash_profile"
-  fi
-  mkdir -p "$(dirname "$target_file")"
-  touch "$target_file"
-
-  python3 - "$target_file" "$qat_dir" <<'PY'
+  "$model_compiler_dir/bin/python" - "$SOURCE_JSON" "$model_compiler_dir" <<'PY'
+import importlib
+import importlib.metadata
+import json
 from pathlib import Path
 import sys
 
-target = Path(sys.argv[1])
-qat_dir = sys.argv[2]
-begin = "# >>> sima qat >>>"
-end = "# <<< sima qat <<<"
-block = f"""{begin}
-activate-qat() {{
-  source {qat_dir}/bin/activate
-}}
+source_json = Path(sys.argv[1])
+expected_prefix = Path(sys.argv[2]).resolve()
+with source_json.open(encoding="utf-8") as source_file:
+    source = json.load(source_file)
 
-deactivate-qat() {{
-  deactivate 2>/dev/null || true
-}}
-{end}
-"""
-text = target.read_text(encoding="utf-8") if target.exists() else ""
-start = text.find(begin)
-finish = text.find(end)
-if start != -1 and finish != -1 and finish > start:
-    finish += len(end)
-    text = text[:start].rstrip() + "\n\n" + block + text[finish:].lstrip("\n")
-else:
-    if text and not text.endswith("\n"):
-        text += "\n"
-    text += "\n" + block
-target.write_text(text, encoding="utf-8")
+errors = []
+if Path(sys.prefix).resolve() != expected_prefix:
+    errors.append(
+        f"Python prefix is {Path(sys.prefix).resolve()}, expected {expected_prefix}"
+    )
+
+raw_python_version = str(source.get("python_version", ""))
+try:
+    expected_python = tuple(int(part) for part in raw_python_version.split("."))
+except ValueError:
+    expected_python = ()
+if len(expected_python) != 3:
+    errors.append(f"Invalid python_version in {source_json}: {raw_python_version!r}")
+elif sys.version_info[:3] != expected_python:
+    actual = ".".join(str(part) for part in sys.version_info[:3])
+    errors.append(f"Python is {actual}, expected {raw_python_version}")
+
+shared_environment = source.get("shared_environment", {})
+expected_packages = shared_environment.get("packages", {})
+if shared_environment.get("provider") != "model-compiler":
+    errors.append(
+        "source.json does not declare model-compiler as the environment provider"
+    )
+if not isinstance(expected_packages, dict) or not expected_packages:
+    errors.append("source.json has no shared-environment package contract")
+    expected_packages = {}
+
+actual_versions = {}
+for distribution, expected_version in expected_packages.items():
+    try:
+        actual_version = importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        errors.append(f"{distribution} is not installed (expected {expected_version})")
+        continue
+    actual_versions[distribution] = actual_version
+    actual_base = actual_version.split("+", 1)[0]
+    expected_base = str(expected_version).split("+", 1)[0]
+    if actual_base != expected_base:
+        errors.append(
+            f"{distribution} is {actual_version}, expected base version {expected_base}"
+        )
+
+modules = {
+    "numpy": "numpy",
+    "torch": "torch",
+    "torchvision": "torchvision",
+    "onnx": "onnx",
+    "onnxruntime": "onnxruntime",
+    "pytorch-lightning": "pytorch_lightning",
+}
+for distribution in expected_packages:
+    module = modules.get(distribution)
+    if module is None:
+        continue
+    try:
+        importlib.import_module(module)
+    except Exception as error:
+        errors.append(f"{distribution} cannot be imported: {error}")
+
+if errors:
+    print(
+        "The Model Compiler environment is not compatible with this QAT artifact:",
+        file=sys.stderr,
+    )
+    for error in errors:
+        print(f"  - {error}", file=sys.stderr)
+    print(
+        "QAT will not create another environment or change Python, Torch, or "
+        "torchvision in the Model Compiler environment.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+print(f"Compatible Model Compiler environment: {expected_prefix}")
+print(f"Python: {sys.version.split()[0]}")
+for distribution in expected_packages:
+    print(f"{distribution}: {actual_versions[distribution]}")
 PY
 }
 
-if [[ ! -f "$SOURCE_JSON" ]]; then
-  echo "Missing source manifest: $SOURCE_JSON" >&2
-  exit 1
-fi
-if [[ ! -f "$WHEEL_MANIFEST" ]]; then
-  echo "Missing wheel manifest: $WHEEL_MANIFEST" >&2
+for required_file in "$SOURCE_JSON" "$WHEEL_MANIFEST" "$SMOKE_TEST"; do
+  if [[ ! -f "$required_file" ]]; then
+    echo "Missing QAT bundle resource: $required_file" >&2
+    exit 1
+  fi
+done
+
+if ! MODEL_COMPILER_DIR="$(find_model_compiler_dir)"; then
+  echo "Install Model Compiler before installing QAT." >&2
+  echo "No model-compiler environment was found under /sdk-extensions or /sdk-add-on." >&2
   exit 1
 fi
 
-PYTHON_VERSION_RAW="$(read_source_json_field python_version)"
-if ! PYTHON_MM="$(normalize_python_version "$PYTHON_VERSION_RAW")"; then
-  echo "Unsupported python_version in $SOURCE_JSON: '$PYTHON_VERSION_RAW'" >&2
-  exit 1
+validate_model_compiler_environment "$MODEL_COMPILER_DIR"
+if [[ "${QAT_VALIDATE_ONLY:-0}" == "1" ]]; then
+  echo "Model Compiler environment validation complete."
+  exit 0
 fi
-if ! PYTHON_CMD="$(resolve_python_cmd "$PYTHON_MM")"; then
-  echo "Python $PYTHON_MM was not found. Install it or install pyenv and retry." >&2
-  exit 1
-fi
-
-if [[ -d "/sdk-extensions" && -w "/sdk-extensions" ]]; then
-  EXTENSIONS_DIR="/sdk-extensions"
-elif [[ -d "/sdk-add-on" && -w "/sdk-add-on" ]]; then
-  EXTENSIONS_DIR="/sdk-add-on"
-else
-  EXTENSIONS_DIR="$HOME/sdk-extensions"
-  mkdir -p "$EXTENSIONS_DIR"
-fi
-
-QAT_DIR="$EXTENSIONS_DIR/qat"
-echo "Creating QAT virtual environment at: $QAT_DIR (python: $PYTHON_CMD)"
-reset_venv_dir "$QAT_DIR"
-"$PYTHON_CMD" -m venv "$QAT_DIR"
-"$QAT_DIR/bin/python" -m pip install --upgrade pip
 
 wheels=()
 while IFS= read -r entry; do
@@ -165,14 +153,35 @@ while IFS= read -r entry; do
 done < "$WHEEL_MANIFEST"
 
 if [[ ${#wheels[@]} -eq 0 ]]; then
-  echo "No wheels listed in $WHEEL_MANIFEST" >&2
+  echo "No QAT wheel is listed in $WHEEL_MANIFEST." >&2
   exit 1
 fi
 
-pip_args=(--disable-pip-version-check --find-links "$BUNDLE_DIR")
-if [[ -n "$EXTRA_INDEX_URL" ]]; then
-  pip_args+=(--extra-index-url "$EXTRA_INDEX_URL")
+echo "Validating the QAT wheel without resolving or changing dependencies..."
+"$MODEL_COMPILER_DIR/bin/python" -m pip install \
+  --disable-pip-version-check \
+  --dry-run \
+  --no-deps \
+  "${wheels[@]}"
+
+if "$MODEL_COMPILER_DIR/bin/python" -m pip show swml-qat >/dev/null 2>&1; then
+  echo "Removing legacy swml-qat before installing sima-qat."
+  "$MODEL_COMPILER_DIR/bin/python" -m pip uninstall -y swml-qat
 fi
-"$QAT_DIR/bin/python" -m pip install "${pip_args[@]}" "${wheels[@]}"
-configure_shell_helpers "$QAT_DIR"
-echo "QAT installation complete in $QAT_DIR."
+
+echo "Installing QAT into: $MODEL_COMPILER_DIR"
+"$MODEL_COMPILER_DIR/bin/python" -m pip install \
+  --disable-pip-version-check \
+  --no-deps \
+  --force-reinstall \
+  "${wheels[@]}"
+
+"$MODEL_COMPILER_DIR/bin/python" -m pip check
+
+echo "Running the installed-environment functional QAT smoke test..."
+"$MODEL_COMPILER_DIR/bin/python" "$SMOKE_TEST" \
+  --expected-prefix "$MODEL_COMPILER_DIR"
+
+echo "QAT installation complete in the Model Compiler environment."
+echo "Use activate-model-compiler to run QAT."
+echo "Reinstall QAT after any Model Compiler reinstall or upgrade."

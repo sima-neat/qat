@@ -119,24 +119,17 @@ Example:
 python export_onnx.py --model resnet18 --device cuda
 ```
 
-## Expected Warnings
+## Backend Notes
 
-These warnings are expected in the current PyTorch/PT2E path:
-
-- `No annotator registered for 'max_pool2d'; skipping.` Max-pool has no trainable
-  weights and is left unannotated while surrounding tensors remain quantized.
-- `erase_node(batch_norm_*) on an already erased node.` This comes from PyTorch
-  FX/PT2E batchnorm cleanup during `convert_pt2e()` on ResNet-style graphs.
-  PyTorch is attempting to erase batchnorm bookkeeping nodes that were already
-  removed. It is noisy but non-fatal when the run continues to
-  `Generating graph dump to file: post_p2e_graph.txt`, ONNX export, and
-  ONNXRuntime validation.
-- Torchvision `pretrained` deprecation warnings are from the current example model
-  constructor and do not affect QAT export.
+- QAT uses symbolic FX tracing and does not fall back to Dynamo. Custom Python
+  control flow must be symbolically traceable.
+- Conv-BN and Conv-BN-ReLU modules are folded during finalization.
+- PyTorch 2.8 may emit FX quantization and legacy ONNX exporter deprecation
+  warnings. The Model Compiler target remains PyTorch 2.3.1.
+- Torchvision pretrained-constructor warnings do not affect QAT export.
 
 ## Debugging Tips
 
 - Use `--samples-limit` on `train.py` and `test_onnx.py` for fast class-balanced smoke tests.
 - Use `--workers 4` or lower if the dataloader is noisy or the machine has few CPU cores.
-- Generated graph dumps are written as `prepare_p2e_graph.txt` and `post_p2e_graph.txt`.
 - For an FX graph object, `{fx_graph_model}.graph.print_tabular()` prints node-level details.

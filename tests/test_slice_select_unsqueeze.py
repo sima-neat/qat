@@ -27,54 +27,120 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
-import torch
-
-from sima_qat.qat_api import (sima_prepare_qat_model, 
-                              sima_finalize_qat_model, 
-                              sima_export_onnx)
-
+import numpy as np
+import onnx
+import onnxruntime
 import pytest
+import torch
+from torch import nn
+from torch.ao.quantization import FakeQuantize
 
-class SliceSelectUnsqueezeModel(torch.nn.Module):
+from sima_qat.qat_api import (
+    sima_export_onnx,
+    sima_finalize_qat_model,
+    sima_prepare_qat_model,
+)
 
+
+class SliceSelectUnsqueezeModel(nn.Module):
     def __init__(self):
-        super(SliceSelectUnsqueezeModel, self).__init__()
-        
-        self.Conv2d_1a_3x3 = torch.nn.Conv2d(3, 32, bias=False, kernel_size=3, stride=2)
+        super().__init__()
+        self.conv = nn.Conv2d(
+            3,
+            4,
+            bias=False,
+            kernel_size=3,
+            stride=1,
+        )
 
-    def forward(self, x):
-        x_ch0 = torch.unsqueeze(x[:, 0], 1)
-        x_ch1 = torch.unsqueeze(x[:, 1], 1)
-        x_ch2 = torch.unsqueeze(x[:, 2], 1)
-        x = torch.cat((x_ch0, x_ch1, x_ch2), 1)
-        out = self.Conv2d_1a_3x3(x)
-        return out
+    def forward(self, inputs):
+        channels = [
+            torch.unsqueeze(inputs[:, channel], 1)
+            for channel in range(3)
+        ]
+        return self.conv(torch.cat(channels, dim=1))
 
 
 @pytest.mark.regression
-@pytest.mark.parametrize("model", [SliceSelectUnsqueezeModel()])
-def test_slice_select_unsqueeze_model(model: torch.nn.Module):
-    input_tensor = torch.randn(1, 3, 224, 224)
-    example_inputs = (input_tensor, )
+def test_slice_select_unsqueeze_boundaries_export_and_run(tmp_path):
+    torch.manual_seed(19)
+    example_inputs = (torch.randn(2, 3, 8, 8),)
+    prepared = sima_prepare_qat_model(
+        SliceSelectUnsqueezeModel(),
+        example_inputs,
+        "cpu",
+    )
+    prepared(example_inputs[0])
+    finalized = sima_finalize_qat_model(prepared)
+    torch_output = finalized(example_inputs[0]).detach().numpy()
+    assert torch_output.shape == (2, 4, 6, 6)
 
-    prepared_model = sima_prepare_qat_model(model, example_inputs, 'cpu')
+    output_file = tmp_path / "slice_select_unsqueeze.onnx"
+    sima_export_onnx(
+        finalized,
+        example_inputs,
+        str(output_file),
+        input_names=["input"],
+        output_names=["output"],
+    )
+    model = onnx.load(str(output_file))
+    onnx.checker.check_model(model)
 
-    prepared_model(example_inputs[0][0])
+    op_types = [node.op_type for node in model.graph.node]
+    assert op_types.count("Gather") == 3
+    assert op_types.count("Unsqueeze") == 3
+    assert op_types.count("Concat") == 1
+    assert op_types.count("Conv") == 1
 
-    prepared_model.cpu()
+    consumers = {}
+    producers = {}
+    for node in model.graph.node:
+        for value in node.input:
+            consumers.setdefault(value, []).append(node)
+        for value in node.output:
+            producers[value] = node
 
-    converted_model = sima_finalize_qat_model(prepared_model)
+    concat = next(node for node in model.graph.node if node.op_type == "Concat")
+    for unsqueeze in (
+        node for node in model.graph.node if node.op_type == "Unsqueeze"
+    ):
+        quantizers = [
+            node
+            for node in consumers.get(unsqueeze.output[0], [])
+            if node.op_type == "QuantizeLinear"
+        ]
+        assert len(quantizers) == 1
+        dequantizers = [
+            node
+            for node in consumers.get(quantizers[0].output[0], [])
+            if node.op_type == "DequantizeLinear"
+        ]
+        assert len(dequantizers) == 1
+        assert dequantizers[0].output[0] in concat.input
+        assert producers[unsqueeze.input[0]].op_type == "Gather"
 
-    for node in converted_model.graph.nodes:
-        if node.name.startswith('slice'):
-            #check if the prior node is the end of a input qdq node
-            assert node.args[0].target is torch.ops.quantized_decomposed.dequantize_per_tensor.default
-            # check if the next node is the select node
-            assert node.next.target is torch.ops.aten.select.int
-            
-        if node.name.startswith('unsqueeze'):
-            # check if prior node to unsqueeze is select node 
-            assert node.args[0].target is torch.ops.aten.select.int
-
-            # check if next node is the start of a qdq node
-            assert node.next.target is torch.ops.quantized_decomposed.quantize_per_tensor.default
+    session_options = onnxruntime.SessionOptions()
+    session_options.graph_optimization_level = (
+        onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
+    )
+    session = onnxruntime.InferenceSession(
+        str(output_file),
+        sess_options=session_options,
+        providers=["CPUExecutionProvider"],
+    )
+    ort_output = session.run(
+        None,
+        {"input": example_inputs[0].numpy()},
+    )[0]
+    activation_steps = [
+        float(module.scale.max())
+        for module in finalized.modules()
+        if isinstance(module, FakeQuantize) and not module.is_per_channel
+    ]
+    assert activation_steps
+    np.testing.assert_allclose(
+        ort_output,
+        torch_output,
+        rtol=0,
+        atol=2 * max(activation_steps) + 1e-7,
+    )
