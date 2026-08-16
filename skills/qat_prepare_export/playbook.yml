@@ -1,6 +1,6 @@
 id: sima-qat-prepare-export
 name: Prepare, Export, and Compile QAT Models for SiMa
-version: 0.2.2
+version: 0.2.3
 agents: [codex, claude]
 description: >-
   Skill for shared-environment FX QAT, canonical data/build/dist paths, Q/DQ
@@ -8,7 +8,7 @@ description: >-
 compatibility:
   env_types: [host, sdk]
   env_subtypes: [linux, palette]
-  min_cli_version: 2.1.2
+  min_cli_version: 2.1.3
 runtime:
   requires:
     - python

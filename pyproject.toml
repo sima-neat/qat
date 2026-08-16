@@ -1,3 +1,44 @@
 [build-system]
 requires = ["setuptools==84.0.0", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "sima-qat"
+dynamic = ["version"]
+description = "SiMa.ai QAT implementation"
+readme = "README.md"
+requires-python = "==3.12.3"
+license = { text = "Proprietary" }
+authors = [
+  { name = "SiMa.ai", email = "support@sima.ai" },
+]
+dependencies = [
+  "numpy==1.26.4",
+  "torch>=2.3,<2.9",
+  "torchvision>=0.18,<0.24",
+  "onnx==1.17.0",
+  "onnxruntime==1.21.1",
+  "pytorch-lightning==2.4.0",
+]
+classifiers = [
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.optional-dependencies]
+tests = [
+  "pytest>=8.2,<10",
+]
+
+[project.urls]
+Homepage = "https://sima.ai"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.dynamic]
+version = { file = ["VERSION.in"] }
+
+[tool.setuptools.packages.find]
+include = ["sima_qat", "sima_qat.*"]
+namespaces = false

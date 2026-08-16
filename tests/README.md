@@ -39,17 +39,13 @@ activate-model-compiler
 python -m pytest -q
 ```
 
+Customer and contributor test commands use the activated SiMa 2.1.3 Model
+Compiler environment. Do not create a QAT-specific virtual environment.
+
 Run only the two smallest lifecycle checks:
 
 ```bash
 python -m pytest -q -rs -m smoke tests/integration
-```
-
-The equivalent isolated contributor environments are:
-
-```bash
-python -m tox -e smoke
-python -m tox -e integration
 ```
 
 ## End-to-end commands
@@ -140,8 +136,6 @@ Compiler MPKs are test output and do not belong in `dist/`.
 | `build/pytest/end-to-end/<suite>/` | Isolated training, checkpoint, and ONNX output | Recreated by the selected E2E command |
 | `build/pytest/model-compiler/<target>/` | Target-labeled ONNX, `.sima`, and MPK evidence | Recreated only by that target command |
 | `build/pytest-cache/` | Pytest collection and last-failure cache | Disposable |
-| `build/pytest/tox/<env>/` | Tox-specific pytest temporary output | Disposable |
-| `build/test-results/<env>.xml` | Tox JUnit reports | Disposable/report upload |
 | `data/` | Shared CIFAR-10 download cache | Reusable local input |
 
 Tests must use `tmp_path`/`tmp_path_factory` or an explicitly injected output

@@ -1,9 +1,11 @@
 {
-  "sdk_version": "2.1.2",
+  "sdk_version": "2.1.3",
   "python_version": "3.12.3",
   "shared_environment": {
     "provider": "model-compiler",
     "packages": {
+      "sima-frontend": "2.1.3.dev0+master.391",
+      "sima-mlc": "2.1.3.dev0+master.186",
       "numpy": "1.26.4",
       "torch": "2.3.1",
       "torchvision": "0.18.1",
@@ -11,20 +13,5 @@
       "onnxruntime": "1.21.1",
       "pytorch-lightning": "2.4.0"
     }
-  },
-  "system_dependencies": {
-    "ubuntu": [
-      "build-essential",
-      "curl",
-      "libbz2-dev",
-      "libffi-dev",
-      "liblzma-dev",
-      "libreadline-dev",
-      "libsqlite3-dev",
-      "libssl-dev",
-      "tk-dev",
-      "xz-utils",
-      "zlib1g-dev"
-    ]
   }
 }

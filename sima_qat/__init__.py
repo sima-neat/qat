@@ -13,7 +13,7 @@ from sima_qat.qat_api import (
 def _resolve_version() -> str:
     source_root = Path(__file__).resolve().parents[1]
     source_version = source_root / "VERSION.in"
-    if source_version.is_file() and (source_root / "setup.py").is_file():
+    if source_version.is_file() and (source_root / "pyproject.toml").is_file():
         return source_version.read_text(encoding="utf-8").strip()
     try:
         return version("sima-qat")

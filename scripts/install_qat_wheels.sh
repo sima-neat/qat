@@ -164,7 +164,6 @@ import importlib
 import importlib.metadata
 import importlib.util
 import json
-import os
 from pathlib import Path
 import sys
 
@@ -196,6 +195,11 @@ if shared_environment.get("provider") != "model-compiler":
     errors.append(
         "source.json does not declare model-compiler as the environment provider"
     )
+
+raw_sdk_version = str(source.get("sdk_version", ""))
+if not raw_sdk_version:
+    errors.append(f"source.json has no sdk_version: {source_json}")
+
 identity_problems = []
 try:
     afe_spec = importlib.util.find_spec("afe")
@@ -204,32 +208,61 @@ except (ImportError, AttributeError, ValueError) as error:
     identity_problems.append(f"cannot inspect afe: {error}")
 if afe_spec is None:
     identity_problems.append("afe module is missing")
+else:
+    afe_locations = []
+    if afe_spec.origin not in {None, "built-in", "frozen"}:
+        afe_locations.append(Path(afe_spec.origin).resolve())
+    if afe_spec.submodule_search_locations is not None:
+        afe_locations.extend(
+            Path(location).resolve()
+            for location in afe_spec.submodule_search_locations
+        )
+    if not afe_locations:
+        identity_problems.append("afe has no inspectable installation location")
+    for location in afe_locations:
+        try:
+            location.relative_to(expected_prefix)
+        except ValueError:
+            identity_problems.append(
+                f"afe resolves outside Model Compiler: {location}"
+            )
 try:
-    sima_mlc_version = importlib.metadata.version("sima-mlc")
+    sima_mlc_distribution = importlib.metadata.distribution("sima-mlc")
 except importlib.metadata.PackageNotFoundError:
-    sima_mlc_version = None
     identity_problems.append("sima-mlc distribution is missing")
-is_model_compiler = not identity_problems
-allow_test_fixture = (
-    os.environ.get("QAT_ALLOW_COMPATIBLE_TEST_ENV") == "1"
-    and os.environ.get("CI") == "true"
-)
+else:
+    sima_mlc_location = Path(
+        sima_mlc_distribution.locate_file("")
+    ).resolve()
+    try:
+        sima_mlc_location.relative_to(expected_prefix)
+    except ValueError:
+        identity_problems.append(
+            "sima-mlc distribution resolves outside Model Compiler: "
+            f"{sima_mlc_location}"
+        )
 if identity_problems:
-    identity_message = "; ".join(identity_problems)
-    if allow_test_fixture:
-        print(
-            "WARNING: accepting a test-only compatible CI environment "
-            f"({identity_message}); this override is not a supported customer path.",
-            file=sys.stderr,
-        )
-    else:
-        errors.append(
-            f"this is not a Model Compiler environment: {identity_message}"
-        )
+    errors.append(
+        "this is not a Model Compiler environment: "
+        + "; ".join(identity_problems)
+    )
 
 if not isinstance(expected_packages, dict) or not expected_packages:
     errors.append("source.json has no shared-environment package contract")
     expected_packages = {}
+
+expected_sima_mlc = expected_packages.get("sima-mlc")
+if expected_sima_mlc is None:
+    errors.append("source.json shared-environment contract has no sima-mlc version")
+elif raw_sdk_version and not (
+    str(expected_sima_mlc) == raw_sdk_version
+    or str(expected_sima_mlc).startswith(f"{raw_sdk_version}.")
+    or str(expected_sima_mlc).startswith(f"{raw_sdk_version}+")
+):
+    errors.append(
+        "source.json sima-mlc version "
+        f"{expected_sima_mlc} does not belong to SDK {raw_sdk_version}"
+    )
 
 actual_versions = {}
 for distribution, expected_version in expected_packages.items():
@@ -241,12 +274,23 @@ for distribution, expected_version in expected_packages.items():
     actual_versions[distribution] = actual_version
     actual_base = actual_version.split("+", 1)[0]
     expected_base = str(expected_version).split("+", 1)[0]
-    if actual_base != expected_base:
+    versions_match = (
+        actual_version == str(expected_version)
+        if "+" in str(expected_version)
+        else actual_base == expected_base
+    )
+    if not versions_match:
+        expected_description = (
+            f"exactly {expected_version}"
+            if "+" in str(expected_version)
+            else f"base version {expected_base}"
+        )
         errors.append(
-            f"{distribution} is {actual_version}, expected base version {expected_base}"
+            f"{distribution} is {actual_version}, expected {expected_description}"
         )
 
 modules = {
+    "sima-frontend": "afe",
     "numpy": "numpy",
     "torch": "torch",
     "torchvision": "torchvision",
@@ -277,13 +321,9 @@ if errors:
     )
     raise SystemExit(1)
 
-environment_label = (
-    "Model Compiler" if is_model_compiler else "test-only compatible CI fixture"
-)
-print(f"Compatible {environment_label}: {expected_prefix}")
+print(f"Compatible Model Compiler: {expected_prefix}")
+print(f"SDK: {raw_sdk_version}")
 print(f"Python: {sys.version.split()[0]}")
-if sima_mlc_version is not None:
-    print(f"sima-mlc: {sima_mlc_version}")
 for distribution in expected_packages:
     print(f"{distribution}: {actual_versions[distribution]}")
 PY
@@ -419,13 +459,6 @@ STAGED_SITE="$INSTALL_ROOT/site"
 PREVIOUS_SIMA_BACKUP="$INSTALL_ROOT/previous-sima-qat.tar.gz"
 LEGACY_BACKUP="$INSTALL_ROOT/legacy-swml-qat.tar.gz"
 mkdir -p "$STAGED_SITE"
-
-printf '%s\n' "Checking wheel dependency metadata against Model Compiler..."
-"$MODEL_COMPILER_PYTHON" -m pip install \
-  --disable-pip-version-check \
-  --dry-run \
-  --no-index \
-  "${wheels[@]}"
 
 printf '%s\n' "Staging and functionally validating the wheel before package mutation..."
 "$MODEL_COMPILER_PYTHON" -m pip install \

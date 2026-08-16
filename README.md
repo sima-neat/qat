@@ -7,7 +7,7 @@ customer virtual environment.
 The backend uses PyTorch FX graph-mode QAT and the legacy TorchScript ONNX
 exporter. It deliberately avoids Dynamo, `torch.export`,
 `capture_pre_autograd_graph`, `prepare_qat_pt2e`, and `convert_pt2e` so it can
-run with the released Model Compiler stack:
+run with the SiMa 2.1.3 Model Compiler stack:
 
 - Python 3.12.3
 - PyTorch 2.3.1
@@ -16,9 +16,6 @@ run with the released Model Compiler stack:
 - ONNX 1.17.0
 - ONNX Runtime 1.21.1
 - PyTorch Lightning 2.4.0
-
-A separate contributor control profile exercises PyTorch 2.8 and torchvision
-0.23. The customer artifact continues to target the versions above.
 
 ## Install with Model Compiler
 
@@ -47,8 +44,9 @@ Model Compiler reinstall or upgrade because Model Compiler replaces its whole
 virtual environment.
 
 For source development, activate Model Compiler and run the checkout directly.
-Do not use a normal `pip install .`; dependency resolution must not modify the
-shared stack.
+Customer and contributor workflows use this same environment. Do not create a
+QAT-specific virtual environment or use a normal `pip install .`; dependency
+resolution must not modify the shared stack.
 
 ```bash
 activate-model-compiler
@@ -64,7 +62,7 @@ from their source location, not from the caller's current working directory.
 | Root | Purpose | Examples |
 |---|---|---|
 | `data/` | Reusable, local dataset and input caches | `data/mnist/`, the torchvision CIFAR-10 cache in `data/`, and an explicitly selected ImageNet root |
-| `build/` | Disposable test, example, tool, graph, checkpoint, log, ONNX, and report output | `build/pytest/`, `build/test-results/`, `build/examples/`, `build/tools/` |
+| `build/` | Disposable test, example, graph, checkpoint, log, and ONNX output | `build/pytest/`, `build/examples/` |
 | `dist/<arch>/` | Publishable QAT extension bundles only | `dist/amd64/`, `dist/arm64/` |
 
 Pytest recreates its selected base temporary directory at the start of a run.
@@ -186,28 +184,6 @@ Use `--disable-qat` for a float baseline. See
 [`examples/imagenet/README.md`](examples/imagenet/README.md) for checkpoint and
 standalone-export commands.
 
-The optional CIFAR-10 distillation utility uses `torch.compile` and therefore
-runs only in the disposable Torch 2.8 contributor profile. Its `torch-kmeans`
-and `transformers` dependencies are deliberately excluded from the customer
-QAT bundle and shared Model Compiler environment:
-
-This contributor workflow requires `uv` on `PATH` and package-index network access.
-
-```bash
-./setup_env.sh build/venvs/torch28-control
-uv pip install \
-  --python build/venvs/torch28-control/bin/python \
-  -r requirements-distill.txt
-build/venvs/torch28-control/bin/python scripts/distill_cifar10.py \
-  --data-dir data \
-  --output build/tools/distill_cifar10/mini_samples.json \
-  --device cpu \
-  --allow-download
-```
-The first run needs `--allow-download`; later runs use only the existing
-CIFAR-10 and TinyCLIP caches. The supplied Torch 2.8 control profile is CPU-only;
-a separately qualified CUDA control environment is required for `--device cuda`.
-
 ## Validation
 
 Run the lifecycle and graph integration suite inside Model Compiler:
@@ -218,19 +194,15 @@ python -m pytest -q -m smoke tests/integration
 python -m pytest -q tests/integration
 ```
 
-The default integration base directory is `build/pytest/integration`, its cache is
-`build/pytest-cache`, and tox writes JUnit reports to `build/test-results`.
-The integration suite covers optimizer identity, gradients, fusion, signed
+The default integration base directory is `build/pytest/integration`, and its
+cache is `build/pytest-cache`. The integration suite covers optimizer identity,
+gradients, fusion, signed
 quantization, dropout, residual/concat/slice regions, checkpoint stages,
 standard ONNX Q/DQ, and ONNX Runtime. End-to-end training gates are explicit;
 see [`tests/README.md`](tests/README.md).
 
-Pull requests run the exact Torch 2.3 Model Compiler baseline, the Torch 2.8
-control suite, generated-document checks, customer CLI checks, and a staged
-bundle installer smoke. Candidate packaging and every release/publish job are
-skipped on pull requests. Protected branches and semantic release tags use the same
-validation before candidate construction; publication still requires the external
-qualification and legal gates described below.
+Run every customer and contributor test from the activated SiMa 2.1.3 Model
+Compiler environment. This is the repository's only supported Python environment.
 
 Run the opt-in compiler tests serially from an activated Model Compiler
 environment. The pre-QAT test applies compiler PTQ to float ONNX; the post-QAT
@@ -255,16 +227,6 @@ Use `mlsoc` instead of `modalix` and a matching
 `build/pytest/model-compiler/mlsoc` base directory for the Gen1 target. Release
 qualification must run both targets on both supported host architectures; a
 single local run is development evidence only.
-
-For the contributor-only PyTorch 2.8 CPU control profile, create a disposable
-environment below `build/`:
-
-```bash
-./setup_env.sh build/venvs/torch28-control
-build/venvs/torch28-control/bin/python -m pytest -q tests/integration
-```
-
-This profile is not an installation path for Model Compiler customers.
 
 ## Build the Neat artifact
 
@@ -300,7 +262,6 @@ scripts/
   build_qat_bundle.sh   # architecture-specific publishable bundle
   install_qat_wheels.sh # shared Model Compiler installation with --no-deps
   smoke_test_qat.py     # installed-environment functional acceptance
-  distill_cifar10.py    # optional CIFAR-10 mini-index utility
 tests/
   integration/          # default lifecycle and graph contracts
   end_to_end/           # explicit CIFAR training/export/accuracy gates

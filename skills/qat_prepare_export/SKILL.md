@@ -16,15 +16,16 @@ sima-cli neat install qat/amd64  # use qat/arm64 on arm64
 activate-model-compiler
 ```
 
-Target Python 3.12.3, Torch 2.3.1, torchvision 0.18.1, NumPy 1.26.4,
-ONNX 1.17.0, ONNX Runtime 1.21.1, and PyTorch Lightning 2.4.0.
+Target the SiMa 2.1.3 baseline: Python 3.12.3, Torch 2.3.1,
+torchvision 0.18.1, NumPy 1.26.4, ONNX 1.17.0, ONNX Runtime 1.21.1, and
+PyTorch Lightning 2.4.0.
 
 - Do not create a customer QAT virtual environment.
 - Do not run a normal `pip install .` or allow pip to upgrade shared packages.
 - Reinstall QAT after any Model Compiler reinstall or upgrade; Model Compiler
   replaces the virtual environment.
-- Treat Torch 2.8/torchvision 0.23 as a contributor control profile, not the
-  customer artifact target.
+- Run customer and contributor commands from the activated SiMa 2.1.3 Model
+  Compiler environment; do not maintain a separate QAT or control environment.
 
 ## Use the repository path contract
 
@@ -207,13 +208,3 @@ Never type a documented `...` placeholder literally as a pytest path.
 - Keep generated models, compiler files, graphs, datasets, and logs out of the
   source package and Git history unless the repository intentionally tracks a
   test fixture.
-
-Create the contributor-only Torch 2.8 CPU profile below `build` when required.
-This contributor workflow requires `uv` and package-index network access:
-
-```bash
-./setup_env.sh build/venvs/torch28-control
-build/venvs/torch28-control/bin/python -m pytest -q tests/integration
-```
-
-Do not reuse that control profile as the customer Model Compiler environment.

@@ -315,13 +315,9 @@ BUILD_SOURCE="$BUILD_ROOT/source"
 BUNDLE_STAGE="$BUILD_ROOT/bundle"
 mkdir -p "$BUILD_DIST" "$BUILD_SOURCE" "$BUNDLE_STAGE"
 cp \
-  "$REPO_ROOT/setup.py" \
   "$REPO_ROOT/pyproject.toml" \
   "$REPO_ROOT/README.md" \
   "$REPO_ROOT/VERSION.in" \
-  "$REPO_ROOT/requirements.txt" \
-  "$REPO_ROOT/requirements-test.txt" \
-  "$REPO_ROOT/requirements-distill.txt" \
   "$BUILD_SOURCE/"
 cp -R "$REPO_ROOT/sima_qat" "$BUILD_SOURCE/"
 if [[ ${#LEGAL_SOURCE_FILES[@]} -gt 0 ]]; then
