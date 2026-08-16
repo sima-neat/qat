@@ -53,11 +53,14 @@ from torchvision.models import resnet50
 import pytorch_lightning as L
 from pytorch_lightning.utilities import disable_possible_user_warnings
 
-import cifar_classifier as cc
+if __package__:
+    from . import cifar_classifier as cc
+else:
+    import cifar_classifier as cc
 
 
 # Absolute path to the cached CIFAR dataset (next to this test), so the data is found
-# regardless of the test's working directory (see tests/conftest.py); downloaded on demand.
+# regardless of the test's working directory (see tests/end_to_end/conftest.py); downloaded on demand.
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 
 
@@ -235,6 +238,9 @@ def _run_resnet50_qat(args: Namespace) -> bool:
         cc.build_dataloaders = orig_build_dataloaders
 
 
+@pytest.mark.slow
+@pytest.mark.network
+@pytest.mark.gpu
 @pytest.mark.regression
 @pytest.mark.skipif(not torch.cuda.is_available(),
                     reason="ResNet50 full-CIFAR10 QAT run requires a CUDA GPU")

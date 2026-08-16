@@ -42,14 +42,19 @@ from torch import optim, nn, utils, Tensor
 import pytorch_lightning as L
 from pytorch_lightning.utilities import disable_possible_user_warnings
 
-from cifar_classifier import get_args, training_test
+if __package__:
+    from .cifar_classifier import get_args, training_test
+else:
+    from cifar_classifier import get_args, training_test
 
 
 # Absolute path to the cached CIFAR dataset (next to this test), so it is found regardless
-# of the test's working directory (see tests/conftest.py); downloaded on demand.
+# of the test's working directory (see tests/end_to_end/conftest.py); downloaded on demand.
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 
 
+@pytest.mark.slow
+@pytest.mark.network
 @pytest.mark.regression
 def test_densenet():
     disable_possible_user_warnings()

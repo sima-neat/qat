@@ -95,8 +95,8 @@ Run fast installed/lifecycle coverage first:
 
 ```bash
 activate-model-compiler
-python -m pytest -q -rs -m smoke
-python -m pytest -q tests --ignore=tests/end_to_end
+python -m pytest -q -rs -m smoke tests/integration
+python -m pytest -q tests/integration
 ```
 
 Run the CUDA-only full-CIFAR10 ResNet50 gate only when the current environment
@@ -121,11 +121,10 @@ These tiny compiler gates are CPU tests and do not require CUDA.
 ```bash
 SIMA_QAT_RUN_MODEL_COMPILER_TESTS=1 \
 SIMA_QAT_MODEL_COMPILER_TARGET=modalix \
-python -m pytest -q -s -o addopts= \
-  -n 0 \
+python -m pytest -q -s \
   --basetemp=build/model-compiler-pytest \
   -m model_compiler \
-  tests/model_compiler
+  tests/acceptance/model_compiler
 ```
 
 Use `mlsoc` for the Gen1 target and `modalix` for Gen2. The two tests prove

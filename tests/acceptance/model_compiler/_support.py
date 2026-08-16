@@ -34,8 +34,9 @@ _RUN_COMPILER_TESTS = os.environ.get(
 _INPUT_SHAPE = (1, 3, 8, 8)
 _TRANSPORT_OPS = {"QuantizeLinear", "DequantizeLinear"}
 
-pytestmark = [
+COMPILER_TEST_MARKS = [
     pytest.mark.model_compiler,
+    pytest.mark.slow,
     pytest.mark.nightly,
     pytest.mark.skipif(
         not _RUN_COMPILER_TESTS,
@@ -185,7 +186,7 @@ def _qat_contract(path: Path) -> _QatContract:
     )
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def onnx_pair(tmp_path_factory: pytest.TempPathFactory) -> _OnnxPair:
     output_dir = tmp_path_factory.mktemp("compile-onnx")
     pre_qat = output_dir / "pre_qat.onnx"
@@ -221,7 +222,7 @@ def onnx_pair(tmp_path_factory: pytest.TempPathFactory) -> _OnnxPair:
     return _OnnxPair(pre_qat=pre_qat, post_qat=post_qat)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def compiler_api() -> _CompilerApi:
     try:
         from afe.apis.defines import (
@@ -459,40 +460,3 @@ def _assert_qat_execution_matches(
     assert sdk_output.shape == ort_output.shape
     max_abs_error = float(np.max(np.abs(sdk_output - ort_output)))
     assert max_abs_error <= (2.0 * output_scale) + 1e-6
-
-
-def test_pre_qat_float_onnx_compiles(
-    onnx_pair: _OnnxPair,
-    compiler_api: _CompilerApi,
-    tmp_path: Path,
-) -> None:
-    model_name = "pre_qat"
-    model = _lower_for_compile(
-        compiler_api,
-        onnx_pair.pre_qat,
-        model_name,
-    )
-    _save_and_compile(model, tmp_path / "pre-qat-compile", model_name)
-
-
-def test_post_qat_qdq_onnx_compiles(
-    onnx_pair: _OnnxPair,
-    compiler_api: _CompilerApi,
-    tmp_path: Path,
-) -> None:
-    model_name = "post_qat"
-    contract = _qat_contract(onnx_pair.post_qat)
-    model = _lower_for_compile(
-        compiler_api,
-        onnx_pair.post_qat,
-        model_name,
-    )
-    _assert_qat_execution_matches(
-        model,
-        compiler_api,
-        onnx_pair.post_qat,
-        contract.output_scale,
-    )
-    output_dir = tmp_path / "post-qat-compile"
-    _save_and_compile(model, output_dir, model_name)
-    _assert_qat_lowering_preserved(output_dir, model_name, contract)

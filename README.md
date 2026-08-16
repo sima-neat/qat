@@ -52,7 +52,7 @@ must not modify the shared stack.
 ```bash
 activate-model-compiler
 cd /path/to/qat
-python -m pytest -m smoke
+python -m pytest -m smoke tests/integration
 ```
 
 `setup_env.sh` remains available only for the separate PyTorch 2.8 reference
@@ -149,20 +149,21 @@ Use `--disable-qat` for a float baseline.
 
 ## Validation
 
-Run the fast lifecycle and operator tests in both stacks:
+Run the fast lifecycle and graph-integration tests in both stacks:
 
 ```bash
 activate-model-compiler
-python -m pytest -m smoke
-python -m pytest tests --ignore=tests/end_to_end
+python -m pytest -q -rs -m smoke tests/integration
+python -m pytest -q tests/integration
 
 source .venv/bin/activate
-python -m pytest tests --ignore=tests/end_to_end
+python -m pytest -q tests/integration
 ```
 
-The local acceptance suite covers optimizer identity, gradients, fusion, signed
+The integration suite covers optimizer identity, gradients, fusion, signed
 quantization, dropout, residual/concat/slice regions, checkpoint stages,
-standard ONNX Q/DQ, ONNX Runtime, and ResNet export.
+standard ONNX Q/DQ, and ONNX Runtime. End-to-end DenseNet and CUDA ResNet50
+training/export checks run separately from `tests/end_to_end`.
 
 Run the opt-in ONNX compilation tests from an activated Model Compiler
 environment. The pre-QAT test applies compiler PTQ to the float ONNX model; the
@@ -173,9 +174,10 @@ arithmetic-folded representation before checking the generated MPK archive.
 activate-model-compiler
 SIMA_QAT_RUN_MODEL_COMPILER_TESTS=1 \
 SIMA_QAT_MODEL_COMPILER_TARGET=modalix \
-python -m pytest -q -s -o addopts= \
-  -n 0 \
-  -m model_compiler tests/model_compiler
+python -m pytest -q -s \
+  --basetemp=build/model-compiler-pytest \
+  -m model_compiler \
+  tests/acceptance/model_compiler
 ```
 
 Use `mlsoc` instead of `modalix` to select the Gen1 target. Release
@@ -205,9 +207,17 @@ sima_qat/
   sima_quantizer.py     # Dynamo-free FX QConfig and backend policies
   onnx_ops.py           # standard Q/DQ weight folding and validation
 examples/               # MNIST and ImageNet workflows
-tests/                  # lifecycle, operator, ONNX, and end-to-end tests
+tests/
+  integration/
+    lifecycle/          # public API, checkpoint, stage, and device contracts
+    graph/              # FX fusion, quantization, ONNX, and ORT behavior
+  end_to_end/           # CIFAR training, export, and accuracy validation
+  acceptance/
+    model_compiler/     # opt-in pre-QAT and post-QAT compilation
+  README.md             # suite taxonomy and focused commands
 scripts/
   install_qat_wheels.sh # installs into Model Compiler with --no-deps
   smoke_test_qat.py     # installed-environment functional acceptance test
+  distill_cifar10.py    # optional CIFAR mini-dataset generation utility
   source.json           # immutable shared-environment contract
 ```

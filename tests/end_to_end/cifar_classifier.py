@@ -58,7 +58,7 @@ from sima_qat.qat_api import sima_prepare_qat_model, sima_finalize_qat_model, si
 
 class CIFAR10Mini(CIFAR10):
     """ A distilled version of CIFAR10 which uses k-means clustering on image embeddings to choose
-        good samples of the original dataset. The distillation code is in misc/distill_cifar10.py.
+        good samples of the original dataset. The distillation code is in scripts/distill_cifar10.py.
 
         This distilled verison uses 250 samples per class (=2500 samples) for the train set, and
         50 samples per class (=500 samples) for the test set.

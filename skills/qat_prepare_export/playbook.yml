@@ -1,6 +1,6 @@
 id: sima-qat-prepare-export
 name: Prepare, Export, and Compile QAT Models for SiMa
-version: 0.2.0
+version: 0.2.1
 agents: [codex, claude]
 description: Skill for shared-environment FX QAT, Q/DQ ONNX export, Model Compiler acceptance compilation, and MPK artifact handling.
 compatibility:
