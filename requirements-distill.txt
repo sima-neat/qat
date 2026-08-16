@@ -1,0 +1,5 @@
+# Contributor-only profile for scripts/distill_cifar10.py.
+# Install this only in the Python 3.12.3 / Torch 2.8 control environment.
+torch==2.8.0
+torch-kmeans==0.2.0
+transformers==4.57.1

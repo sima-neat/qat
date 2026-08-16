@@ -30,7 +30,6 @@
 import numpy as np
 import onnx
 import onnxruntime
-import pytest
 import torch
 from onnx import numpy_helper
 from torch import nn
@@ -102,7 +101,6 @@ def _identity_root(value, producers):
     raise AssertionError("Identity cycle found in ONNX graph.")
 
 
-@pytest.mark.regression
 def test_concat_keeps_independent_input_scales_and_runs_in_onnxruntime(tmp_path):
     torch.manual_seed(17)
     example_inputs = (torch.randn(2, 2, 6, 6),)

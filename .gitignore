@@ -1,14 +1,38 @@
-*.pyc
-*.log
-*.onnx
-data/
-exported_models/
-build/
-dist/
+# Python
+__pycache__/
+*.py[cod]
 *.egg-info/
-sima_qat/VERSION
-examples/*/MNIST/
-examples/*/checkpoints/
-examples/*/lightning_logs/
-examples/*/prepare_p2e_graph.txt
-examples/*/post_p2e_graph.txt
+.pytest_cache/
+.tox/
+.venv/
+.venv-*/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage and test reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit*.xml
+
+# Canonical repository-generated roots
+/build/
+/dist/
+/data/
+/sima_qat/VERSION
+
+# Legacy generated roots retained for existing local workspaces
+/exported_models/
+/examples/*/data/
+/examples/*/MNIST/
+/examples/*/checkpoints/
+/examples/*/lightning_logs/
+/tests/end_to_end/data/
+
+# Legacy example files; new outputs belong under /build/examples
+/examples/**/*.onnx
+/examples/**/*.ckpt
+/examples/**/*.log
+/examples/*/prepare_p2e_graph.txt
+/examples/*/post_p2e_graph.txt

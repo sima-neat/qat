@@ -27,7 +27,6 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
-import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -49,7 +48,6 @@ class DropoutModel(nn.Module):
         return self.conv2(outputs)
 
 
-@pytest.mark.regression
 def test_module_and_functional_dropout_are_absent_from_prepared_model():
     model = DropoutModel()
     example_inputs = (torch.randn(2, 3, 6, 6),)

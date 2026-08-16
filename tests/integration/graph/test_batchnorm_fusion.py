@@ -27,7 +27,6 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
-import pytest
 import torch
 from torch import nn
 from torch.ao.nn.intrinsic import qat as intrinsic_qat
@@ -46,7 +45,6 @@ class ConvBatchNormReluModel(nn.Module):
         return self.relu(self.bn(self.conv(inputs)))
 
 
-@pytest.mark.regression
 def test_conv_batchnorm_relu_tracks_stats_then_folds_for_inference():
     torch.manual_seed(13)
     example_inputs = (torch.randn(4, 3, 8, 8) + 2.0,)

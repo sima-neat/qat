@@ -1,100 +1,129 @@
-# MNIST Classifier example
+# MNIST QAT example
 
-This folder contains the following helper files:
+This example trains an MNIST classifier with PyTorch Lightning, applies the
+public SiMa QAT lifecycle, exports opset-17 Q/DQ ONNX, and validates the model
+with CPU ONNX Runtime. It also supports a float training/export baseline.
+
+Run every command below from the repository root. Defaults are derived from the
+repository location and do not depend on the process working directory.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `mnist_lit.py` | Lightning module and QAT/float export hooks |
+| `train.py` | Train, checkpoint, fully resume, and optionally export |
+| `export_onnx.py` | Export a selected or latest checkpoint |
+| `test_onnx.py` | Check ONNX and measure MNIST top-1 accuracy |
+
+## Path contract
+
+| Path | Contents |
+|---|---|
+| `data/mnist/` | Reusable torchvision MNIST cache |
+| `build/examples/mnist/checkpoints/` | Lightning checkpoints |
+| `build/examples/mnist/lightning/` | Lightning run state and logs |
+| `build/examples/mnist/graphs/` | FX graph dumps |
+| `build/examples/mnist/exports/` | Generated ONNX models |
+
+`data/` is reusable input. Everything below `build/` is disposable output and
+is ignored by Git. The Lightning module uses the repository-root
+`build/examples/mnist` path even when imported from another working directory;
+passing `output_dir` overrides it.
+
+## Train and export
+
+Activate Model Compiler, then run:
+
+```bash
+activate-model-compiler
+python -m examples.mnist.train \
+  --data data/mnist \
+  --output-dir build/examples/mnist \
+  --epochs 2 \
+  --batch 32 \
+  --workers 1 \
+  --device cpu \
+  --download \
+  --export-on-end
 ```
-mnist/
-├── README.md
-├── mnist_lit.py
-├── train.py
-├── test_onnx.py
-└── export_onnx.py
+
+A QAT run writes `build/examples/mnist/exports/mnist_qat.onnx`. Omit
+`--download` after the cache exists. Add `--disable-qat` to train and export a
+float baseline at `build/examples/mnist/exports/mnist_float.onnx`.
+
+`--epochs`, `--batch`, and `--samples-limit` must be positive;
+`--workers` must be nonnegative. Requesting `--device cuda` fails before model
+or dataset setup when CUDA is unavailable.
+
+## Resume full training state
+
+```bash
+python -m examples.mnist.train \
+  --data data/mnist \
+  --output-dir build/examples/mnist \
+  --epochs 10 \
+  --device cpu \
+  --resume
 ```
 
-## File Descriptions
+`--resume` selects the newest checkpoint with the requested `mnist_qat_` or
+`mnist_float_` prefix and supplies it to `Trainer.fit(ckpt_path=...)`, so
+model tensors, optimizer/scheduler state, epoch, and global step are restored.
+`--epochs` is the total target epoch count, not the number of additional
+epochs. Use `--disable-qat` to select the float checkpoint namespace; QAT and float
+runs under the same output directory cannot cross-resume. The command never searches the
+current directory and fails clearly if no checkpoint exists.
 
-- **README.md** : Provides an overview of the example, file structure and descriptions, instructions on usage.
-- **mnist_lit.py** : Contains the main Lightning module implementation for training and validating the MNIST model using PyTorch Lightning.
-- **train.py**: Script to train the MNIST model. It leverages the Lightning module defined in mnist_lit.py.
-- **test_onnx.py** : Script to test the ONNX model. This evaluates the exported ONNX model's performance on the test set.
-- **export_onnx.py** : Script to export the the last trained Pytorch checkpoint into the ONNX format, which can be used for running inference on different platforms supporting ONNX.
+## Export a checkpoint
 
-## Train MNIST model using QAT
-The training process for the MNIST model uses PyTorch Lightning to streamline the training, checkpointing, and model export. Below is an overview of the key steps involved:
+PyTorch Lightning checkpoints use Python pickle. Load only checkpoints from a
+trusted source; checkpoint deserialization is not a safe interchange format.
 
-* Dataset Preparation - 
-If the dataset is already downloaded, users can specify where the `MNIST/raw` directory is in the data argument. If the dataset is not already present, the MNIST dataset is automatically downloaded and stored in the `MNIST/raw/` directory during the training process. 
+Export the latest checkpoint below the selected output directory on CPU:
 
-* Training the Model - 
-The training is managed by PyTorch Lightning's Trainer class, which simplifies the training loop, logging, and checkpointing.
-The script `train.py` starts the training process, leveraging the `mnist_lit.py` pytorch lightning module, which defines the model, training, validation steps, and metrics.
+```bash
+python -m examples.mnist.export_onnx \
+  --output-dir build/examples/mnist \
+  --device cpu
+```
 
-* QAT User API Usage -
-The user can directly leverage the `mnist_lit.py` pyTorch lightning module which internally calls the QAT user APIs. 
-    - The `on_train_start()` hook calls the `sima_prepare_qat_model()` which any Pytorch nn.Module and prepares it for QAT training. 
-    - The `on_train_end()` hook calls the `sima_finalize_qat_model()` which takes a trained QAT model and converts it to a quantized model. It becomes inference-only after this point. 
-    - The `on_fit_end()` hook calls the `sima_export_onnx()` which finalized QAT model and exports a ONNX graph for the same.
+The checkpoint is always mapped through CPU first, including checkpoints saved
+from CUDA training. A QAT checkpoint creates
+`build/examples/mnist/exports/mnist_checkpoint_qat.onnx`; a float checkpoint
+creates `mnist_checkpoint_float.onnx`. Select a checkpoint explicitly for
+reproducible automation:
 
-* Training Script Arguments - 
-The training process can be customized using various command-line arguments defined in `train.py`. These arguments allow you to control key aspects of the training, such as the number of epochs, batch size, dataset location, and more. 
+```bash
+python -m examples.mnist.export_onnx \
+  --ckpt build/examples/mnist/checkpoints/mnist_qat_classifier_epoch=1.ckpt \
+  --output-dir build/examples/mnist \
+  --device cpu
+```
 
-The Arguments can be found using the `--help` command as below:
-`python train.py --help`
+## Validate ONNX
 
-Below are the descriptions of the arguments:
+```bash
+python -m examples.mnist.test_onnx \
+  --onnx build/examples/mnist/exports/mnist_qat.onnx \
+  --dsroot data/mnist \
+  --samples-limit 1000 \
+  --min-accuracy 0.95
+```
 
-| Argument                | Default Value | Description                                                                                                           | Example Usage                     |
-|-------------------------|---------------|-----------------------------------------------------------------------------------------------------------------------|-----------------------------------|
-| `-e, --epochs`          | `10`          | The number of epochs to train the model (i.e., how many times the entire dataset is passed through the model).       | `--epochs 20`                     |
-| `-b, --batch`           | `16`          | Specifies the batch size, which is the number of training samples used in each training iteration.                   | `--batch 32`                      |
-| `-d, --data`            | `"."`         | The path where the dataset is located. If not present, the dataset can be downloaded to this path with `--download`. | `--data /path/to/dataset`        |
-| `--download`            | `False`           | Download the MNIST dataset to the specified path if it's not already available.                                      | `--download`                      |
-| `--device`              | `"cpu"`       | The device to use for training: `"mps"` for Apple Silicon GPUs, `"cuda"` for NVIDIA GPUs, or `"cpu"` for CPU.      | `--device cuda`                   |
-| `--samples-limit`       | `50000`       | Limits the number of training samples used. Useful for testing or debugging with a smaller dataset.                  | `--samples-limit 10000`          |
-| `--export-on-end`       | `False`           | Export the trained model to ONNX format at the end of training.                                                     | `--export-on-end`                 |
-| `--disable-qat`         | `False`           | Disable Quantization Aware Training (QAT), which prepares the model for quantization during training.               | `--disable-qat`                   |
-| `--resume`              | `False`          | Resume training from the most recent checkpoint if available, allowing for interrupted training sessions to continue. | `--resume`                        |
+All ONNX Runtime sessions explicitly use `CPUExecutionProvider`. Accuracy is a
+fraction in `[0, 1]`; `--min-accuracy` makes the command exit nonzero when the
+model misses the required threshold. `--samples-limit` must be positive. Add
+`--download` only when validation is allowed to populate a missing cache.
+Throughput is reported as `samples/s` without implying a precision mode.
 
-* Example Usage - 
-`python train.py -b 32 --device cpu -e 2 --download --export-on-end` 
+## CLI defaults
 
-* Checkpoints - 
-During training, the script automatically saves checkpoints at various stages to allow for model recovery and resuming training. These checkpoints are stored in the **checkpoints/** directory by default. 
+| Command | Important defaults |
+|---|---|
+| `train.py` | `--epochs 10`, `--batch 16`, `--workers 1`, QAT enabled, CPU, repository `data/mnist` and `build/examples/mnist` |
+| `export_onnx.py` | newest checkpoint under the output directory, CPU |
+| `test_onnx.py` | newest file under the default export directory, full test split, no minimum-accuracy gate |
 
-* ONNX Model Export -
-Once training is complete, the trained model is exported to the ONNX format for compatibility with various inference engines and platforms.
-The script `export_onnx.py` handles this, exporting the final model as `exported_model.onnx`, which is saved in the project directory or a specified location. This format allows for easy deployment in environments that support ONNX.
-
-
-## Test QAT ONNX model
-The `test_onnx.py` script is used to test a trained MNIST model saved in the ONNX format. 
-
-Below are the command-line arguments for this script:
-
-| Argument                | Default Value       | Description                                                                                                    | Example Usage                        |
-|-------------------------|---------------------|----------------------------------------------------------------------------------------------------------------|--------------------------------------|
-| `--onnx`                | `recent_onnx_file`  | The path to the ONNX file containing the trained MNIST model. The script finds the most recent onnx file and sets it to the name `recent_onnx_file`.                                                 | `--onnx /path/to/model.onnx`         |
-| `--dsroot`              | `.`                 | The root directory of the dataset, used for testing the model.                                                 | `--dsroot /path/to/dataset`          |
-| `--download`            | `False`             | Download the MNIST dataset to the specified dataset path if not already available.                             | `--download`                         |
-| `-v, --verbosity`       | `INFO`              | Sets the logging verbosity level (e.g., DEBUG, INFO, WARNING, ERROR).                                          | `--verbosity DEBUG`                  |
-
-The Arguments can also be found using the `--help` command as below:
-`python test_onnx.py --help`
-
-* Example Usage - 
-`python test_onnx.py` 
-
-## Export any trained checkpoint to ONNX
-The `export_onnx.py` script is used to export the most recent checkpoint of the trained model to an ONNX file. 
-
-Below are the command-line arguments for this script:
-
-| Argument                | Default Value       | Description                                                                                                      | Example Usage                        |
-|-------------------------|---------------------|------------------------------------------------------------------------------------------------------------------|--------------------------------------|
-| `-c, --ckpt`            | `latest_ckpt`       | The path to the checkpoint file to be loaded and exported as an ONNX model.                                      | `--ckpt /path/to/checkpoint.ckpt`    |
-| `--device`              | `cpu`               | The device to use for exporting the model. Options include `"cpu"`, `"cuda"`, `"mps"` for Apple GPUs, etc.        | `--device cuda`                      |
-
-The Arguments can also be found using the `--help` command as below:
-`python export_onnx.py --help`
-
-* Example Usage - 
-`python export_onnx.py`
+Use `python -m examples.mnist.<script> --help` as the authoritative option
+reference.

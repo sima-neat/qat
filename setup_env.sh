@@ -1,45 +1,71 @@
 #!/usr/bin/env bash
-# Generic setup script for the SiMa QAT package.
+# Create the contributor-only PyTorch 2.8 CPU control environment.
 #
-# Creates a Python venv, installs the runtime dependencies (from requirements.txt,
-# the single source of truth for pinned versions), installs this package in
-# editable mode, adds the test tooling, then runs a quick import / CUDA check.
+# This is not the Model Compiler installation path. Customers install the QAT
+# bundle into the existing Model Compiler environment with sima-cli.
 #
-# Usage:
-#   ./setup_env.sh [VENV_DIR] [PYTHON_VERSION]
-#
-# Examples:
-#   ./setup_env.sh                 # -> .venv,    python 3.12
-#   ./setup_env.sh .venv311 3.11   # -> .venv311, python 3.11
+# Usage: ./setup_env.sh [NEW_VENV_DIR]
+# Default: build/venvs/torch28-control
 set -euo pipefail
 
-# Resolve the repo root from this script's location so it works from any cwd.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+CONTROL_VENV="${1:-$SCRIPT_DIR/build/venvs/torch28-control}"
+CONTROL_PYTHON_VERSION="3.12.3"
+TORCH_VERSION="2.8.0"
+TORCHVISION_VERSION="0.23.0"
 
-VENV_DIR="${1:-.venv}"
-PYTHON_VERSION="${2:-3.12}"
+if [[ -z "$CONTROL_VENV" || "$CONTROL_VENV" == "/" || "$CONTROL_VENV" == "$SCRIPT_DIR" ]]; then
+  echo "Refusing unsafe control-environment path: $CONTROL_VENV" >&2
+  exit 1
+fi
+if [[ -e "$CONTROL_VENV" ]]; then
+  echo "Control-environment path already exists: $CONTROL_VENV" >&2
+  echo "Choose a new path, or remove the existing environment explicitly." >&2
+  exit 1
+fi
+if ! command -v uv >/dev/null 2>&1; then
+  echo "uv is required to create the PyTorch 2.8 control environment." >&2
+  exit 1
+fi
 
-export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/sima-qat-uv-cache}"
 export TMPDIR="${TMPDIR:-/tmp}"
 
-echo "[1/4] create venv ($VENV_DIR, python $PYTHON_VERSION)"
-rm -rf "$VENV_DIR"
-uv venv --python "$PYTHON_VERSION" "$VENV_DIR"
-PY="$VENV_DIR/bin/python"
-$PY --version
+echo "[1/5] Create Python $CONTROL_PYTHON_VERSION environment: $CONTROL_VENV"
+uv venv --python "$CONTROL_PYTHON_VERSION" "$CONTROL_VENV"
+CONTROL_PYTHON="$CONTROL_VENV/bin/python"
 
-echo "[2/4] install runtime dependencies (requirements.txt)"
-# pyyaml/setuptools/wheel are build-time requirements for the editable install below
-# (setup.py imports yaml and we use --no-build-isolation), so install them up front.
-uv pip install --python "$PY" -r requirements.txt pyyaml setuptools wheel
+echo "[2/5] Install the PyTorch 2.8 CPU control pair"
+uv pip install --python "$CONTROL_PYTHON" \
+  --index-url https://download.pytorch.org/whl/cpu \
+  "torch==$TORCH_VERSION" "torchvision==$TORCHVISION_VERSION"
 
-echo "[3/4] install sima-qat (editable, no build isolation, no deps)"
-uv pip install --python "$PY" --no-build-isolation --no-deps -e .
+echo "[3/5] Install pinned non-Torch runtime and test dependencies"
+uv pip install --python "$CONTROL_PYTHON" \
+  -r "$SCRIPT_DIR/requirements-torch28-control.txt" \
+  -r "$SCRIPT_DIR/requirements-test.txt"
 
-echo "[4/4] install test tooling"
-uv pip install --python "$PY" pytest==7.0.0 pytest-cov pytest-timeout pytest-randomly pytest-xdist
+echo "[4/5] Install the checkout without resolving the Model Compiler pins"
+uv pip install --python "$CONTROL_PYTHON" --no-deps -e "$SCRIPT_DIR"
 
-echo "=== environment check ==="
-$PY -c "import torch; print('torch', torch.__version__, '| cuda', torch.cuda.is_available(), '|', (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'))"
-echo "SETUP_DONE_OK"
+echo "[5/5] Validate the control profile"
+"$CONTROL_PYTHON" - <<'PY'
+import importlib.metadata as metadata
+import sys
+
+import sima_qat
+import torch
+
+assert sys.version_info[:3] == (3, 12, 3), sys.version
+assert metadata.version("torch").split("+", 1)[0] == "2.8.0"
+assert metadata.version("torchvision").split("+", 1)[0] == "0.23.0"
+print(
+    "Torch 2.8 control ready:",
+    f"python={sys.version.split()[0]}",
+    f"torch={torch.__version__}",
+    f"cuda={torch.cuda.is_available()}",
+)
+PY
+uv pip check --python "$CONTROL_PYTHON"
+
+echo "Run: $CONTROL_PYTHON -m pytest -q tests/integration"

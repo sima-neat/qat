@@ -27,181 +27,267 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
-import os
-
+import copy
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
-import torch
-from torch import optim, nn
-from torch.nn import CrossEntropyLoss
-import torch.nn.functional as F
-
-from torch.fx.graph_module import GraphModule
-
-import torchvision
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
+from typing import Any, Dict
 
 import pytorch_lightning as L
+import torch
+import torchvision
+from torch import nn, optim
+from torch.fx.graph_module import GraphModule
+from torch.nn import CrossEntropyLoss
 
-from sima_qat.qat_api import (sima_prepare_qat_model, 
-                              sima_finalize_qat_model, 
-                              sima_export_onnx)
+from sima_qat import (
+    sima_export_onnx,
+    sima_finalize_qat_model,
+    sima_prepare_qat_model,
+)
 
 
-# Some parts adapted from https://github.com/MadryLab/pytorch-lightning-imagenet/blob/main/imagenet.py
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_OUTPUT_DIR = _REPO_ROOT / "build" / "examples" / "imagenet"
+
+
+def _module_device(module: nn.Module) -> torch.device:
+    """Return the device that owns a module's state."""
+    for parameter in module.parameters():
+        return parameter.device
+    for buffer in module.buffers():
+        return buffer.device
+    return torch.device("cpu")
+
+
+def _resolve_weights(model_name: str, weights: str | None):
+    """Resolve a stable CLI/checkpoint weight policy to a torchvision enum."""
+    if weights is None or str(weights).lower() == "none":
+        return None
+    weights_enum = torchvision.models.get_model_weights(model_name)
+    if str(weights).upper() == "DEFAULT":
+        return weights_enum.DEFAULT
+    try:
+        return weights_enum[str(weights)]
+    except KeyError as error:
+        choices = ", ".join(member.name for member in weights_enum)
+        raise ValueError(
+            f"Unknown weights policy {weights!r} for {model_name}. "
+            f"Use DEFAULT, none, or one of: {choices}."
+        ) from error
+
+
+# Some parts adapted from
+# https://github.com/MadryLab/pytorch-lightning-imagenet/blob/main/imagenet.py
 class ImageNet_Model_Trainer(L.LightningModule):
-    # Some settings taken from https://github.com/MadryLab/pytorch-lightning-imagenet/blob/main/imagenet.py
-    def __init__(self, model: str, use_qat: bool = True, export_on_end: bool = False, 
-                 batch_size: int = 50, device_train: str = 'cuda'):
+    def __init__(
+        self,
+        model: str,
+        use_qat: bool = True,
+        export_on_end: bool = False,
+        batch_size: int = 50,
+        device_train: str = "cuda",
+        output_dir: str | Path = _DEFAULT_OUTPUT_DIR,
+        weights: str | None = None,
+    ):
         super().__init__()
+        self.output_dir = Path(output_dir).expanduser().resolve()
+        self.exports_dir = self.output_dir / "exports"
+        self.graphs_dir = self.output_dir / "graphs"
+        self.exports_dir.mkdir(parents=True, exist_ok=True)
+        self.graphs_dir.mkdir(parents=True, exist_ok=True)
         self.model_name = model
-        self.imagenet_model = torchvision.models.__dict__[model](pretrained = True)
+        self.imagenet_model = torchvision.models.get_model(
+            model,
+            weights=_resolve_weights(model, weights),
+        )
         self.prev_epoch_step = 0
-        self.val_accuracy = 0
-        self.val_batch_count = 0
+        self.val_correct = 0
+        self.val_samples = 0
         self.use_qat = use_qat
+        self._qat_prepared = False
         self.export_on_end = export_on_end
         self.dump_fx_graphs = True
-        self.dummy_inputs = (torch.randn(1, 3, 224, 224), )
+        self.dummy_inputs = (torch.randn(1, 3, 224, 224),)
         self.loss_fn = CrossEntropyLoss()
         self.lr = 1e-5
         self.weight_decay = 1e-4
         self.batch_size = batch_size
-        self.workers = 4
         self.device_train = device_train
-        # Call this last once all init has been done
+        self.weights_policy = weights
         self.save_hyperparameters()
 
     def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        return [optimizer]
-    
+        return [
+            optim.AdamW(
+                self.parameters(),
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+        ]
+
     def forward(self, imgs):
-        # Forward function that is run when visualizing the graph
         return self.imagenet_model(imgs)
 
     def training_step(self, batch, batch_idx):
+        del batch_idx
         images, target = batch
         output = self(images)
         loss_train = self.loss_fn(output, target)
         acc1, acc5 = self.__accuracy(output, target, topk=(1, 5))
-        self.log("train_loss", loss_train, on_step=True, on_epoch=True, logger=True, prog_bar=True)
+        self.log(
+            "train_loss",
+            loss_train,
+            on_step=True,
+            on_epoch=True,
+            logger=True,
+            prog_bar=True,
+        )
         self.log("train_acc1", acc1, on_step=True, prog_bar=True, on_epoch=True, logger=True)
-        self.log("train_acc5", acc5, on_step=True, on_epoch=True, logger=True)
+        self.log("train_acc5", acc5, on_step=True, prog_bar=True, on_epoch=True, logger=True)
         return loss_train
 
     def eval_step(self, batch, batch_idx, prefix: str):
+        del batch_idx
         images, target = batch
         output = self(images)
-        loss_val = self.loss_fn(output, target)
-        self.log("val_loss", loss_val, prog_bar=True)
+        loss_value = self.loss_fn(output, target)
         acc1, acc5 = self.__accuracy(output, target, topk=(1, 5))
-        self.val_accuracy += acc1
-        self.val_batch_count += 1
-        return loss_val
+        self.log(f"{prefix}_loss", loss_value, prog_bar=True)
+        self.log(f"{prefix}_acc1", acc1, prog_bar=True)
+        self.log(f"{prefix}_acc5", acc5)
+        if prefix == "val":
+            predictions = output.argmax(dim=1)
+            self.val_correct += int(predictions.eq(target).sum().item())
+            self.val_samples += int(target.numel())
+        return loss_value
 
     def validation_step(self, batch, batch_idx):
         return self.eval_step(batch, batch_idx, "val")
-    
+
     def on_validation_end(self) -> None:
         super().on_validation_end()
-        top1_acc = self.val_accuracy / self.val_batch_count
-        print(f"Validation top-1 accuracy: {top1_acc}")
-        self.val_accuracy = 0
-        self.val_batch_count = 0
-        self.prev_epoch_step = self.global_step 
-    
+        if self.val_samples:
+            top1_acc = self.val_correct / self.val_samples
+            print(f"Validation top-1 accuracy: {top1_acc:.6f}")
+        else:
+            print("Validation top-1 accuracy unavailable: no samples were evaluated.")
+        self.val_correct = 0
+        self.val_samples = 0
+        self.prev_epoch_step = self.global_step
+
     def test_step(self, batch, batch_idx):
         return self.eval_step(batch, batch_idx, "test")
-   
+
     @staticmethod
     def __accuracy(output, target, topk=(1,)):
-        """Computes the accuracy over the k top predictions for the specified values of k."""
+        """Compute top-k percentage accuracy for each requested k."""
         with torch.no_grad():
             maxk = max(topk)
             batch_size = target.size(0)
-
             _, pred = output.topk(maxk, 1, True, True)
-            pred = pred.t()
-            correct = pred.eq(target.view(1, -1).expand_as(pred))
+            correct = pred.t().eq(target.view(1, -1).expand(maxk, -1))
+            return [
+                correct[:k].reshape(-1).float().sum().mul(100.0 / batch_size)
+                for k in topk
+            ]
 
-            res = []
-            for k in topk:
-                correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-                res.append(correct_k.mul_(100.0 / batch_size))
-            return res
-    
     def on_train_start(self) -> None:
         super().on_train_start()
-        if self.use_qat:
+        if self.use_qat and not self._qat_prepared:
             self._prepare_qat()
-        else:
-            # Do a compile so we can see an FX graph
-            print(f"Compiling model to FX graph ...")
-            self._dump_fx_graph('compiled_graph.txt')
-        pass
-    
+        elif not self.use_qat:
+            print("Tracing float model to an FX graph ...")
+            self._dump_fx_graph("compiled_graph.txt")
+
     def on_train_end(self) -> None:
         super().on_train_end()
         self._finalize_qat_model()
 
     def on_train_epoch_start(self) -> None:
-        # For some reason Lightning doesn't switch to train mode hence, we ensure it switches to train mode here
         self.train(True)
 
     def _prepare_qat(self) -> None:
-        m = sima_prepare_qat_model(input_graph=self.imagenet_model, inputs=self.dummy_inputs, device=self.device_train)
-        # Now replace our model
-        setattr(self, 'imagenet_model', m)
-        self._dump_fx_graph('prepare_fx_qat_graph.txt')
-        
+        if self._qat_prepared:
+            return
+        prepared = sima_prepare_qat_model(
+            input_graph=self.imagenet_model,
+            inputs=self.dummy_inputs,
+            device=_module_device(self.imagenet_model),
+        )
+        self.imagenet_model = prepared
+        self._qat_prepared = True
+        self._dump_fx_graph("prepare_fx_qat_graph.txt")
+
     def _finalize_qat_model(self) -> None:
         self.train(False)
-        # If we are running in QAT mode, we first convert to a quantized graph.
-        if self.use_qat:
-            m = sima_finalize_qat_model(self.imagenet_model)
-            # Now replace our model
-            setattr(self, 'imagenet_model', m)
-            self._dump_fx_graph('final_fx_qat_graph.txt')
-        return
+        if not self.use_qat:
+            return
+        if not self._qat_prepared:
+            raise RuntimeError("QAT must be prepared before it can be finalized.")
+        self.imagenet_model = sima_finalize_qat_model(self.imagenet_model)
+        self._dump_fx_graph("final_fx_qat_graph.txt")
 
     def on_fit_end(self) -> None:
         if self.export_on_end:
-            self.to_onnx(file_path=f"exported_model_{self.model_name}.onnx")
-            
+            suffix = "qat" if self.use_qat else "float"
+            self.to_onnx(file_path=f"{self.model_name}_{suffix}.onnx")
+
     def _dump_fx_graph(self, fname: str) -> None:
         if not self.dump_fx_graphs:
             return
-        if not isinstance(self.imagenet_model, GraphModule):
-            from torch.fx import symbolic_trace
-            # Symbolic tracing frontend - captures the semantics of the module
-            symbolic_traced : torch.fx.GraphModule = symbolic_trace(self.imagenet_model)
-            # If the graph is not already in FX format, we skip this entire step.
-            # return
-        else:
+        if isinstance(self.imagenet_model, GraphModule):
             symbolic_traced = self.imagenet_model
+        else:
+            from torch.fx import symbolic_trace
 
-        # High-level intermediate representation (IR) - Graph representation
-        print(f"Generating graph dump to file: {fname}")
-        with open(fname, 'wt') as f:
-            print(symbolic_traced.graph, file=f)
+            symbolic_traced = symbolic_trace(self.imagenet_model)
 
-    def to_onnx(self, file_path: str | Path, input_sample: Any | None = None, **kwargs: Any) -> None:
-        """ This function needs to be overridden in the case of QAT, since export gets tricky
-            and specialized.
-        """
+        graph_path = self.graphs_dir / fname
+        print(f"Generating graph dump to file: {graph_path}")
+        with graph_path.open("wt", encoding="utf-8") as graph_file:
+            print(symbolic_traced.graph, file=graph_file)
+
+    def to_onnx(
+        self,
+        file_path: str | Path,
+        input_sample: Any | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Export either a finalized QAT graph or a float model to ONNX."""
         self.imagenet_model.train(False)
-        self.imagenet_model = sima_export_onnx(qat_model=self.imagenet_model, inputs=self.dummy_inputs, output_file=file_path, device=self.device_train)
+        output_path = Path(file_path).expanduser()
+        if not output_path.is_absolute():
+            output_path = self.exports_dir / output_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Writing ONNX model to: {output_path}")
+
+        inputs = input_sample if input_sample is not None else self.dummy_inputs
+        if not isinstance(inputs, tuple):
+            inputs = (inputs,)
+        if self.use_qat:
+            self.imagenet_model = sima_export_onnx(
+                qat_model=self.imagenet_model,
+                inputs=inputs,
+                output_file=output_path,
+                device=_module_device(self.imagenet_model),
+            )
+            return
+
+        export_model = copy.deepcopy(self.imagenet_model).cpu().eval()
+        cpu_inputs = tuple(
+            value.detach().cpu() if isinstance(value, torch.Tensor) else value
+            for value in inputs
+        )
+        export_kwargs = {
+            "export_params": True,
+            "opset_version": 17,
+            "do_constant_folding": True,
+            **kwargs,
+        }
+        with torch.no_grad():
+            torch.onnx.export(export_model, cpu_inputs, output_path, **export_kwargs)
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """ We have to apply the QAT scaffold before we load a checkpoint (if QAT is enabled),
-            because Pytorch doesn't serialize the graph, just the params. Pytorch changesf
-            all the param names when scaffolding is applied, so the state_dict will have 
-            mismatching keys unless we scaffold the model first.
-        """
+        """Prepare the QAT scaffold before Lightning restores its tensors."""
         if self.use_qat:
             self._prepare_qat()
         return super().on_load_checkpoint(checkpoint)
-

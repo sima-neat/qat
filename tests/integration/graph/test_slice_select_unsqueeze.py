@@ -30,7 +30,6 @@
 import numpy as np
 import onnx
 import onnxruntime
-import pytest
 import torch
 from torch import nn
 from torch.ao.quantization import FakeQuantize
@@ -61,7 +60,6 @@ class SliceSelectUnsqueezeModel(nn.Module):
         return self.conv(torch.cat(channels, dim=1))
 
 
-@pytest.mark.regression
 def test_slice_select_unsqueeze_boundaries_export_and_run(tmp_path):
     torch.manual_seed(19)
     example_inputs = (torch.randn(2, 3, 8, 8),)

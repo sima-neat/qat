@@ -27,198 +27,195 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
-"""Script to load a generated ONNX file and run MNIST samples through it.
+"""Validate a generated MNIST ONNX model with CPU ONNX Runtime."""
 
-    Dataset loading uses torchvision; the inference path uses numpy and onnxruntime.
-"""
-import sys
-import os
-import datetime
-from glob import glob
-from argparse import ArgumentParser, Namespace
-from typing import Callable, Dict, List, Iterable
-from pathlib import Path
 import logging
 import time
+from argparse import ArgumentParser, ArgumentTypeError, Namespace
+from pathlib import Path
+from typing import Dict
 
-from tqdm import tqdm
+import numpy as np
 import onnx
 import onnxruntime
-import numpy as np
-
-from torch.utils.data import DataLoader
-from torchvision.datasets import MNIST
-from torchvision import transforms
-
 import pytorch_lightning as L
+from torchvision import transforms
+from torchvision.datasets import MNIST
+from tqdm import tqdm
 
 from sima_qat.misc import find_latest_file_string
 
 
-def validate_model_and_input(onnx_file_name: str, input_: np.ndarray) -> np.ndarray:
-    # Find out if we are using a more recent ONNX model.
-    onnx_model = onnx.load(onnx_file_name)
-    ort_session = onnxruntime.InferenceSession(onnx_file_name)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_DATA_DIR = _REPO_ROOT / "data" / "mnist"
+_DEFAULT_EXPORT_DIR = _REPO_ROOT / "build" / "examples" / "mnist" / "exports"
 
-    # get the name of the first input of the model
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise ArgumentTypeError(f"expected a positive integer, got {value}")
+    return parsed
+
+
+def _accuracy(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise ArgumentTypeError("accuracy must be between 0.0 and 1.0")
+    return parsed
+
+
+def _create_cpu_session(onnx_path: Path) -> onnxruntime.InferenceSession:
+    return onnxruntime.InferenceSession(
+        str(onnx_path),
+        providers=["CPUExecutionProvider"],
+    )
+
+
+def validate_model_and_input(onnx_path: Path, input_: np.ndarray) -> list[np.ndarray]:
+    onnx_model = onnx.load(str(onnx_path))
+    onnx.checker.check_model(onnx_model)
+    ort_session = _create_cpu_session(onnx_path)
+
     input_t = ort_session.get_inputs()[0]
-    logging.info(f"Input {input_t.name}, shape: {input_t.shape}")
+    logging.info("Input %s, shape: %s", input_t.name, input_t.shape)
     output_t = ort_session.get_outputs()[0]
-    logging.info(f"Output {output_t.name}, shape: {output_t.shape}")
-
-    ort_inputs = {input_t.name: input_}
-    outs = ort_session.run(None, ort_inputs)
-    return outs
+    logging.info("Output %s, shape: %s", output_t.name, output_t.shape)
+    return ort_session.run(None, {input_t.name: input_})
 
 
-class MNISTIterator(object):
-    """ This is a helper class to iterate over samples in the MNIST dataset.
+class MNISTIterator:
+    """Indexable view of the torchvision MNIST test split."""
 
-        Note: __iter__ not implemented for now.
-    """
-    def __init__(self, ds_root: str, download: bool) -> None:
-
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
-        ])
-        assert os.path.isdir(ds_root)
-
-        # Fixed to test set for now.
+    def __init__(
+        self,
+        ds_root: str | Path,
+        download: bool,
+        samples_limit: int | None = None,
+    ) -> None:
+        root = Path(ds_root).expanduser().resolve()
+        if download:
+            root.mkdir(parents=True, exist_ok=True)
+        elif not root.is_dir():
+            raise FileNotFoundError(
+                f"MNIST dataset cache not found: {root}. Pass --download to create it."
+            )
+        transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.1307,), (0.3081,)),
+            ]
+        )
         self.mnist_dataset_test = MNIST(
-            download=download, 
-            root=ds_root, 
+            download=download,
+            root=str(root),
             transform=transform,
             train=False,
         )
-        return
+        self.samples_limit = samples_limit
 
     def __len__(self) -> int:
-        return len(self.mnist_dataset_test)
+        length = len(self.mnist_dataset_test)
+        return min(length, self.samples_limit) if self.samples_limit else length
 
-    def __getitem__(self, i: int) -> Dict:
-        """ Returns dict: {'image', 'mask'}
-        """
-        v = self.mnist_dataset_test[i]
-        return {'sample': v[0], 'gt': v[1]}
-    
-
-def debug_allclose(a, b, rtol=1e-2) -> bool:
-    ''' Helper function.
-    '''
-    a = a.flatten()
-    b = b.flatten()
-    err = False
-    for i in range(len(a)):
-        if b[i] == 0.0:
-            diff = a[i] - b[i]
-        else:
-            diff = abs((a[i]/(b[i]+1e-9)) - 1.0)
-        if diff > rtol:
-            print(f"Got [{i}] miscompare: {diff:.6f} pct, {a[i]} / {b[i]}")
-            # return False
-            err = True
-    return not err
-
-
-def debug_compare_tensors(t_dut: np.ndarray, t_ref_name: str) -> bool:
-    """ Do a comparison against a reference value.
-    """
-    if os.path.isfile(t_ref_name):
-        hmap_ref = np.load(t_ref_name)
-    else:
-        logging.warning(f"No numpy debug file found for: {t_ref_name}")
-    # We will print a message at > 10%. There seems to be a surprising difference
-    # for some elements in each tensor, so this should prompt some additional debug
-    # to find out more.
-    return debug_allclose(hmap_ref, t_dut, rtol=1e-1)
+    def __getitem__(self, index: int) -> Dict:
+        sample, target = self.mnist_dataset_test[index]
+        return {"sample": sample, "gt": target}
 
 
 def run_accuracy_test(
-        ort_session: onnxruntime.InferenceSession,
-        dataset_test: object,
-    ) -> float:
-    """ Run the dataset against the model and compute accuracy.
-    """
-    super_debug = False
-
-    # Get model IO
+    ort_session: onnxruntime.InferenceSession,
+    dataset_test: object,
+) -> float:
+    """Run the dataset against the model and return top-1 accuracy in [0, 1]."""
     input_t = ort_session.get_inputs()[0]
-    output_t = ort_session.get_outputs()[0]
+    sample_count = len(dataset_test)
+    if sample_count <= 0:
+        raise ValueError("Accuracy validation requires at least one sample")
 
-    l = len(dataset_test)
-    class_outputs = np.zeros((l,), dtype=np.int32)
-    class_gt = np.zeros((l,), dtype=np.int32)
+    correct = 0
     inf_start = time.perf_counter()
-    # For some strange reason, the builtin iterator throws an exception because
-    # it tries to iterate past the dataset size ...
-    for i in tqdm(range(l)):
-        sample = dataset_test[i]
-        # Expand the batch dimension to 1: (1, H, W) -> (1, 1, H, W)
-        nn_in = np.expand_dims(sample['sample'], axis=0)
-        s_out = ort_session.run(None, {input_t.name: nn_in})
-        # 1st network output, batch dim = 1
-        net_map = s_out[0][0]
-        class_outputs[i] = np.argmax(net_map)
-        class_gt[i] = sample['gt']
+    for index in tqdm(range(sample_count)):
+        sample = dataset_test[index]
+        image = sample["sample"]
+        if hasattr(image, "detach"):
+            image = image.detach().cpu().numpy()
+        nn_input = np.expand_dims(image, axis=0)
+        outputs = ort_session.run(None, {input_t.name: nn_input})
+        prediction = int(np.argmax(outputs[0][0]))
+        correct += int(prediction == sample["gt"])
 
-    inf_end = time.perf_counter()
-    fps = l / (inf_end - inf_start)
-    logging.info(f"FP32 FPS: {fps}")
-
-    scores = class_outputs == class_gt
-    acc = np.mean(scores.astype(np.float32))
-    return acc
-
+    elapsed = time.perf_counter() - inf_start
+    logging.info("Throughput: %.2f samples/s", sample_count / elapsed)
+    return correct / sample_count
 
 
 def get_args() -> Namespace:
-    """Get CLI arguments.
-
-    Returns:
-        Namespace: CLI arguments.
-    """
-    # Find the presence of onnx files first
-    recent_onnx_file = find_latest_file_string(os.getcwd())
-
-    parser = ArgumentParser()
-    parser.add_argument("--onnx", type=str, required=False, default=recent_onnx_file, help="The ONNX file containing a MNIST Model.")
-    parser.add_argument("--dsroot", type=str, required=False, default='.', help="Directory for the root of the dataset.")
-    parser.add_argument('--download', action='store_true', help='Download dataset to specified data path')
-    parser.add_argument('-v', '--verbosity', type=str, default='INFO', help='Logging verbosity level')
+    """Get CLI arguments."""
+    recent_onnx_file = find_latest_file_string(str(_DEFAULT_EXPORT_DIR))
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--onnx",
+        type=Path,
+        default=recent_onnx_file,
+        help="ONNX model to validate (defaults to the latest example export)",
+    )
+    parser.add_argument(
+        "--dsroot",
+        type=Path,
+        default=_DEFAULT_DATA_DIR,
+        help="MNIST dataset cache directory",
+    )
+    parser.add_argument("--download", action="store_true", help="Download missing MNIST data")
+    parser.add_argument(
+        "--samples-limit",
+        type=_positive_int,
+        default=None,
+        help="Maximum number of validation samples",
+    )
+    parser.add_argument(
+        "--min-accuracy",
+        type=_accuracy,
+        default=None,
+        help="Fail with a nonzero exit status when top-1 accuracy is below this value",
+    )
+    parser.add_argument("-v", "--verbosity", default="INFO", help="Logging verbosity level")
     return parser.parse_args()
 
 
-def main():
+def main() -> float:
     args = get_args()
     logging.getLogger().setLevel(args.verbosity)
-
-    # Set the global seed to be able to be able to replicate results.
     L.seed_everything(42)
 
-    onnxf = os.path.abspath(args.onnx)
-    logging.info(f"Loading ONNX file: {onnxf}")
+    if not args.onnx:
+        raise FileNotFoundError(
+            f"No ONNX model found under {_DEFAULT_EXPORT_DIR}; pass --onnx explicitly."
+        )
+    onnx_path = Path(args.onnx).expanduser().resolve()
+    if not onnx_path.is_file():
+        raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
+    logging.info("Loading ONNX file: %s", onnx_path)
 
-    dim = 28
-    input_ = np.random.rand(1, 1, dim, dim).astype(np.float32)
-    logging.info(f'Testing model on input shape: {input_.shape}')
+    input_ = np.random.rand(1, 1, 28, 28).astype(np.float32)
+    logging.info("Testing model on input shape: %s", input_.shape)
+    validate_model_and_input(onnx_path, input_)
+    logging.info("ONNX validation succeeded.")
 
-    outs = validate_model_and_input(onnxf, input_)
-    logging.info('Succeeded.')
-
-    # After we do a smoke test of the model (does it compile and produce outputs), we pass
-    # dataset samples into the network and manually compute accuracy.
-    dsroot = os.path.abspath(args.dsroot)
-    logging.info(f"Using MNIST dataset at: {dsroot}")
-    dataset_test = MNISTIterator(ds_root=dsroot, download=args.download)
-
-    ort_session = onnxruntime.InferenceSession(onnxf, sess_opts=None)
-    acc = run_accuracy_test(
-        ort_session, 
-        dataset_test, 
+    dataset_test = MNISTIterator(
+        ds_root=args.dsroot,
+        download=args.download,
+        samples_limit=args.samples_limit,
     )
-    logging.info(f"Top-1 accuracy: {acc}")
+    accuracy = run_accuracy_test(_create_cpu_session(onnx_path), dataset_test)
+    logging.info("Top-1 accuracy: %.6f", accuracy)
+    if args.min_accuracy is not None and accuracy < args.min_accuracy:
+        raise SystemExit(
+            f"Top-1 accuracy {accuracy:.6f} is below required minimum "
+            f"{args.min_accuracy:.6f}"
+        )
+    return accuracy
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

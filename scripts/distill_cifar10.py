@@ -1,216 +1,329 @@
+"""Create a class-balanced CIFAR-10 mini-sample index.
 
-import os
-import logging
+Repository-relative CLI paths are resolved from the repository root so the
+utility behaves the same from every working directory.
+"""
+
+from __future__ import annotations
+
 import argparse
 from argparse import Namespace
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-import json
 from copy import deepcopy
+import json
+from pathlib import Path
+from typing import Any
 
-from tqdm import tqdm
 import numpy as np
-
+from tqdm import tqdm
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch import Tensor
+from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import CIFAR10
-from torchvision.models import DenseNet
-# from torchsummary import summary
-
-from torch import optim, nn, utils, Tensor
-from torch.nn import CrossEntropyLoss
-import torch.nn.functional as F
-
-# For embedding processing
-from transformers import CLIPProcessor, CLIPModel
-from torch_kmeans import KMeans
-
-# Distill the CIFAR10 samples down to 1000 samples.
-
-torch_device = None
 
 
-def clip_embeddings(class_samples: np.ndarray) -> np.ndarray:
-    model = CLIPModel.from_pretrained("wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M")
-    processor = CLIPProcessor.from_pretrained("wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M")
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_DATA_DIR = _REPO_ROOT / "data"
+_DEFAULT_OUTPUT = (
+    _REPO_ROOT / "build" / "tools" / "distill_cifar10" / "mini_samples.json"
+)
+_TINY_CLIP_MODEL = "wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M"
+torch_device = torch.device("cpu")
 
-    model.to(torch_device)
-    c_model = torch.compile(model)
+
+def _resolve_repo_path(path: Path) -> Path:
+    resolved = path.expanduser()
+    if not resolved.is_absolute():
+        resolved = _REPO_ROOT / resolved
+    return resolved.resolve()
+
+
+def _require_distillation_dependencies() -> None:
+    torch_base_version = torch.__version__.split("+", 1)[0]
+    torch_major_minor = tuple(
+        int(part) for part in torch_base_version.split(".")[:2]
+    )
+    if torch_major_minor != (2, 8):
+        raise RuntimeError(
+            "CIFAR distillation requires the disposable Torch 2.8 control "
+            f"profile; found torch {torch.__version__}."
+        )
+    try:
+        import torch_kmeans  # noqa: F401
+        import transformers  # noqa: F401
+    except ImportError as error:
+        raise RuntimeError(
+            "CIFAR distillation requires the optional contributor packages "
+            "from requirements-distill.txt. They are not part of the customer "
+            "QAT bundle. Install that profile into the disposable Torch 2.8 "
+            "control environment; do not modify the shared Model Compiler "
+            "environment."
+        ) from error
+
+
+def clip_embeddings(
+    class_samples: np.ndarray,
+    allow_download: bool,
+) -> Tensor:
+    from transformers import CLIPModel, CLIPProcessor
+
+    model = CLIPModel.from_pretrained(
+        _TINY_CLIP_MODEL,
+        local_files_only=not allow_download,
+    )
+    processor = CLIPProcessor.from_pretrained(
+        _TINY_CLIP_MODEL,
+        local_files_only=not allow_download,
+    )
+
+    compute_dtype = (
+        torch.float16 if torch_device.type == "cuda" else torch.float32
+    )
+    model.to(device=torch_device, dtype=compute_dtype).eval()
+    compiled_model = torch.compile(model)
 
     embed_dim = 512
     sample_features = []
-    print(f"Computing image embeddings ...")
+    print("Computing image embeddings ...")
 
-    with torch.no_grad(): # torch.autocast(device_type="mps", dtype=torch.float16):
-        for i in tqdm(range(len(class_samples))):
-            image = Tensor(class_samples[i]).to(torch_device)
-            inputs = processor(images=image, return_tensors="pt", padding=True, do_rescale=False)
-            for k, v in inputs.items():
-                inputs[k] = v.half().to(torch_device)
-
-            image_features = c_model.get_image_features(**inputs)
-            
+    with torch.no_grad():
+        for sample in tqdm(class_samples):
+            image = Tensor(sample).to(torch_device)
+            inputs = processor(
+                images=image,
+                return_tensors="pt",
+                padding=True,
+                do_rescale=False,
+            )
+            inputs = {
+                name: (
+                    value.to(device=torch_device, dtype=compute_dtype)
+                    if value.is_floating_point()
+                    else value.to(torch_device)
+                )
+                for name, value in inputs.items()
+            }
+            image_features = compiled_model.get_image_features(**inputs)
             sample_features.append(image_features[0])
-    
-    # Choose batch=4 to improve downstream runtime
+
+    # Keep four batches for the batched KMeans implementation used below.
     embed_features = torch.stack(sample_features).view((4, -1, embed_dim))
-    # Save memory
-    del sample_features
     return embed_features
 
 
-def build_dataloaders(args: Namespace):
-    """ Build the dataset iterators
-    """
-    # We need absolutely minimal transforms here because the CLIP embedding needs unprocessed 
-    # image data.
-    test_transforms = transforms.Compose([
-        transforms.ToTensor(),
-    ])
+def build_dataloaders(args: Namespace) -> tuple[DataLoader, DataLoader]:
+    """Build deterministic CIFAR-10 iterators for index selection."""
+    dataset_transform = transforms.Compose([transforms.ToTensor()])
+    dataset_train = CIFAR10(
+        args.data_dir,
+        train=True,
+        download=args.allow_download,
+        transform=dataset_transform,
+    )
+    dataset_test = CIFAR10(
+        args.data_dir,
+        train=False,
+        download=args.allow_download,
+        transform=dataset_transform,
+    )
 
-    dataset_train = CIFAR10(args.data, train=True, download=True, transform=test_transforms)
-    dataset_test = CIFAR10(args.data, train=False, download=True, transform=test_transforms)
-
-    workers = 0
-    train_dataloader = DataLoader(dataset_train, batch_size=args.batch, shuffle=False, num_workers=workers) # persistent_workers=True)
-    test_dataloader = DataLoader(dataset_test, batch_size=args.batch, shuffle=False, num_workers=workers)  #, persistent_workers=True)
+    train_dataloader = DataLoader(
+        dataset_train,
+        batch_size=args.batch,
+        shuffle=False,
+        num_workers=0,
+    )
+    test_dataloader = DataLoader(
+        dataset_test,
+        batch_size=args.batch,
+        shuffle=False,
+        num_workers=0,
+    )
     return train_dataloader, test_dataloader
 
 
 def get_samples(dloader: DataLoader, sample_list: np.ndarray) -> np.ndarray:
-    # Collect given samples into a single array.
-    sample_set = set([int(x) for x in sample_list])
+    """Collect selected samples into a contiguous array."""
+    sample_set = {int(index) for index in sample_list}
     out_samples = np.zeros((len(sample_list), 3, 32, 32), dtype=np.float32)
     tail_ptr = 0
-    for i, s in enumerate(dloader):
-        if i not in sample_set:
+    for index, sample in enumerate(dloader):
+        if index not in sample_set:
             continue
-        out_samples[tail_ptr] = s[0].cpu().numpy()
+        out_samples[tail_ptr] = sample[0].cpu().numpy()
         tail_ptr += 1
     return out_samples
 
 
-def check_uniqueness(x):
-    if isinstance(x, list):
-        x = np.array(x, dtype=np.int64)
-    if isinstance(x, Tensor):
-        x = x.cpu().numpy()
-    x = x.flatten()
-    uniques = set(x)
-    lu = len(uniques)
-    if lu != x.size:
-        print(f"Got {lu} unique indices and expected: {x.size}")
-    return
+def check_uniqueness(values: Any) -> None:
+    if isinstance(values, list):
+        values = np.array(values, dtype=np.int64)
+    if isinstance(values, Tensor):
+        values = values.cpu().numpy()
+    values = values.flatten()
+    unique_count = len(set(values))
+    if unique_count != values.size:
+        print(f"Got {unique_count} unique indices and expected: {values.size}")
 
 
-def classify_and_sort(dloader: DataLoader, n_clusters: int) -> np.ndarray:
+def classify_and_sort(
+    dloader: DataLoader,
+    n_clusters: int,
+    allow_download: bool,
+) -> np.ndarray:
+    from torch_kmeans import KMeans
+
     n_classes = 10
-
-    # Sort the samples by GT identity. Record the index of each sample in each set.
-    gt_classes = np.zeros((n_classes, int(len(dloader)/n_classes)), dtype=np.int64)
+    gt_classes = np.zeros(
+        (n_classes, int(len(dloader) / n_classes)),
+        dtype=np.int64,
+    )
     class_ptr = np.zeros((n_classes,), dtype=np.int64)
 
-    for i, s in enumerate(dloader):
-        # each sample is [sample, gt]
-        classid = s[1].cpu().numpy()[0]
-        ptr = class_ptr[classid]
-        gt_classes[classid][ptr] = i
-        class_ptr[classid] += 1
-    
+    for index, sample in enumerate(dloader):
+        class_id = sample[1].cpu().numpy()[0]
+        pointer = class_ptr[class_id]
+        gt_classes[class_id][pointer] = index
+        class_ptr[class_id] += 1
+
     print(f"Got {gt_classes.shape[1]} samples for {n_classes} classes")
-    # SANITY: check for uniqueness
     check_uniqueness(gt_classes)
 
-    kmeans = KMeans(n_clusters=n_clusters).half().to(torch_device)
-    c_kmeans = torch.compile(kmeans)
-    if False:
-        # show a summary
-        summary(kmeans, (4, 250, 512))
-
+    compute_dtype = (
+        torch.float16 if torch_device.type == "cuda" else torch.float32
+    )
+    kmeans = KMeans(n_clusters=n_clusters).to(torch_device)
+    if compute_dtype == torch.float16:
+        kmeans = kmeans.half()
+    compiled_kmeans = torch.compile(kmeans)
     chosen_samples = np.zeros((n_classes, n_clusters), dtype=np.int64)
 
     for category in range(n_classes):
         class_samples = get_samples(dloader, sample_list=gt_classes[category])
+        embeddings = clip_embeddings(
+            class_samples,
+            allow_download=allow_download,
+        ).to(compute_dtype)
 
-        # Compute embeddings for each sample.
-        emb = clip_embeddings(class_samples).half()
-        # Be conservative with memory
-        del class_samples
-        
-        print(f"Computing top-{n_clusters} feature clusters for class: {category} ...")
-        # Run k-means on all embeddings
-        category_kmeans = deepcopy(c_kmeans).to(torch_device)
-        cluster_idx = category_kmeans.fit_predict(emb)
-        cluster_idx = torch.flatten(cluster_idx).cpu().numpy()
-        # This has shape (1, n_samples)
-        # 
-        # Here we will take the simplest approach of choosing the first element for each k-bin.
-        # The more optimal version would select the sample with the lowest distance from 
-        # each k-centroid.
-        #
-        # Once we get indices into the categorical subset, we need to remap those indices into
-        # the full set.
-        category_indices = np.array([int(np.where(cluster_idx == i)[0][0]) for i in range(n_clusters)])
-        # check_uniqueness(category_indices)
+        print(
+            f"Computing top-{n_clusters} feature clusters for class: "
+            f"{category} ..."
+        )
+        category_kmeans = deepcopy(compiled_kmeans).to(torch_device)
+        cluster_indices = category_kmeans.fit_predict(embeddings)
+        cluster_indices = torch.flatten(cluster_indices).cpu().numpy()
+
+        category_indices = np.array(
+            [
+                int(np.where(cluster_indices == cluster)[0][0])
+                for cluster in range(n_clusters)
+            ]
+        )
         chosen_samples[category] = gt_classes[category][category_indices]
-        # print("")
 
     check_uniqueness(chosen_samples)
     return chosen_samples
 
 
-def write_samples(chosen_samples: np.ndarray):
-    # Write out our chosen samples. We will do this using a very simple scheme that's easy for
-    # a dataset wrapper to consume. We will map from a set of included samples onto an index
-    # from the original dataset.        
-    fname = f"mini_samples.json"
-    print(f"Writing mini samples to file: {fname}")
-    with open(fname, 'w') as f:
-        json.dump(chosen_samples, f, indent=4)
-    return
+def write_samples(chosen_samples: dict[str, list[int]], output: Path) -> None:
+    """Write the selected source-dataset indices as JSON."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Writing mini samples to file: {output}")
+    with output.open("w", encoding="utf-8") as stream:
+        json.dump(chosen_samples, stream, indent=4)
+        stream.write("\n")
 
 
-def main(args: Namespace):
+def main(args: Namespace) -> None:
+    _require_distillation_dependencies()
     train_dataloader, test_dataloader = build_dataloaders(args)
-
-    subset_map = {
-        'train': train_dataloader,
-        'test': test_dataloader,
+    subsets = {
+        "train": train_dataloader,
+        "test": test_dataloader,
+    }
+    mini_samples: dict[str, list[int]] = {
+        "train": [],
+        "test": [],
     }
 
-    mini_samples = {
-        'train': [],
-        'test': [],
-    }
+    for name, dataloader in subsets.items():
+        n_samples = int(args.sample_pct * len(dataloader))
+        if n_samples < 1:
+            raise ValueError(
+                f"--sample-pct={args.sample_pct} selects no {name} samples"
+            )
+        print(f"Distilling subset: {name} to {n_samples} samples per class")
+        chosen_samples = classify_and_sort(
+            dataloader,
+            n_clusters=n_samples,
+            allow_download=args.allow_download,
+        )
 
-    for k, v in subset_map.items():
-        n_samples = int(args.sample_pct * len(v))
-        print(f"Distilling subset: {k} to {n_samples} samples per class")
-        chosen_samples = classify_and_sort(v, n_clusters=n_samples)
+        for category in chosen_samples:
+            mini_samples[name].extend(int(index) for index in category)
+        check_uniqueness(mini_samples[name])
 
-        # Put the results in a simple data struct
-        for category in range(len(chosen_samples)):
-            for s in chosen_samples[category]:
-                mini_samples[k].append(int(s))
-        check_uniqueness(mini_samples[k])
-
-    write_samples(mini_samples)
-    return
+    write_samples(mini_samples, args.output)
 
 
-def get_args():
-    parser = argparse.ArgumentParser(description=f"Minify CIFAR10")
-    parser.add_argument('-b', '--batch', type=int, default=1, help='Batch size')
-    parser.add_argument('-d', '--data', type=str, default="./data", help='Dataset location')
-    parser.add_argument('-s', '--sample-pct', type=float, default=0.002, help='Percentage of samples to keep')
-    parser.add_argument('--device', type=str, default="cpu", help='Device to use')
-    all_args = parser.parse_args()
-    return all_args
+def get_args() -> Namespace:
+    parser = argparse.ArgumentParser(
+        description="Create a class-balanced CIFAR-10 mini-sample index"
+    )
+    parser.add_argument(
+        "-b",
+        "--batch",
+        type=int,
+        choices=[1],
+        default=1,
+        help="Loader batch size; index selection currently requires 1",
+    )
+    parser.add_argument(
+        "-d",
+        "--data-dir",
+        type=Path,
+        default=_DEFAULT_DATA_DIR,
+        help="CIFAR-10 cache (relative paths resolve from the repository root)",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=_DEFAULT_OUTPUT,
+        help="Output JSON path (relative paths resolve from the repository root)",
+    )
+    parser.add_argument(
+        "-s",
+        "--sample-pct",
+        type=float,
+        default=0.002,
+        help="Fraction of each dataset split to retain per class",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help="Torch device used for embedding and clustering",
+    )
+    parser.add_argument(
+        "--allow-download",
+        action="store_true",
+        help="Permit CIFAR-10 and TinyCLIP downloads when caches are missing",
+    )
+    args = parser.parse_args()
+    if not 0.0 < args.sample_pct <= 1.0:
+        parser.error("--sample-pct must be in the interval (0, 1]")
+    args.data_dir = _resolve_repo_path(args.data_dir)
+    args.output = _resolve_repo_path(args.output)
+    return args
 
 
 if __name__ == "__main__":
     run_args = get_args()
     torch_device = torch.device(run_args.device)
-    print(f"Using pytorch device: {torch_device}")
-    main(run_args)
+    if torch_device.type == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("error: --device cuda was requested, but CUDA is unavailable")
+    print(f"Using PyTorch device: {torch_device}")
+    try:
+        main(run_args)
+    except RuntimeError as error:
+        raise SystemExit(f"error: {error}") from None

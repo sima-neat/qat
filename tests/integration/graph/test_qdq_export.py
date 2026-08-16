@@ -32,7 +32,6 @@ import copy
 import numpy as np
 import onnx
 import onnxruntime
-import pytest
 import torch
 from onnx import TensorProto, numpy_helper
 from torch import nn
@@ -112,7 +111,6 @@ def _identity_root(value, producers):
     raise AssertionError("Identity cycle found in ONNX graph.")
 
 
-@pytest.mark.regression
 def test_onnx_qdq_topology_checker_runtime_and_cpu_restoration(tmp_path):
     torch.manual_seed(23)
     example_inputs = (torch.randn(2, 2, 4, 4),)

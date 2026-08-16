@@ -27,21 +27,35 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
+import copy
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
-import torch
-from torch import optim, nn, utils, Tensor
-from torch.nn import CrossEntropyLoss
-import torch.nn.functional as F
-
-from torch.fx.graph_module import GraphModule
+from typing import Any, Dict
 
 import pytorch_lightning as L
+import torch
+import torch.nn.functional as F
+from torch import nn, optim
+from torch.fx.graph_module import GraphModule
+from torch.nn import CrossEntropyLoss
 
-from sima_qat.qat_api import (sima_prepare_qat_model, 
-                              sima_finalize_qat_model, 
-                              sima_export_onnx)
+from sima_qat import (
+    sima_export_onnx,
+    sima_finalize_qat_model,
+    sima_prepare_qat_model,
+)
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_OUTPUT_DIR = _REPO_ROOT / "build" / "examples" / "mnist"
+
+
+def _module_device(module: nn.Module) -> torch.device:
+    """Return the device that owns a module's state."""
+    for parameter in module.parameters():
+        return parameter.device
+    for buffer in module.buffers():
+        return buffer.device
+    return torch.device("cpu")
 
 
 class MNIST_Model(nn.Module):
@@ -67,135 +81,171 @@ class MNIST_Model(nn.Module):
         x = self.fc1(x)
         x = F.relu(x)
         x = self.dropout2(x)
-        x = self.fc2(x)
-        output = x
-        return output
+        return self.fc2(x)
 
 
 class MNIST_Trainer(L.LightningModule):
-    def __init__(self, use_qat: bool = True, export_on_end: bool = False):
+    def __init__(
+        self,
+        use_qat: bool = True,
+        export_on_end: bool = False,
+        output_dir: str | Path = _DEFAULT_OUTPUT_DIR,
+    ):
         super().__init__()
+        self.output_dir = Path(output_dir).expanduser().resolve()
+        self.exports_dir = self.output_dir / "exports"
+        self.graphs_dir = self.output_dir / "graphs"
+        self.exports_dir.mkdir(parents=True, exist_ok=True)
+        self.graphs_dir.mkdir(parents=True, exist_ok=True)
         self.mnist_model = MNIST_Model()
         self.loss_fn = CrossEntropyLoss()
         self.prev_epoch_step = 0
-        self.val_accuracy = 0
-        self.val_batch_count = 0
+        self.val_correct = 0
+        self.val_samples = 0
         self.use_qat = use_qat
+        self._qat_prepared = False
         self.export_on_end = export_on_end
         self.dump_fx_graphs = True
-        self.dummy_inputs = (torch.randn(1, 1, 28, 28), )
-        # Call this last once all init has been done
+        self.dummy_inputs = (torch.randn(1, 1, 28, 28),)
         self.save_hyperparameters()
 
     def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(), lr=1e-3)
-        return optimizer
-    
+        return optim.AdamW(self.parameters(), lr=1e-3)
+
     def forward(self, imgs):
-        # Forward function that is run when visualizing the graph
         return self.mnist_model(imgs)
-        
+
     def _step(self, batch, batch_idx):
+        del batch_idx
         x, gt = batch
         logits_y = self.mnist_model(x)
-        loss = self.loss_fn(logits_y, gt)
-        return loss
+        return self.loss_fn(logits_y, gt)
 
     def training_step(self, batch, batch_idx):
         loss = self._step(batch, batch_idx)
-        # Logging to TensorBoard (if installed) by default
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
+        del batch_idx
         x, gt = batch
         logits_y = self.mnist_model(x)
         loss = self.loss_fn(logits_y, gt)
-        # We run the validation set here.
         self.log("val_loss", loss, prog_bar=True)
-        # Compute top-1 accuracy here and keep a running tab of results.
         scores = torch.argmax(logits_y, dim=-1) == gt
-        self.val_accuracy += torch.mean(scores.type(torch.float32))
-        self.val_batch_count += 1
+        self.val_correct += int(scores.sum().item())
+        self.val_samples += int(gt.numel())
         return loss
-    
+
     def on_validation_end(self) -> None:
         super().on_validation_end()
-        top1_acc = self.val_accuracy / self.val_batch_count
-        print(f"Validation top-1 accuracy: {top1_acc}")
-        self.val_accuracy = 0
-        self.val_batch_count = 0
-        self.prev_epoch_step = self.global_step 
+        if self.val_samples:
+            top1_acc = self.val_correct / self.val_samples
+            print(f"Validation top-1 accuracy: {top1_acc:.6f}")
+        else:
+            print("Validation top-1 accuracy unavailable: no samples were evaluated.")
+        self.val_correct = 0
+        self.val_samples = 0
+        self.prev_epoch_step = self.global_step
 
     def on_train_start(self) -> None:
         super().on_train_start()
-        if self.use_qat:
+        if self.use_qat and not self._qat_prepared:
             self._prepare_qat()
-        else:
-            # Do a compile so we can see an FX graph
-            print(f"Compiling model to FX graph ...")
-            self._dump_fx_graph('compiled_graph.txt')
-        pass
+        elif not self.use_qat:
+            print("Tracing float model to an FX graph ...")
+            self._dump_fx_graph("compiled_graph.txt")
 
     def on_train_end(self) -> None:
         super().on_train_end()
         self._finalize_qat_model()
 
     def on_train_epoch_start(self) -> None:
-        # For some reason Lightning doesn't switch to train mode hence, we ensure it switches to train mode here
         self.train(True)
 
     def _prepare_qat(self) -> None:
-        m = sima_prepare_qat_model(input_graph=self.mnist_model, inputs=self.dummy_inputs, device=self.device)
-        # Now replace our model
-        setattr(self, 'mnist_model', m)
-        self._dump_fx_graph('prepare_fx_qat_graph.txt')
+        if self._qat_prepared:
+            return
+        prepared = sima_prepare_qat_model(
+            input_graph=self.mnist_model,
+            inputs=self.dummy_inputs,
+            device=_module_device(self.mnist_model),
+        )
+        self.mnist_model = prepared
+        self._qat_prepared = True
+        self._dump_fx_graph("prepare_fx_qat_graph.txt")
 
     def _finalize_qat_model(self) -> None:
         self.train(False)
-        # If we are running in QAT mode, we first convert to a quantized graph.
-        if self.use_qat:
-            m = sima_finalize_qat_model(self.mnist_model)
-            # Now replace our model
-            setattr(self, 'mnist_model', m)
-            self._dump_fx_graph('final_fx_qat_graph.txt')
-        return
+        if not self.use_qat:
+            return
+        if not self._qat_prepared:
+            raise RuntimeError("QAT must be prepared before it can be finalized.")
+        self.mnist_model = sima_finalize_qat_model(self.mnist_model)
+        self._dump_fx_graph("final_fx_qat_graph.txt")
 
     def on_fit_end(self) -> None:
         if self.export_on_end:
-            self.to_onnx(file_path='exported_model.onnx')
+            suffix = "qat" if self.use_qat else "float"
+            self.to_onnx(file_path=f"mnist_{suffix}.onnx")
 
     def _dump_fx_graph(self, fname: str) -> None:
         if not self.dump_fx_graphs:
             return
-        if not isinstance(self.mnist_model, GraphModule):
-            from torch.fx import symbolic_trace
-            # Symbolic tracing frontend - captures the semantics of the module
-            symbolic_traced : torch.fx.GraphModule = symbolic_trace(self.mnist_model)
-            # If the graph is not already in FX format, we skip this entire step.
-            # return
-        else:
+        if isinstance(self.mnist_model, GraphModule):
             symbolic_traced = self.mnist_model
+        else:
+            from torch.fx import symbolic_trace
 
-        # High-level intermediate representation (IR) - Graph representation
-        print(f"Generating graph dump to file: {fname}")
-        with open(fname, 'wt') as f:
-            print(symbolic_traced.graph, file=f)
+            symbolic_traced = symbolic_trace(self.mnist_model)
 
-    def to_onnx(self, file_path: str | Path, input_sample: Any | None = None, **kwargs: Any) -> None:
-        """ This function needs to be overridden in the case of QAT, since export gets tricky
-            and specialized.
-        """
+        graph_path = self.graphs_dir / fname
+        print(f"Generating graph dump to file: {graph_path}")
+        with graph_path.open("wt", encoding="utf-8") as graph_file:
+            print(symbolic_traced.graph, file=graph_file)
+
+    def to_onnx(
+        self,
+        file_path: str | Path,
+        input_sample: Any | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Export either a finalized QAT graph or a float model to ONNX."""
         self.train(False)
-        sima_export_onnx(qat_model=self.mnist_model, inputs=self.dummy_inputs, output_file=file_path)
-    
+        output_path = Path(file_path).expanduser()
+        if not output_path.is_absolute():
+            output_path = self.exports_dir / output_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Writing ONNX model to: {output_path}")
+
+        inputs = input_sample if input_sample is not None else self.dummy_inputs
+        if not isinstance(inputs, tuple):
+            inputs = (inputs,)
+        if self.use_qat:
+            sima_export_onnx(
+                qat_model=self.mnist_model,
+                inputs=inputs,
+                output_file=output_path,
+                device=_module_device(self.mnist_model),
+            )
+            return
+
+        export_model = copy.deepcopy(self.mnist_model).cpu().eval()
+        cpu_inputs = tuple(
+            value.detach().cpu() if isinstance(value, torch.Tensor) else value
+            for value in inputs
+        )
+        export_kwargs = {
+            "export_params": True,
+            "opset_version": 17,
+            "do_constant_folding": True,
+            **kwargs,
+        }
+        with torch.no_grad():
+            torch.onnx.export(export_model, cpu_inputs, output_path, **export_kwargs)
+
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """ We have to apply the QAT scaffold before we load a checkpoint (if QAT is enabled),
-            because Pytorch doesn't serialize the graph, just the params. Pytorch changes
-            all the param names when scaffolding is applied, so the state_dict will have 
-            mismatching keys unless we scaffold the model first.
-        """
+        """Prepare the QAT scaffold before Lightning restores its tensors."""
         if self.use_qat:
             self._prepare_qat()
         return super().on_load_checkpoint(checkpoint)
-    

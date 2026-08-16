@@ -28,6 +28,7 @@
 #
 #**************************************************************************
 import copy
+from pathlib import Path
 
 import pytest
 import torch
@@ -64,14 +65,30 @@ def _prepared_tiny(example_inputs):
 
 
 @pytest.mark.smoke
-@pytest.mark.regression
-def test_qat_public_api_imports_and_supported_runtime():
+def test_qat_public_api_imports_and_supported_runtime(monkeypatch):
     major, minor = torch.__version__.split("+", 1)[0].split(".")[:2]
 
     assert sima_qat.__name__ == "sima_qat"
+    assert sima_qat.__all__ == [
+        "sima_prepare_qat_model",
+        "sima_finalize_qat_model",
+        "sima_export_onnx",
+        "__version__",
+    ]
+    for public_name in sima_qat.__all__[:-1]:
+        assert callable(getattr(sima_qat, public_name))
     assert callable(qat_api.sima_prepare_qat_model)
     assert callable(qat_api.sima_finalize_qat_model)
     assert callable(qat_api.sima_export_onnx)
+    expected_version = (
+        Path(__file__).resolve().parents[3] / "VERSION.in"
+    ).read_text(encoding="utf-8").strip()
+    assert sima_qat.__version__ == expected_version
+
+    # A source checkout must not report an older installed distribution.
+    monkeypatch.setattr(sima_qat, "version", lambda _distribution: "999.0.0")
+    assert sima_qat._resolve_version() == expected_version
+
     assert int(major) == 2
     assert 3 <= int(minor) < 9
 
@@ -84,7 +101,6 @@ def test_qat_public_api_imports_and_supported_runtime():
 
 
 @pytest.mark.smoke
-@pytest.mark.regression
 def test_prepare_train_and_finalize_lifecycle_preserves_optimizer_parameters():
     torch.manual_seed(7)
     model = TinyClassifier()
@@ -166,7 +182,6 @@ def test_prepare_train_and_finalize_lifecycle_preserves_optimizer_parameters():
         finalized.train(True)
 
 
-@pytest.mark.regression
 def test_prepared_checkpoint_schema_round_trip_and_stage_guards():
     torch.manual_seed(11)
     example_inputs = (torch.randn(2, 1, 8, 8),)
@@ -220,7 +235,6 @@ def test_prepared_checkpoint_schema_round_trip_and_stage_guards():
         qat_api.sima_prepare_qat_model(finalized, example_inputs, "cpu")
 
 
-@pytest.mark.regression
 def test_lifecycle_rejects_invalid_inputs_and_unfinalized_export(tmp_path):
     example_inputs = (torch.randn(2, 1, 8, 8),)
 

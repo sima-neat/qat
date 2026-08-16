@@ -1,0 +1,1 @@
+"""MNIST QAT example package."""

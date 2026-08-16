@@ -21,7 +21,7 @@ import pytest
 import torch
 from torch import nn
 
-from sima_qat.qat_api import (
+from sima_qat import (
     sima_export_onnx,
     sima_finalize_qat_model,
     sima_prepare_qat_model,
@@ -37,7 +37,6 @@ _TRANSPORT_OPS = {"QuantizeLinear", "DequantizeLinear"}
 COMPILER_TEST_MARKS = [
     pytest.mark.model_compiler,
     pytest.mark.slow,
-    pytest.mark.nightly,
     pytest.mark.skipif(
         not _RUN_COMPILER_TESTS,
         reason=(
@@ -56,12 +55,6 @@ class _CompileModel(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.relu(self.conv(inputs))
-
-
-@dataclass(frozen=True)
-class _OnnxPair:
-    pre_qat: Path
-    post_qat: Path
 
 
 @dataclass(frozen=True)
@@ -186,12 +179,7 @@ def _qat_contract(path: Path) -> _QatContract:
     )
 
 
-@pytest.fixture(scope="session")
-def onnx_pair(tmp_path_factory: pytest.TempPathFactory) -> _OnnxPair:
-    output_dir = tmp_path_factory.mktemp("compile-onnx")
-    pre_qat = output_dir / "pre_qat.onnx"
-    post_qat = output_dir / "post_qat.onnx"
-
+def _fixture_model() -> tuple[_CompileModel, torch.Tensor]:
     torch.manual_seed(7)
     inputs = torch.linspace(
         -1.5,
@@ -200,7 +188,62 @@ def onnx_pair(tmp_path_factory: pytest.TempPathFactory) -> _OnnxPair:
         dtype=torch.float32,
     ).reshape(_INPUT_SHAPE)
     model = _CompileModel().eval()
-    _float_export(model, inputs, pre_qat)
+    return model, inputs
+
+
+@pytest.fixture(scope="session")
+def compiler_target_name() -> str:
+    """Return the explicit, validated qualification target name."""
+    raw_target = os.environ.get("SIMA_QAT_MODEL_COMPILER_TARGET")
+    if raw_target is None or not raw_target.strip():
+        pytest.fail(
+            "SIMA_QAT_MODEL_COMPILER_TARGET must be explicitly set to "
+            "'modalix' or 'mlsoc' for compiler acceptance.",
+            pytrace=False,
+        )
+    target_name = raw_target.strip().lower()
+    if target_name not in {"modalix", "mlsoc"}:
+        pytest.fail(
+            "SIMA_QAT_MODEL_COMPILER_TARGET must be 'modalix' or 'mlsoc', "
+            f"not {target_name!r}.",
+            pytrace=False,
+        )
+    return target_name
+
+
+@pytest.fixture(scope="session")
+def compiler_artifact_root(
+    tmp_path_factory: pytest.TempPathFactory,
+    compiler_target_name: str,
+) -> Path:
+    """Return a basetemp whose final component matches the target."""
+    artifact_root = tmp_path_factory.getbasetemp().resolve()
+    if artifact_root.name != compiler_target_name:
+        pytest.fail(
+            "Compiler --basetemp must end with the selected target name; "
+            f"target={compiler_target_name!r}, basetemp={artifact_root}.",
+            pytrace=False,
+        )
+    return artifact_root
+
+
+@pytest.fixture(scope="session")
+def float_onnx(compiler_artifact_root: Path) -> Path:
+    output_dir = compiler_artifact_root / "pre_qat" / "export"
+    output_dir.mkdir(parents=True)
+    output = output_dir / "pre_qat.onnx"
+    model, inputs = _fixture_model()
+    _float_export(model, inputs, output)
+    _validate_fixture_operators(output, qat=False)
+    return output
+
+
+@pytest.fixture(scope="session")
+def qat_onnx(compiler_artifact_root: Path) -> Path:
+    output_dir = compiler_artifact_root / "post_qat" / "export"
+    output_dir.mkdir(parents=True)
+    output = output_dir / "post_qat.onnx"
+    model, inputs = _fixture_model()
 
     qat_model = sima_prepare_qat_model(model, (inputs,), "cpu")
     qat_model.train()
@@ -211,19 +254,18 @@ def onnx_pair(tmp_path_factory: pytest.TempPathFactory) -> _OnnxPair:
     sima_export_onnx(
         qat_model,
         (inputs,),
-        str(post_qat),
+        str(output),
         input_names=["input"],
         output_names=["output"],
         device="cpu",
     )
 
-    _validate_fixture_operators(pre_qat, qat=False)
-    _validate_fixture_operators(post_qat, qat=True)
-    return _OnnxPair(pre_qat=pre_qat, post_qat=post_qat)
+    _validate_fixture_operators(output, qat=True)
+    return output
 
 
 @pytest.fixture(scope="session")
-def compiler_api() -> _CompilerApi:
+def compiler_api(compiler_target_name: str) -> _CompilerApi:
     try:
         from afe.apis.defines import (
             InputName,
@@ -252,16 +294,7 @@ def compiler_api() -> _CompilerApi:
             pytrace=False,
         )
 
-    target_name = os.environ.get(
-        "SIMA_QAT_MODEL_COMPILER_TARGET", "modalix"
-    ).lower()
     targets = {"modalix": gen2_target, "mlsoc": gen1_target}
-    if target_name not in targets:
-        pytest.fail(
-            "SIMA_QAT_MODEL_COMPILER_TARGET must be 'modalix' or 'mlsoc', "
-            f"not {target_name!r}.",
-            pytrace=False,
-        )
 
     return _CompilerApi(
         ImporterParams=ImporterParams,
@@ -270,7 +303,7 @@ def compiler_api() -> _CompilerApi:
         ScalarType=ScalarType,
         default_quantization=default_quantization,
         load_model=load_model,
-        target=targets[target_name],
+        target=targets[compiler_target_name],
     )
 
 

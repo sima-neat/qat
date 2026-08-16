@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import inspect
 import operator
+import re
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from packaging import version
 from torch import Tensor, nn
 from torch.ao.quantization import FakeQuantize
 from torch.ao.quantization.fake_quantize import disable_observer, enable_fake_quant
@@ -33,10 +33,22 @@ from sima_qat.sima_quantizer import (
 )
 
 
-if (
-    version.parse(torch.__version__) < version.parse("2.3.0")
-    or version.parse(torch.__version__) >= version.parse("2.9.0")
-):
+__all__ = [
+    "sima_prepare_qat_model",
+    "sima_finalize_qat_model",
+    "sima_export_onnx",
+]
+
+def _torch_major_minor(raw_version: str) -> Tuple[int, int]:
+    """Extract Torch's numeric major/minor pair without third-party helpers."""
+    match = re.match(r"^\s*(\d+)\.(\d+)(?=\D|$)", raw_version)
+    if match is None:
+        raise RuntimeError(f"Unable to parse torch version {raw_version!r}")
+    return int(match.group(1)), int(match.group(2))
+
+
+_TORCH_MAJOR_MINOR = _torch_major_minor(torch.__version__)
+if not (2, 3) <= _TORCH_MAJOR_MINOR < (2, 9):
     raise RuntimeError(
         "Sima QAT only supports torch version 2.3.x through 2.8.x, "
         f"found {torch.__version__}"

@@ -57,7 +57,6 @@ class ConvReluModel(nn.Module):
         return self.pool(self.activation(self.conv(inputs)))
 
 
-@pytest.mark.regression
 def test_conv_relu_is_one_public_fx_qat_fusion():
     example_inputs = (torch.randn(2, 3, 8, 8),)
     prepared = sima_prepare_qat_model(ConvReluModel(), example_inputs, "cpu")
@@ -306,7 +305,6 @@ def _assert_legacy_region(model, case):
         "silu_functional",
     ],
 )
-@pytest.mark.regression
 def test_legacy_fusion_regions_export_with_standard_qdq(case, tmp_path):
     torch.manual_seed(23)
     model, example_inputs = _fusion_case(case)

@@ -1,19 +1,24 @@
-name: Publish QAT
+# Release boundary:
+# This workflow validates the portable CPU QAT implementation and builds release
+# candidates. It does not pretend that GitHub-hosted runners qualify real SiMa
+# compiler targets, GPU behavior, or native arm64 execution. Publishing requires
+# an external qualification record for the exact SHA and approved legal files.
+name: QAT Validation and Release
 
-run-name: Publish QAT from ${{ github.ref_name }}
+run-name: QAT validation and release from ${{ github.ref_name }}
 
 on:
+  pull_request:
   push:
     branches:
-      - "**"
+      - main
+      - develop
     tags:
-      - "*"
+      - "v*"
   workflow_dispatch:
 
 permissions:
-  actions: write
   contents: read
-  id-token: write
 
 concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
@@ -21,17 +26,64 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  QAT_BUILD_TOOLS: >-
+    pip==24.0 setuptools==84.0.0 wheel==0.48.0
 
 jobs:
-  resolve-vulcan-config:
-    name: Resolve Vulcan Config
-    if: ${{ github.event_name == 'workflow_dispatch' || github.ref_type == 'tag' || github.ref_name == 'develop' || github.ref_name == 'main' }}
-    uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@main
-    with:
-      vulcan_env: ${{ vars.VULCAN_ENV || 'dev' }}
+  release-context:
+    name: Validate workflow context
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      update_latest: ${{ steps.ref.outputs.update_latest }}
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      REF_TYPE: ${{ github.ref_type }}
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Checkout candidate ref
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          clean: true
+          fetch-depth: 1
+
+      - name: Admit pull-request validation or protected release refs
+        id: ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          update_latest=false
+          case "$EVENT_NAME:$REF_TYPE:$REF_NAME" in
+            pull_request:*)
+              ;;
+            push:branch:main|push:branch:develop)
+              update_latest=true
+              ;;
+            push:tag:*)
+              [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+                echo "Release tags must match vMAJOR.MINOR.PATCH; found: $REF_NAME" >&2
+                exit 1
+              }
+              package_version="$(< VERSION.in)"
+              [[ "${REF_NAME#v}" == "$package_version" ]] || {
+                echo "Release tag $REF_NAME does not match VERSION.in ($package_version)." >&2
+                exit 1
+              }
+              ;;
+            workflow_dispatch:branch:main|workflow_dispatch:branch:develop)
+              update_latest=true
+              ;;
+            *)
+              echo "Publishing workflows are limited to main, develop, and semantic v* tags." >&2
+              echo "Manual dispatch must target main or develop." >&2
+              exit 1
+              ;;
+          esac
+          echo "update_latest=$update_latest" >> "$GITHUB_OUTPUT"
 
   validate-qat:
     name: Validate QAT (Python 3.12.3 / Torch 2.3.1 CPU)
+    needs: release-context
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -39,25 +91,26 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           clean: true
           fetch-depth: 0
 
       - name: Set up Python 3.12.3
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12.3'
 
-      - name: Install exact Model Compiler CPU baseline
+      - name: Install exact build and test tooling
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip wheel setuptools pyyaml
+          python -m pip install --upgrade $QAT_BUILD_TOOLS
           python -m pip install --index-url https://download.pytorch.org/whl/cpu \
             torch==2.3.1 torchvision==0.18.1
           python -m pip install \
             numpy==1.26.4 onnx==1.17.0 onnxruntime==1.21.1 \
-            pytorch-lightning==2.4.0 'pytest>=7,<10'
+            pytorch-lightning==2.4.0
+          python -m pip install -r requirements-test.txt
           python - <<'PY'
           import importlib.metadata as metadata
           import sys
@@ -74,21 +127,47 @@ jobs:
           for name, expected_version in expected.items():
               actual = metadata.version(name)
               assert actual.split('+', 1)[0] == expected_version, (name, actual)
+          expected_tools = {
+              'pip': '24.0',
+              'setuptools': '84.0.0',
+              'wheel': '0.48.0',
+          }
+          for name, expected_version in expected_tools.items():
+              assert metadata.version(name) == expected_version, (name, metadata.version(name))
           PY
           python -m pip check
+
+      - name: Verify generated API documentation is current
+        run: |
+          set -euo pipefail
+          python scripts/generate_api_docs.py --check
 
       - name: Run Dynamo-free FX/QDQ integration suite
         run: python -m pytest -q tests/integration
 
+      - name: Validate customer CLI and shell entrypoints
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m examples.mnist.train --help
+          python -m examples.mnist.export_onnx --help
+          python -m examples.mnist.test_onnx --help
+          python -m examples.imagenet.train --help
+          python -m examples.imagenet.export_onnx --help
+          python -m examples.imagenet.test_onnx --help
+          python scripts/distill_cifar10.py --help
+          bash -n scripts/*.sh setup_env.sh
+
       - name: Build acceptance bundle
         run: |
           set -euo pipefail
-          bash scripts/build_qat_bundle.sh \
+          scripts/build_qat_bundle.sh \
             --target-arch amd64 \
             --output-dir "$QAT_BUNDLE_DIR" \
             --bundle-version "ci-${GITHUB_SHA::12}"
 
-      - name: Inspect and install built wheel without dependencies
+      - name: Inspect bundle inventory and wheel contents
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -97,86 +176,343 @@ jobs:
           import zipfile
 
           bundle = Path(os.environ['QAT_BUNDLE_DIR'])
+          entries = {path.name for path in bundle.iterdir()}
           wheels = list(bundle.glob('*.whl'))
           assert len(wheels) == 1, wheels
+          legal_names = (
+              'LICENSE', 'LICENSE.txt', 'LICENSE.md',
+              'NOTICE', 'NOTICE.txt', 'NOTICE.md',
+          )
+          legal = {name for name in legal_names if (bundle / name).is_file()}
+          assert all((bundle / name).stat().st_size > 0 for name in legal)
+          expected = {
+              wheels[0].name,
+              'install_qat_wheels.sh',
+              'manifest.txt',
+              'metadata.json',
+              'smoke_test_qat.py',
+              'source.json',
+          } | legal
+          assert entries == expected, (entries, expected)
           with zipfile.ZipFile(wheels[0]) as archive:
-              leaked = [
-                  name
-                  for name in archive.namelist()
-                  if name == 'tests' or name.startswith('tests/')
-              ]
+              members = archive.namelist()
+          leaked = [
+              name
+              for name in members
+              if name in {'tests', 'examples'} or name.startswith(('tests/', 'examples/'))
+          ]
           assert not leaked, leaked
+          for legal_name in legal:
+              assert any(
+                  member.endswith(f'.dist-info/licenses/{legal_name}')
+                  for member in members
+              ), (legal_name, members)
           PY
-          wheels=("$QAT_BUNDLE_DIR"/*.whl)
-          [[ ${#wheels[@]} -eq 1 ]]
-          python -m pip install --no-deps --force-reinstall "${wheels[0]}"
 
-      - name: Run installed-wheel smoke outside checkout
+      - name: Exercise installer in a compatible CI fixture (test-only)
+        env:
+          QAT_ALLOW_COMPATIBLE_TEST_ENV: "1"
+          CI: "true"
         run: |
           set -euo pipefail
-          smoke_dir="$(mktemp -d "$RUNNER_TEMP/qat-smoke.XXXXXX")"
-          expected_prefix="$(python -c 'import sys; print(sys.prefix)')"
-          cd "$smoke_dir"
-          python "$QAT_BUNDLE_DIR/smoke_test_qat.py" \
-            --expected-prefix "$expected_prefix"
-          python -m pip check
+          install_dir="$(mktemp -d "$RUNNER_TEMP/qat-install.XXXXXX")"
+          model_compiler_dir="$(python -c 'import sys; print(sys.prefix)')"
+          cd "$install_dir"
+          QAT_MODEL_COMPILER_DIR="$model_compiler_dir" \
+            bash "$QAT_BUNDLE_DIR/install_qat_wheels.sh"
 
-  package-qat:
-    name: Package QAT (${{ matrix.arch }})
-    needs: validate-qat
+  validate-torch28-control:
+    name: Validate QAT control (Python 3.12.3 / Torch 2.8 CPU)
+    needs: release-context
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-          - arch: arm64
+    timeout-minutes: 20
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           clean: true
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - name: Set up Python 3.12.3
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12.3'
 
-      - name: Install build dependencies
+      - name: Install the Torch 2.8 CPU control profile
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip wheel setuptools pyyaml
+          python -m pip install --upgrade $QAT_BUILD_TOOLS
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.8.0 torchvision==0.23.0
+          python -m pip install \
+            -r requirements-torch28-control.txt \
+            -r requirements-test.txt
+          python -m pip install --no-deps .
+          python - <<'PY'
+          import importlib.metadata as metadata
+          from pathlib import Path
+          import sys
 
-      - name: Build QAT package
+          assert sys.version_info[:3] == (3, 12, 3), sys.version
+          assert metadata.version('torch').split('+', 1)[0] == '2.8.0'
+          assert metadata.version('torchvision').split('+', 1)[0] == '0.23.0'
+          expected_qat = Path('VERSION.in').read_text(encoding='utf-8').strip()
+          assert metadata.version('sima-qat') == expected_qat
+          PY
+          python -m pip check
+
+      - name: Verify installed package outside the checkout
+        working-directory: ${{ runner.temp }}
+        run: python -c 'from sima_qat import __version__, sima_prepare_qat_model; print(__version__)'
+
+      - name: Run Dynamo-free FX/QDQ integration suite
+        run: python -m pytest -q tests/integration
+
+  package-qat:
+    if: ${{ github.event_name != 'pull_request' }}
+    name: Build QAT candidate (${{ matrix.arch }})
+    needs:
+      - release-context
+      - validate-qat
+      - validate-torch28-control
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          clean: true
+          fetch-depth: 0
+
+      - name: Set up Python 3.12.3
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12.3'
+
+      - name: Install exact build tooling
+        run: python -m pip install --upgrade $QAT_BUILD_TOOLS
+
+      - name: Build portable candidate bundle
         run: |
           set -euo pipefail
-          python3 scripts/generate_api_docs.py
-          bash scripts/build_qat_bundle.sh --target-arch "${{ matrix.arch }}" --output-dir "dist/${{ matrix.arch }}"
+          scripts/build_qat_bundle.sh --target-arch "${{ matrix.arch }}"
           ls -la "dist/${{ matrix.arch }}"
+          {
+            echo "### ${{ matrix.arch }} candidate only"
+            echo
+            echo "This pure-Python bundle build is not native ${{ matrix.arch }} qualification."
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload QAT package
-        uses: actions/upload-artifact@v7
+      - name: Upload QAT candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: qat-extension-${{ matrix.arch }}
           path: dist/${{ matrix.arch }}/*
           if-no-files-found: error
           retention-days: 3
 
-  publish-qat:
-    name: Publish QAT to Vulcan (${{ matrix.arch }})
-    if: ${{ github.event_name == 'workflow_dispatch' || github.ref_type == 'tag' || github.ref_name == 'develop' || github.ref_name == 'main' }}
-    needs:
-      - resolve-vulcan-config
-      - package-qat
+  validate-packaged-candidates:
+    name: Validate uploaded QAT candidate (${{ matrix.arch }})
+    needs: package-qat
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-          - arch: arm64
-    uses: sima-neat/.github/.github/workflows/vulcan-publish-artifacts.yml@main
+        arch:
+          - amd64
+          - arm64
+    env:
+      CANDIDATE_DIR: ${{ runner.temp }}/qat-candidate-${{ matrix.arch }}
+      QAT_ALLOW_COMPATIBLE_TEST_ENV: "1"
+      CI: "true"
+
+    steps:
+      - name: Set up Python 3.12.3
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12.3'
+
+      - name: Install exact Model Compiler CPU fixture
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade $QAT_BUILD_TOOLS
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.3.1 torchvision==0.18.1
+          python -m pip install \
+            numpy==1.26.4 onnx==1.17.0 onnxruntime==1.21.1 \
+            pytorch-lightning==2.4.0
+          python -m pip check
+
+      - name: Download exact uploaded candidate
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          name: qat-extension-${{ matrix.arch }}
+          path: ${{ env.CANDIDATE_DIR }}
+
+      - name: Verify candidate inventory, checksums, and wheel metadata
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from email.parser import BytesParser
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          from packaging.requirements import Requirement
+          import zipfile
+
+          candidate = Path(os.environ['CANDIDATE_DIR'])
+          entries = list(candidate.iterdir())
+          assert entries and all(path.is_file() and not path.is_symlink() for path in entries)
+          by_name = {path.name: path for path in entries}
+          wheels = [path for path in entries if path.suffix == '.whl']
+          assert len(wheels) == 1, wheels
+          metadata = json.loads(by_name['metadata.json'].read_text(encoding='utf-8'))
+          resources = metadata['resources']
+          checksums = metadata['resources-checksum']
+          assert set(resources) == set(checksums) == set(by_name) - {'metadata.json'}
+          for name in resources:
+              assert re.fullmatch(r'[0-9a-f]{64}', checksums[name])
+              assert hashlib.sha256(by_name[name].read_bytes()).hexdigest() == checksums[name]
+          with zipfile.ZipFile(wheels[0]) as archive:
+              members = archive.namelist()
+              member, = [
+                  name for name in members
+                  if name.endswith('.dist-info/METADATA')
+              ]
+              leaked = [
+                  name for name in members
+                  if name in {'tests', 'examples'}
+                  or name.startswith(('tests/', 'examples/'))
+              ]
+              assert not leaked, leaked
+              wheel_metadata = BytesParser().parsebytes(archive.read(member))
+          requirements = [
+              Requirement(value)
+              for value in wheel_metadata.get_all('Requires-Dist', [])
+          ]
+          runtime = {
+              requirement.name.lower(): requirement
+              for requirement in requirements
+              if requirement.marker is None
+          }
+          assert '2.3.1' in runtime['torch'].specifier
+          assert '2.8.0' in runtime['torch'].specifier
+          assert '2.9.0' not in runtime['torch'].specifier
+          assert '0.18.1' in runtime['torchvision'].specifier
+          assert '0.23.0' in runtime['torchvision'].specifier
+          assert '0.24.0' not in runtime['torchvision'].specifier
+          assert wheel_metadata['Requires-Python'] == '==3.12.3'
+          print(f'validated candidate resources: {sorted(by_name)}')
+          PY
+          {
+            echo "### Exact ${{ matrix.arch }} candidate SHA-256 inventory"
+            echo
+            echo '```text'
+            sha256sum "$CANDIDATE_DIR"/* | sort
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install and smoke the exact uploaded candidate
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          model_compiler_dir="$(python -c 'import sys; print(sys.prefix)')"
+          QAT_MODEL_COMPILER_DIR="$model_compiler_dir" \
+            bash "$CANDIDATE_DIR/install_qat_wheels.sh"
+
+  release-preflight:
+    if: ${{ github.event_name != 'pull_request' }}
+    name: Require external qualification and legal approval
+    needs: release-context
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      QUALIFIED_SHA: ${{ vars.QAT_RELEASE_QUALIFIED_SHA }}
+    steps:
+      - name: Checkout candidate SHA
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          clean: true
+          fetch-depth: 1
+
+      - name: Enforce external release boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ### External QAT release boundary
+
+          `QAT_RELEASE_QUALIFIED_SHA` is an external approval record for this exact
+          commit. Approval must cover real Modalix and MLSoC compilation, amd64 and
+          arm64 execution, and end-to-end GPU behavior. These checks cannot be
+          represented by the portable GitHub-hosted tests in this workflow.
+          SUMMARY
+          if [[ -z "$QUALIFIED_SHA" || "$QUALIFIED_SHA" != "$GITHUB_SHA" ]]; then
+            echo "QAT_RELEASE_QUALIFIED_SHA must equal the candidate SHA: $GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          license_file=""
+          notice_file=""
+          for candidate in LICENSE LICENSE.txt LICENSE.md; do
+            if [[ -s "$candidate" ]]; then
+              license_file="$candidate"
+              break
+            fi
+          done
+          for candidate in NOTICE NOTICE.txt NOTICE.md; do
+            if [[ -s "$candidate" ]]; then
+              notice_file="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$license_file" || -z "$notice_file" ]]; then
+            echo "Publishing requires approved, non-empty LICENSE and NOTICE files." >&2
+            echo "Do not create placeholder proprietary terms in CI." >&2
+            exit 1
+          fi
+          echo "External qualification and legal release boundary satisfied."
+
+  resolve-vulcan-config:
+    name: Resolve Vulcan Config
+    needs: release-preflight
+    permissions:
+      contents: read
+    uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@dac902538598b56af173c5d92fe8d6ec1320da80
+    with:
+      vulcan_env: ${{ vars.VULCAN_ENV || 'dev' }}
+
+  publish-qat:
+    name: Publish QAT to Vulcan (${{ matrix.arch }})
+    needs:
+      - release-preflight
+      - resolve-vulcan-config
+      - package-qat
+      - validate-packaged-candidates
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+    uses: sima-neat/.github/.github/workflows/vulcan-publish-artifacts.yml@dac902538598b56af173c5d92fe8d6ec1320da80
     with:
       aws_region: ${{ needs.resolve-vulcan-config.outputs.aws_region }}
       environment_name: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
@@ -187,21 +523,33 @@ jobs:
       artifact_folder: ${{ matrix.arch }}
       artifact_pattern: qat-extension-${{ matrix.arch }}
       artifact_glob: "*"
-      min_artifact_count: 4
+      min_artifact_count: 8
       publish_manifest: true
 
   update-latest:
-    name: Update Vulcan Latest Tag
-    if: ${{ github.ref_type == 'branch' && (github.event_name == 'workflow_dispatch' || github.ref_name == 'develop' || github.ref_name == 'main') }}
+    name: Update Vulcan Latest Tag (${{ matrix.arch }})
+    if: ${{ needs.release-context.outputs.update_latest == 'true' }}
     needs:
+      - release-context
+      - release-preflight
       - resolve-vulcan-config
       - publish-qat
-    uses: sima-neat/.github/.github/workflows/vulcan-update-latest-artifacts.yml@main
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+    uses: sima-neat/.github/.github/workflows/vulcan-update-latest-artifacts.yml@dac902538598b56af173c5d92fe8d6ec1320da80
     with:
       aws_region: ${{ needs.resolve-vulcan-config.outputs.aws_region }}
       environment_name: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
       bucket: ${{ needs.resolve-vulcan-config.outputs.artifact_bucket }}
       role_to_assume: ${{ needs.resolve-vulcan-config.outputs.artifact_publisher_role_arn }}
       sse_kms_key_id: ${{ needs.resolve-vulcan-config.outputs.artifact_kms_key_id }}
-      artifact_folder: amd64
+      artifact_folder: ${{ matrix.arch }}
       validate_manifest: true

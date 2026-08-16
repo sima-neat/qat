@@ -1,6 +1,8 @@
 numpy==1.26.4
-torch==2.3.1
-torchvision==0.18.1
+# The QAT backend is validated at both ends of this compatibility window.
+# scripts/source.json separately records the exact Model Compiler baseline.
+torch>=2.3,<2.9
+torchvision>=0.18,<0.24
 onnx==1.17.0
 onnxruntime==1.21.1
 pytorch-lightning==2.4.0

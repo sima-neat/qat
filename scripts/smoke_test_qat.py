@@ -18,7 +18,8 @@ import torch
 from onnx import numpy_helper
 
 from sima_qat import qat_api
-from sima_qat.qat_api import (
+from sima_qat import (
+    __version__,
     sima_export_onnx,
     sima_finalize_qat_model,
     sima_prepare_qat_model,
@@ -218,6 +219,12 @@ def main() -> int:
     args = parser.parse_args()
 
     validate_prefix(args.expected_prefix)
+    installed_version = importlib.metadata.version("sima-qat")
+    if __version__ != installed_version:
+        raise RuntimeError(
+            f"sima_qat.__version__ is {__version__}, "
+            f"but wheel metadata is {installed_version}."
+        )
     with tempfile.TemporaryDirectory(prefix="qat-smoke-") as temporary:
         run_smoke_test(Path(temporary))
 
@@ -225,7 +232,7 @@ def main() -> int:
         "QAT functional smoke test passed "
         f"(python={sys.version.split()[0]}, "
         f"torch={importlib.metadata.version('torch')}, "
-        f"sima-qat={importlib.metadata.version('sima-qat')})."
+        f"sima-qat={installed_version})."
     )
     return 0
 

@@ -27,52 +27,76 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
-""" Script to load a generated ONNX file and run test samples through it.
-    The script first searches the most recent ONNX model and then loads the validation data. 
-    Executes the ONNX file in onnxruntime / numpy. 
-"""
-import os
+"""Validate an explicitly selected ImageNet ONNX model with CPU ONNX Runtime."""
 
-import torch
-import torchvision.datasets as datasets
-import torchvision.transforms as transforms
-import onnx
 import logging
 import time
-import onnxruntime
-from tqdm import tqdm
+from argparse import ArgumentParser, ArgumentTypeError, Namespace
+from pathlib import Path
+from typing import Dict
+
 import numpy as np
-from argparse import ArgumentParser, Namespace
+import onnx
+import onnxruntime
+import pytorch_lightning as L
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+from tqdm import tqdm
 
-from typing import Callable, Dict, List, Iterable
-
-from sima_qat.misc import find_latest_file_string
-
-from imagenet_dataset import (
+from .imagenet_dataset import (
     apply_imagenet_target_transform,
     limit_samples_by_class,
     set_dataset_samples,
 )
 
-import pytorch_lightning as L
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise ArgumentTypeError(f"expected a positive integer, got {value}")
+    return parsed
 
 
-# Helper class to iterate over ImageNet samples
-class ImageNetIterator(object):
-    """Helper class to iterate over ImageNet-style split folders."""
+def _accuracy(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise ArgumentTypeError("accuracy must be between 0.0 and 1.0")
+    return parsed
 
-    def __init__(self, ds_root: str, split: str = 'val', samples_limit: int | None = None) -> None:
-        transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        split_dir = os.path.join(ds_root, split)
-        if not os.path.isdir(split_dir):
+
+def _create_cpu_session(onnx_path: Path) -> onnxruntime.InferenceSession:
+    return onnxruntime.InferenceSession(
+        str(onnx_path),
+        providers=["CPUExecutionProvider"],
+    )
+
+
+class ImageNetIterator:
+    """Indexable view of an ImageNet-style split folder."""
+
+    def __init__(
+        self,
+        ds_root: str | Path,
+        split: str = "val",
+        samples_limit: int | None = None,
+    ) -> None:
+        transform = transforms.Compose(
+            [
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ]
+        )
+        split_dir = Path(ds_root).expanduser().resolve() / split
+        if not split_dir.is_dir():
             raise FileNotFoundError(
                 f"ImageNet split directory not found: {split_dir}. "
-                f"Expected a dataset layout like {ds_root}/train and {ds_root}/val."
+                f"Expected a dataset layout like {split_dir.parent}/train "
+                f"and {split_dir.parent}/val."
             )
 
         self.imagenet_dataset = datasets.ImageFolder(split_dir, transform=transform)
@@ -80,131 +104,115 @@ class ImageNetIterator(object):
         if samples_limit is not None:
             set_dataset_samples(
                 self.imagenet_dataset,
-                limit_samples_by_class(self.imagenet_dataset.samples, samples_limit),
+                limit_samples_by_class(
+                    self.imagenet_dataset.samples,
+                    samples_limit,
+                ),
             )
 
     def __len__(self) -> int:
         return len(self.imagenet_dataset)
 
-    def __getitem__(self, i: int) -> Dict:
-        """Returns dict: {'sample': image, 'gt': label}."""
-        v = self.imagenet_dataset[i]
-        return {'sample': v[0], 'gt': v[1]}
+    def __getitem__(self, index: int) -> Dict:
+        sample, target = self.imagenet_dataset[index]
+        return {"sample": sample, "gt": target}
 
 
-# Validate model and input with ONNX runtime
-def validate_model_and_input(onnx_file_name: str, input_: np.ndarray) -> np.ndarray:
-    onnx_model = onnx.load(onnx_file_name)
-    ort_session = onnxruntime.InferenceSession(onnx_file_name)
+def validate_model_and_input(onnx_path: Path, input_: np.ndarray) -> list[np.ndarray]:
+    onnx_model = onnx.load(str(onnx_path))
+    onnx.checker.check_model(onnx_model)
+    ort_session = _create_cpu_session(onnx_path)
 
     input_t = ort_session.get_inputs()[0]
-    logging.info(f"Input {input_t.name}, shape: {input_t.shape}")
+    logging.info("Input %s, shape: %s", input_t.name, input_t.shape)
     output_t = ort_session.get_outputs()[0]
-    logging.info(f"Output {output_t.name}, shape: {output_t.shape}")
-
-    ort_inputs = {input_t.name: input_}
-    outs = ort_session.run(None, ort_inputs)
-    return outs
+    logging.info("Output %s, shape: %s", output_t.name, output_t.shape)
+    return ort_session.run(None, {input_t.name: input_})
 
 
-def debug_allclose(a, b, rtol=1e-2) -> bool:
-    ''' Helper function.
-    '''
-    a = a.flatten()
-    b = b.flatten()
-    err = False
-    for i in range(len(a)):
-        if b[i] == 0.0:
-            diff = a[i] - b[i]
-        else:
-            diff = abs((a[i]/(b[i]+1e-9)) - 1.0)
-        if diff > rtol:
-            print(f"Got [{i}] miscompare: {diff:.6f} pct, {a[i]} / {b[i]}")
-            # return False
-            err = True
-    return not err
-
-# Debug function to compare tensors
-def debug_compare_tensors(t_dut: np.ndarray, t_ref_name: str) -> bool:
-    """Compare model output with reference value."""
-    if os.path.isfile(t_ref_name):
-        hmap_ref = np.load(t_ref_name)
-    else:
-        logging.warning(f"No numpy debug file found for: {t_ref_name}")
-    return debug_allclose(hmap_ref, t_dut, rtol=1e-1)
-
-
-# Accuracy test function
-def run_accuracy_test(ort_session: onnxruntime.InferenceSession, dataset_test: object) -> float:
-    """Run the dataset against the model and compute accuracy."""
+def run_accuracy_test(
+    ort_session: onnxruntime.InferenceSession,
+    dataset_test: object,
+) -> float:
+    """Run the dataset and return top-1 accuracy in [0, 1]."""
     input_t = ort_session.get_inputs()[0]
-    output_t = ort_session.get_outputs()[0]
+    sample_count = len(dataset_test)
+    if sample_count <= 0:
+        raise ValueError("Accuracy validation requires at least one sample")
 
-    l = len(dataset_test)
-    class_outputs = np.zeros((l,), dtype=np.int32)
-    class_gt = np.zeros((l,), dtype=np.int32)
+    correct = 0
     inf_start = time.perf_counter()
+    for index in tqdm(range(sample_count)):
+        sample = dataset_test[index]
+        image = sample["sample"]
+        if hasattr(image, "detach"):
+            image = image.detach().cpu().numpy()
+        nn_input = np.expand_dims(image, axis=0)
+        outputs = ort_session.run(None, {input_t.name: nn_input})
+        prediction = int(np.argmax(outputs[0][0]))
+        correct += int(prediction == sample["gt"])
 
-    for i in tqdm(range(l)):
-        sample = dataset_test[i]
-        nn_in = np.expand_dims(sample['sample'], axis=0)  # Add batch dimension
-        s_out = ort_session.run(None, {input_t.name: nn_in})
-        net_map = s_out[0][0]
-        class_outputs[i] = np.argmax(net_map)
-        class_gt[i] = sample['gt']
-
-    inf_end = time.perf_counter()
-    fps = l / (inf_end - inf_start)
-    logging.info(f"FP32 FPS: {fps}")
-
-    scores = class_outputs == class_gt
-    acc = np.mean(scores.astype(np.float32))
-    return acc
+    elapsed = time.perf_counter() - inf_start
+    logging.info("Throughput: %.2f samples/s", sample_count / elapsed)
+    return correct / sample_count
 
 
-# CLI argument parser
 def get_args() -> Namespace:
     """Get CLI arguments."""
-    recent_onnx_file = find_latest_file_string(os.getcwd())
-
-    parser = ArgumentParser()
-    parser.add_argument("--onnx", type=str, required=False, default=recent_onnx_file, help="The ONNX file containing the ImageNet Model.")
-    parser.add_argument("--dsroot", type=str, required=False, default='.', help="Directory for the root of the dataset.")
-    parser.add_argument('--split', type=str, default='val', help="Dataset split (test or val).")
-    parser.add_argument('--samples-limit', type=int, default=None, help='Limit evaluation samples to size N')
-    parser.add_argument('-v', '--verbosity', type=str, default='INFO', help='Logging verbosity level')
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("--onnx", type=Path, required=True, help="ONNX model to validate")
+    parser.add_argument(
+        "--dsroot",
+        type=Path,
+        required=True,
+        help="ImageFolder dataset root containing the selected split",
+    )
+    parser.add_argument("--split", default="val", help="Dataset split directory")
+    parser.add_argument(
+        "--samples-limit",
+        type=_positive_int,
+        default=None,
+        help="Maximum number of class-balanced evaluation samples",
+    )
+    parser.add_argument(
+        "--min-accuracy",
+        type=_accuracy,
+        default=None,
+        help="Fail with a nonzero exit status when top-1 accuracy is below this value",
+    )
+    parser.add_argument("-v", "--verbosity", default="INFO", help="Logging verbosity level")
     return parser.parse_args()
 
 
-# Main function
-def main():
+def main() -> float:
     args = get_args()
     logging.getLogger().setLevel(args.verbosity)
-
-    if not args.onnx:
-        raise FileNotFoundError("No ONNX file found. Pass --onnx or run training/export first.")
-
-    # Set the global seed to replicate results.
     L.seed_everything(42)
 
-    onnxf = os.path.abspath(args.onnx)
-    logging.info(f"Loading ONNX file: {onnxf}")
+    onnx_path = Path(args.onnx).expanduser().resolve()
+    if not onnx_path.is_file():
+        raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
+    logging.info("Loading ONNX file: %s", onnx_path)
 
-    input_ = np.random.rand(1, 3, 224, 224).astype(np.float32)  # ImageNet input size
-    logging.info(f'Testing model on input shape: {input_.shape}')
+    input_ = np.random.rand(1, 3, 224, 224).astype(np.float32)
+    logging.info("Testing model on input shape: %s", input_.shape)
+    validate_model_and_input(onnx_path, input_)
+    logging.info("ONNX validation succeeded.")
 
-    outs = validate_model_and_input(onnxf, input_)
-    logging.info('Succeeded.')
+    dataset_test = ImageNetIterator(
+        ds_root=args.dsroot,
+        split=args.split,
+        samples_limit=args.samples_limit,
+    )
+    accuracy = run_accuracy_test(_create_cpu_session(onnx_path), dataset_test)
+    logging.info("Top-1 accuracy: %.6f", accuracy)
+    if args.min_accuracy is not None and accuracy < args.min_accuracy:
+        raise SystemExit(
+            f"Top-1 accuracy {accuracy:.6f} is below required minimum "
+            f"{args.min_accuracy:.6f}"
+        )
+    return accuracy
 
-    # Load dataset and run accuracy test
-    dsroot = os.path.abspath(args.dsroot)
-    logging.info(f"Using ImageNet dataset at: {dsroot}")
-    dataset_test = ImageNetIterator(ds_root=dsroot, split=args.split, samples_limit=args.samples_limit)
 
-    ort_session = onnxruntime.InferenceSession(onnxf, sess_opts=None)
-    acc = run_accuracy_test(ort_session, dataset_test)
-    logging.info(f"Top-1 accuracy: {acc}")
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

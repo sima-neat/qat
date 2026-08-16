@@ -1,0 +1,7 @@
+# Non-Torch dependencies for the contributor-only PyTorch 2.8 CPU control.
+# setup_env.sh installs the matching torch/torchvision pair from the official
+# PyTorch CPU wheel index before installing this file.
+numpy==1.26.4
+onnx==1.17.0
+onnxruntime==1.21.1
+pytorch-lightning==2.4.0

@@ -55,7 +55,6 @@ def _assert_all_state_on_cpu(model):
     assert all(tensor.device == torch.device("cpu") for tensor in tensors)
 
 
-@pytest.mark.regression
 def test_prepare_finalize_and_export_restore_requested_cpu_device(tmp_path):
     example_inputs = (torch.randn(2, 2, 4, 4),)
     prepared = sima_prepare_qat_model(
@@ -81,7 +80,6 @@ def test_prepare_finalize_and_export_restore_requested_cpu_device(tmp_path):
     onnx.checker.check_model(onnx.load(str(output_file)))
 
 
-@pytest.mark.regression
 def test_unavailable_cuda_is_rejected_before_prepare_or_export(monkeypatch, tmp_path):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     example_inputs = (torch.randn(2, 2, 4, 4),)
