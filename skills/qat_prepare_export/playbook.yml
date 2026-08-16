@@ -1,8 +1,8 @@
 id: sima-qat-prepare-export
-name: Prepare, Train, and Export QAT Models for SiMa
-version: 0.1.0
+name: Prepare, Export, and Compile QAT Models for SiMa
+version: 0.2.0
 agents: [codex, claude]
-description: Skill for applying SiMa QAT APIs to PyTorch models and exporting Q/DQ ONNX graphs.
+description: Skill for shared-environment FX QAT, Q/DQ ONNX export, Model Compiler acceptance compilation, and MPK artifact handling.
 compatibility:
   env_types: [host, sdk]
   env_subtypes: [linux, palette]
