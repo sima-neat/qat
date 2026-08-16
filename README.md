@@ -162,9 +162,25 @@ python -m pytest tests --ignore=tests/end_to_end
 
 The local acceptance suite covers optimizer identity, gradients, fusion, signed
 quantization, dropout, residual/concat/slice regions, checkpoint stages,
-standard ONNX Q/DQ, ONNX Runtime, and ResNet export. Release qualification
-must additionally run Model Compiler quantize/compile regressions on amd64 and
-arm64 DevKits.
+standard ONNX Q/DQ, ONNX Runtime, and ResNet export.
+
+Run the opt-in ONNX compilation tests from an activated Model Compiler
+environment. The pre-QAT test applies compiler PTQ to the float ONNX model; the
+post-QAT test lowers the exported Q/DQ parameters and verifies their
+arithmetic-folded representation before checking the generated MPK archive.
+
+```bash
+activate-model-compiler
+SIMA_QAT_RUN_MODEL_COMPILER_TESTS=1 \
+SIMA_QAT_MODEL_COMPILER_TARGET=modalix \
+python -m pytest -q -s -o addopts= \
+  -n 0 \
+  -m model_compiler tests/model_compiler
+```
+
+Use `mlsoc` instead of `modalix` to select the Gen1 target. Release
+qualification must run these compile regressions on both supported host
+architectures.
 
 Generated ONNX models, graph dumps, checkpoints, datasets, and Lightning logs
 are gitignored.

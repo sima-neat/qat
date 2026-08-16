@@ -78,7 +78,10 @@ jobs:
           python -m pip check
 
       - name: Run Dynamo-free FX/QDQ regression suite
-        run: python -m pytest -q -o addopts= tests --ignore=tests/end_to_end
+        run: >-
+          python -m pytest -q -o addopts= tests
+          --ignore=tests/end_to_end
+          --ignore=tests/model_compiler
 
       - name: Build acceptance bundle
         run: |
