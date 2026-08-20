@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import inspect
 import operator
+import os
 import re
+import tempfile
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 
 import torch
@@ -39,18 +42,19 @@ __all__ = [
     "sima_export_onnx",
 ]
 
-def _torch_major_minor(raw_version: str) -> Tuple[int, int]:
-    """Extract Torch's numeric major/minor pair without third-party helpers."""
-    match = re.match(r"^\s*(\d+)\.(\d+)(?=\D|$)", raw_version)
+
+def _torch_release(raw_version: str) -> Tuple[int, int, int]:
+    """Extract Torch's numeric release triplet without third-party helpers."""
+    match = re.match(r"^\s*(\d+)\.(\d+)\.(\d+)(?=\D|$)", raw_version)
     if match is None:
         raise RuntimeError(f"Unable to parse torch version {raw_version!r}")
-    return int(match.group(1)), int(match.group(2))
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
-_TORCH_MAJOR_MINOR = _torch_major_minor(torch.__version__)
-if not (2, 3) <= _TORCH_MAJOR_MINOR < (2, 9):
+_TORCH_RELEASE = _torch_release(torch.__version__)
+if _TORCH_RELEASE != (2, 3, 1):
     raise RuntimeError(
-        "Sima QAT only supports torch version 2.3.x through 2.8.x, "
+        "SiMa QAT for Model Compiler 2.1.3 requires torch version 2.3.1, "
         f"found {torch.__version__}"
     )
 
@@ -123,6 +127,25 @@ def _move_value_to_device(value: Any, device: torch.device) -> Any:
             for key, item in value.items()
         }
     return value
+
+
+@contextmanager
+def _atomic_onnx_output(output_file: str) -> Iterator[Path]:
+    """Publish an ONNX file only after export and validation both succeed."""
+
+    output_path = Path(output_file)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_path.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        yield temporary_path
+        os.replace(temporary_path, output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _validate_device(device: Union[str, torch.device]) -> torch.device:
@@ -781,14 +804,15 @@ def sima_export_onnx(
     if "dynamo" in inspect.signature(torch.onnx.export).parameters:
         export_kwargs["dynamo"] = False
 
-    with torch.no_grad():
-        torch.onnx.export(
-            shadow,
-            export_inputs,
-            output_file,
-            **export_kwargs,
-        )
-    normalize_qdq_model(output_file, shadowed_weights)
+    with _atomic_onnx_output(output_file) as temporary_output:
+        with torch.no_grad():
+            torch.onnx.export(
+                shadow,
+                export_inputs,
+                str(temporary_output),
+                **export_kwargs,
+            )
+        normalize_qdq_model(temporary_output, shadowed_weights)
 
     qat_model.to(restore_device)
     return check_graph_nodes(qat_model, restore_device)

@@ -66,7 +66,10 @@ def _prepared_tiny(example_inputs):
 
 @pytest.mark.smoke
 def test_qat_public_api_imports_and_supported_runtime(monkeypatch):
-    major, minor = torch.__version__.split("+", 1)[0].split(".")[:2]
+    release = tuple(
+        int(part)
+        for part in torch.__version__.split("+", 1)[0].split(".")[:3]
+    )
 
     assert sima_qat.__name__ == "sima_qat"
     assert sima_qat.__all__ == [
@@ -89,8 +92,8 @@ def test_qat_public_api_imports_and_supported_runtime(monkeypatch):
     monkeypatch.setattr(sima_qat, "version", lambda _distribution: "999.0.0")
     assert sima_qat._resolve_version() == expected_version
 
-    assert int(major) == 2
-    assert 3 <= int(minor) < 9
+    assert release == (2, 3, 1)
+    assert qat_api._torch_release("2.3.1+cu121") == (2, 3, 1)
 
     # The public lifecycle must not accidentally regain the Python-3.12-
     # incompatible PT2E/Dynamo entry points.

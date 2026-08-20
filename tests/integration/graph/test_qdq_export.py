@@ -32,10 +32,13 @@ import copy
 import numpy as np
 import onnx
 import onnxruntime
+import pytest
 import torch
 from onnx import TensorProto, numpy_helper
 from torch import nn
 
+from sima_qat import qat_api
+from sima_qat.onnx_ops import normalize_qdq_model
 from sima_qat.qat_api import (
     sima_export_onnx,
     sima_finalize_qat_model,
@@ -235,3 +238,128 @@ def test_onnx_qdq_topology_checker_runtime_and_cpu_restoration(tmp_path):
         {"input": example_inputs[0].numpy()},
     )[0]
     np.testing.assert_allclose(ort_output, torch_output, rtol=0, atol=1e-6)
+
+
+def test_failed_normalization_preserves_previous_onnx_and_removes_temporary_file(
+    tmp_path,
+    monkeypatch,
+):
+    example_inputs = (torch.randn(2, 2, 4, 4),)
+    prepared = sima_prepare_qat_model(
+        FlattenDropoutModel(),
+        example_inputs,
+        "cpu",
+    )
+    prepared(example_inputs[0])
+    finalized = sima_finalize_qat_model(prepared)
+
+    output_file = tmp_path / "existing.onnx"
+    previous_contents = b"previous validated artifact"
+    output_file.write_bytes(previous_contents)
+
+    def fail_normalization(*_args, **_kwargs):
+        raise RuntimeError("forced normalization failure")
+
+    monkeypatch.setattr(qat_api, "normalize_qdq_model", fail_normalization)
+    with pytest.raises(RuntimeError, match="forced normalization failure"):
+        qat_api.sima_export_onnx(
+            finalized,
+            example_inputs,
+            str(output_file),
+            device="cpu",
+        )
+
+    assert output_file.read_bytes() == previous_contents
+    assert list(tmp_path.iterdir()) == [output_file]
+
+
+def test_requantization_cleanup_preserves_intermediate_graph_output(tmp_path):
+    """Keep a DQ output returned by the model while removing downstream DQ-Q."""
+
+    input_info = onnx.helper.make_tensor_value_info(
+        "input",
+        TensorProto.FLOAT,
+        [1, 2],
+    )
+    intermediate_info = onnx.helper.make_tensor_value_info(
+        "intermediate",
+        TensorProto.FLOAT,
+        [1, 2],
+    )
+    downstream_info = onnx.helper.make_tensor_value_info(
+        "downstream",
+        TensorProto.FLOAT,
+        [1, 2],
+    )
+    scale = numpy_helper.from_array(
+        np.array(0.125, dtype=np.float32),
+        name="scale",
+    )
+    zero_point = numpy_helper.from_array(
+        np.array(0, dtype=np.int8),
+        name="zero_point",
+    )
+    graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node(
+                "QuantizeLinear",
+                ["input", "scale", "zero_point"],
+                ["input_codes"],
+            ),
+            onnx.helper.make_node(
+                "DequantizeLinear",
+                ["input_codes", "scale", "zero_point"],
+                ["intermediate"],
+            ),
+            onnx.helper.make_node(
+                "QuantizeLinear",
+                ["intermediate", "scale", "zero_point"],
+                ["requantized_codes"],
+            ),
+            onnx.helper.make_node(
+                "DequantizeLinear",
+                ["requantized_codes", "scale", "zero_point"],
+                ["downstream"],
+            ),
+        ],
+        "multi_output_requantization",
+        [input_info],
+        [intermediate_info, downstream_info],
+        [scale, zero_point],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[onnx.helper.make_opsetid("", 17)],
+    )
+    output_file = tmp_path / "multi_output.onnx"
+    onnx.save(model, output_file)
+
+    normalized = normalize_qdq_model(output_file, 0)
+
+    producers, _, _ = _value_maps(normalized)
+    quantizers = [
+        node
+        for node in normalized.graph.node
+        if node.op_type == "QuantizeLinear"
+    ]
+    dequantizers = [
+        node
+        for node in normalized.graph.node
+        if node.op_type == "DequantizeLinear"
+    ]
+    assert [output.name for output in normalized.graph.output] == [
+        "intermediate",
+        "downstream",
+    ]
+    assert len(quantizers) == 1
+    assert len(dequantizers) == 2
+    assert producers["intermediate"].op_type == "DequantizeLinear"
+    assert producers["downstream"].input[0] == "input_codes"
+
+    inputs = np.array([[-1.0, 0.26]], dtype=np.float32)
+    session = onnxruntime.InferenceSession(
+        str(output_file),
+        providers=["CPUExecutionProvider"],
+    )
+    intermediate, downstream = session.run(None, {"input": inputs})
+    np.testing.assert_array_equal(intermediate, downstream)

@@ -286,10 +286,8 @@ def _remove_redundant_requantization(model: ModelProto) -> int:
                     "Direct DQ-to-Q requantization uses different qparams."
                 )
 
-            if any(
-                output.name == quantize.output[0]
-                for output in model.graph.output
-            ):
+            graph_outputs = {output.name for output in model.graph.output}
+            if quantize.output[0] in graph_outputs:
                 raise RuntimeError("Cannot collapse a graph-output QuantizeLinear.")
 
             upstream_codes = dequantize.input[0]
@@ -299,7 +297,10 @@ def _remove_redundant_requantization(model: ModelProto) -> int:
                         consumer.input[index] = upstream_codes
 
             model.graph.node.remove(quantize)
-            if consumers.get(dequantize.output[0], []) == [quantize]:
+            if (
+                consumers.get(dequantize.output[0], []) == [quantize]
+                and dequantize.output[0] not in graph_outputs
+            ):
                 model.graph.node.remove(dequantize)
             removed_pairs += 1
             changed = True
