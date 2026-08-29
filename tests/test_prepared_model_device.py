@@ -90,7 +90,7 @@ class CheckDeviceModel(torch.nn.Module):
 @pytest.mark.regression
 @pytest.mark.parametrize("model", [CheckDeviceModel(p=0.05, mode="row")])
 def test_prepared_model_device(model: torch.nn.Module):
-    
+    target_device = "cuda" if torch.cuda.is_available() else "cpu"
     example_inputs = (torch.randn(1, 3, 224, 224),)
     prepared_model = sima_prepare_qat_model(model, example_inputs, 'cpu')
     
@@ -98,15 +98,15 @@ def test_prepared_model_device(model: torch.nn.Module):
         #check for parameters not being in the same device as the model
         if n.target in device_modifier_ops:
             n_kwargs = dict(n.kwargs)
-            assert n_kwargs['device'] is 'cpu'
+            assert n_kwargs['device'] == 'cpu'
     
-    prepared_model = check_graph_nodes(prepared_model, 'cuda')
+    prepared_model = check_graph_nodes(prepared_model, target_device)
 
     for n in prepared_model.graph.nodes:
         #check for parameters not being in the same device as the model
         if n.target in device_modifier_ops:
             n_kwargs = dict(n.kwargs)
-            assert n_kwargs['device'] is 'cuda'
+            assert n_kwargs['device'] == target_device
     
     prepared_model.train(True)
     prepared_model = check_graph_nodes(prepared_model, 'cpu')
@@ -114,10 +114,15 @@ def test_prepared_model_device(model: torch.nn.Module):
     prepared_model.train(False)
             
     finalized_model = sima_finalize_qat_model(prepared_model)
-    post_export_model = sima_export_onnx(qat_model=finalized_model, inputs=example_inputs, output_file='prepared_model_device.onnx', device='cuda')
+    post_export_model = sima_export_onnx(
+        qat_model=finalized_model,
+        inputs=example_inputs,
+        output_file='prepared_model_device.onnx',
+        device=target_device,
+    )
     
     for n in post_export_model.graph.nodes:
         #check for parameters not being in the same device as the model
         if n.target in device_modifier_ops:
             n_kwargs = dict(n.kwargs)
-            assert n_kwargs['device'] is 'cuda'
+            assert n_kwargs['device'] == target_device

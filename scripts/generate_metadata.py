@@ -24,7 +24,7 @@ def main() -> int:
     parser.add_argument("--name", default="sima-neat-qat")
     parser.add_argument("--version", required=True)
     parser.add_argument("--release", default="stable")
-    parser.add_argument("--description", default="SiMa.ai NEAT QAT extension")
+    parser.add_argument("--description", default="SiMa.ai Neat QAT extension")
     parser.add_argument("--host-os", default="linux")
     parser.add_argument("--installer-script", default="install_qat_wheels.sh")
     parser.add_argument("--source-manifest", default="source.json")

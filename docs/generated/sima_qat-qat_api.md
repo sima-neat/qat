@@ -4,7 +4,7 @@ Source: `sima_qat/qat_api.py`
 
 ## Public API
 
-### Function: `sima_prepare_qat_model(input_graph, inputs, device)`
+### Function: `sima_prepare_qat_model(input_graph, inputs, device, shift_aware)`
 
 This function is the first transformation needed to perform QAT on a Pytorch model. It takes an
 eager-mode reference to the ML model and produces an FX version of the graph with special annotations
@@ -24,9 +24,20 @@ Args:
         process to build the compiled FX representation.
     device: a Pytorch `device` identifier. This will be the device on which the prepared model will
         be located after the preparation step is complete.
+    shift_aware: when ``True`` (the default), fake-quantize weights during training and prepare
+        them for SiMa's power-of-two requantization. Set this to ``False`` to retain the legacy
+        observer-only weight behavior.
 
 Returns:
     GraphModule: a compiled version of the given graph with QAT annotations, ready to begin training.
+
+### Function: `sima_freeze_qat(qat_model)`
+
+Freeze QAT observers and lock Model Compiler-compatible power-of-two weight scales.
+
+Call this after observer warm-up, then continue fine-tuning with fake quantization
+enabled. For a model prepared with ``shift_aware=False``, this only freezes the
+existing activation observers and therefore retains the legacy behavior.
 
 ### Function: `sima_finalize_qat_model(qat_model)`
 

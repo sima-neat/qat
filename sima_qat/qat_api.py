@@ -27,6 +27,7 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
+import math
 import warnings
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
@@ -206,22 +207,28 @@ def _safe_power_of_two_weight_scale(
     """Return per-channel scales satisfying sx * sw / sy ~= 2**-shift.
 
     Scales are rounded one float32 ULP toward zero when necessary. This keeps
-    the normalized multiplier on the safe side of AFE's power-of-two boundary,
-    preventing a value infinitesimally above the boundary from selecting the
-    next shift and a 0.5 correction factor.
+    the normalized multiplier on the safe side of the Model Compiler's
+    power-of-two boundary, preventing a value infinitesimally above the
+    boundary from selecting the next shift and a 0.5 correction factor.
     """
     if weight.ndim < 1:
         raise RuntimeError("Shift-aware weight tensors must have an output-channel dimension")
 
     sx = float(input_scale.reshape(-1)[0].detach().cpu())
     sy = float(output_scale.reshape(-1)[0].detach().cpu())
-    if sx <= 0.0 or sy <= 0.0:
+    if not math.isfinite(sx) or not math.isfinite(sy) or sx <= 0.0 or sy <= 0.0:
         raise RuntimeError(f"Observed activation scales must be positive, found input={sx}, output={sy}")
 
     reduce_dims = tuple(range(1, weight.ndim))
     max_abs = weight.detach().abs().amax(dim=reduce_dims).to(torch.float64).cpu()
+    if not bool(torch.isfinite(max_abs).all()):
+        raise RuntimeError("Shift-aware weights must be finite")
     required_scale = torch.clamp(max_abs / 127.0, min=torch.finfo(torch.float32).tiny)
     minimum_ratio = (sx / sy) * required_scale
+    if bool((minimum_ratio > 1.0).any()):
+        raise RuntimeError(
+            "Shift-aware weights cannot fit the Model Compiler requantization range at shift 0"
+        )
     unclamped_shift = torch.floor(-torch.log2(minimum_ratio))
     shifts = unclamped_shift.clamp(_MIN_REQUANT_SHIFT, _MAX_REQUANT_SHIFT).to(torch.int32)
 
@@ -249,7 +256,7 @@ def _safe_power_of_two_weight_scale(
 
 
 def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
-    """Freeze QAT observers and lock SiMa-compatible power-of-two weight scales.
+    """Freeze QAT observers and lock Model Compiler-compatible power-of-two weight scales.
 
     Call this after observer warm-up, then continue fine-tuning with fake quantization
     enabled. For a model prepared with ``shift_aware=False``, this only freezes the

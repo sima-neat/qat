@@ -1,4 +1,4 @@
-# Sima QAT
+# SiMa.ai QAT
 
 Quantization-Aware Training (QAT) APIs for preparing PyTorch models for SiMa.ai hardware.
 
@@ -54,7 +54,7 @@ qat_model = sima_prepare_qat_model(model, example_inputs, device='cuda')
 
 # 2. Warm up observers with your normal training loop ...
 
-# 3. Lock AFE-compatible power-of-two scales, then fine-tune for a few more epochs.
+# 3. Lock Model Compiler-compatible power-of-two scales, then fine-tune.
 sima_freeze_qat(qat_model)
 # ... continue training qat_model ...
 
@@ -65,8 +65,9 @@ qat_model = sima_finalize_qat_model(qat_model)
 sima_export_onnx(qat_model, example_inputs, 'model.onnx', device='cuda')
 ```
 
-Shift-aware QAT constrains each convolution or linear weight scale so that AFE can use its native
-integer shift requantization without rescaling the learned INT8 weight codes. Calling
+Shift-aware QAT constrains each convolution or linear weight scale so that the
+Model Compiler can use its native integer shift requantization without
+rescaling the learned INT8 weight codes. Calling
 `sima_freeze_qat` explicitly leaves time to fine-tune against those locked scales. Finalization will
 lock them automatically if necessary, but fine-tuning after the explicit call generally gives better
 accuracy.
@@ -149,9 +150,9 @@ tox -e smoke
 
 Generated ONNX models, graph dumps, checkpoints, example datasets, and Lightning logs are gitignored.
 
-## Neat Artifact Package
+## Neat artifact package
 
-QAT extension bundles are published to Vulcan as independent Neat artifacts:
+QAT extension bundles are published to Vulcan as independent SiMa.ai Neat artifacts:
 
 ```bash
 # amd64 host

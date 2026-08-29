@@ -30,6 +30,30 @@ jobs:
     with:
       vulcan_env: ${{ vars.VULCAN_ENV || 'dev' }}
 
+  test-qat:
+    name: Test QAT
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tested revision
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install QAT test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Run CPU regression and package tests
+        run: |
+          set -euo pipefail
+          pytest -q tests/*.py
+
   package-qat:
     name: Package QAT (${{ matrix.arch }})
     runs-on: ubuntu-latest
@@ -77,6 +101,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.ref_type == 'tag' || github.ref_name == 'develop' || github.ref_name == 'main' }}
     needs:
       - resolve-vulcan-config
+      - test-qat
       - package-qat
     strategy:
       fail-fast: false

@@ -11,13 +11,13 @@ specialized version averages min/max over each sample in the batch. This gives
 more consistency across samples, and makes training behavior more independent
 from the batch size setting.
 
-### Function: `get_sima_quantization_config(is_qat)`
+### Function: `get_sima_quantization_config(is_qat, shift_aware)`
 
 No docstring available.
 
 ### Class: `SimaQuantizer`
 
 This quantizer definition uses XNNPACK implementation for the majority of ops. This is because
-the XNNPACK code simply looks for appropriate patterns, and applies the QuantizationAnnotation
+the XNNPACK code looks for appropriate patterns and applies the QuantizationAnnotation
 attributes accordingly. The quantization rules are defined separately, and specified here using
 Sima properties.

@@ -41,6 +41,7 @@ from sima_qat import qat_api
 def test_qat_public_api_imports():
     assert sima_qat.__name__ == "sima_qat"
     assert callable(qat_api.sima_prepare_qat_model)
+    assert callable(qat_api.sima_freeze_qat)
     assert callable(qat_api.sima_finalize_qat_model)
     assert callable(qat_api.sima_export_onnx)
 

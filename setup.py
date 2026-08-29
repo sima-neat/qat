@@ -98,7 +98,7 @@ setuptools.setup(
     description='SiMa.ai QAT implementation',
     long_description=long_description,
     url='https://sima.ai',
-    packages=setuptools.find_packages(),
+    packages=setuptools.find_packages(exclude=("examples", "examples.*", "tests", "tests.*")),
     package_data={'sima_qat': ['VERSION']},
     license='Proprietary',
     classifiers=[

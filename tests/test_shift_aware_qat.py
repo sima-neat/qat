@@ -13,6 +13,7 @@ from sima_qat.qat_api import (
     _SHIFT_AWARE_OPS,
     _fake_quant_module,
     _find_output_fake_quant,
+    _safe_power_of_two_weight_scale,
     sima_export_onnx,
     sima_finalize_qat_model,
     sima_freeze_qat,
@@ -65,7 +66,7 @@ def test_shift_aware_weight_fake_quant_is_default_and_legacy_is_available():
 
 
 @pytest.mark.regression
-def test_two_epoch_cpu_qat_locks_afe_compatible_scales(tmp_path):
+def test_two_epoch_cpu_qat_locks_model_compiler_compatible_scales(tmp_path):
     torch.manual_seed(7)
     inputs = torch.randn(8, 3, 8, 8)
     targets = torch.randn(8, 2)
@@ -97,8 +98,8 @@ def test_two_epoch_cpu_qat_locks_afe_compatible_scales(tmp_path):
     for module, locked_scale in zip(_weight_fake_quantizers(model), locked_scales):
         torch.testing.assert_close(module.scale, locked_scale, rtol=0, atol=0)
 
-    # Reproduce AFE's normalization boundary calculation. The normalized
-    # correction must be effectively 1, so folding it preserves every INT8 code.
+    # Reproduce the Model Compiler's normalization boundary calculation. The
+    # normalized correction must be effectively 1, so folding it preserves every INT8 code.
     checked = 0
     for node in model.graph.nodes:
         if node.op != "call_function" or node.target not in _SHIFT_AWARE_OPS:
@@ -209,3 +210,27 @@ def test_freeze_is_atomic_when_a_layer_cannot_be_locked():
     assert not bool(model.qat_frozen.item())
     assert bool(input_fq.observer_enabled.item())
     torch.testing.assert_close(weight_fq.scale, original_weight_scale, rtol=0, atol=0)
+
+
+@pytest.mark.regression
+def test_shift_aware_scale_rejects_unrepresentable_or_nonfinite_values():
+    with pytest.raises(RuntimeError, match="cannot fit"):
+        _safe_power_of_two_weight_scale(
+            torch.tensor(1.0),
+            torch.tensor(1.0),
+            torch.tensor([[128.0]]),
+        )
+
+    with pytest.raises(RuntimeError, match="must be finite"):
+        _safe_power_of_two_weight_scale(
+            torch.tensor(1.0),
+            torch.tensor(1.0),
+            torch.tensor([[float("inf")]]),
+        )
+
+    with pytest.raises(RuntimeError, match="must be positive"):
+        _safe_power_of_two_weight_scale(
+            torch.tensor(float("nan")),
+            torch.tensor(1.0),
+            torch.tensor([[1.0]]),
+        )

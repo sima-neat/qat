@@ -288,7 +288,7 @@ def _get_supported_config_and_operators() -> List[OperatorConfig]:
 
 class SimaQuantizer(Quantizer):
     """ This quantizer definition uses XNNPACK implementation for the majority of ops. This is because
-        the XNNPACK code simply looks for appropriate patterns, and applies the QuantizationAnnotation
+        the XNNPACK code looks for appropriate patterns and applies the QuantizationAnnotation
         attributes accordingly. The quantization rules are defined separately, and specified here using
         Sima properties.
     """

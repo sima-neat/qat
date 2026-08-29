@@ -98,6 +98,8 @@ python3 "$SCRIPT_DIR/generate_metadata.py" \
   --artifacts-dir "$OUTPUT_DIR" \
   --output "$OUTPUT_DIR/metadata.json" \
   --version "$BUNDLE_VERSION" \
-  --description "SiMa.ai NEAT QAT extension ($TARGET_ARCH)"
+  --description "SiMa.ai Neat QAT extension ($TARGET_ARCH)"
+
+python3 "$SCRIPT_DIR/verify_qat_bundle.py" "$OUTPUT_DIR"
 
 echo "QAT $TARGET_ARCH bundle written to: $OUTPUT_DIR"
