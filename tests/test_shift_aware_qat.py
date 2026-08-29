@@ -127,6 +127,9 @@ def test_two_epoch_cpu_qat_locks_model_compiler_compatible_scales(tmp_path):
     assert checked == 2
 
     finalized = sima_finalize_qat_model(model)
+    finalized_state = finalized.state_dict()
+    assert "shift_aware_qat" not in finalized_state
+    assert "qat_frozen" not in finalized_state
     output_path = tmp_path / "tiny_shift_aware.onnx"
     sima_export_onnx(finalized, (inputs[:2],), str(output_path), device="cpu")
 

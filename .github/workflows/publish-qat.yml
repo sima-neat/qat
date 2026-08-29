@@ -47,7 +47,19 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pytest
+          # The default PyPI torch wheel pulls several gigabytes of CUDA
+          # runtime packages and exhausts the standard GitHub runner before
+          # tests start. These graph regressions are intentionally CPU-only.
+          python -m pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.8.0
+          python -m pip install \
+            numpy==1.26.4 \
+            onnx==1.17.0 \
+            onnxruntime==1.21.1 \
+            packaging \
+            pyyaml \
+            pytest
 
       - name: Run CPU regression and package tests
         run: |
@@ -125,7 +137,9 @@ jobs:
 
   update-latest:
     name: Update Vulcan Latest Tag
-    if: ${{ github.ref_type == 'branch' && (github.event_name == 'workflow_dispatch' || github.ref_name == 'develop' || github.ref_name == 'main') }}
+    # A manual feature-branch publication is version-addressable but must not
+    # replace the customer-facing latest tag.
+    if: ${{ github.ref_type == 'branch' && (github.ref_name == 'develop' || github.ref_name == 'main') }}
     needs:
       - resolve-vulcan-config
       - publish-qat

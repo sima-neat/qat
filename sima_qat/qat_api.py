@@ -100,6 +100,9 @@ def sima_prepare_qat_model(
     inputs: Tuple,
     device: torch.device,
     shift_aware: bool = True,
+    activation_observer: Optional[str] = None,
+    full_range_ste: Optional[bool] = None,
+    learn_scales: Optional[bool] = None,
 ) -> GraphModule:
     """This function is the first transformation needed to perform QAT on a Pytorch model. It takes an
     eager-mode reference to the ML model and produces an FX version of the graph with special annotations
@@ -122,6 +125,13 @@ def sima_prepare_qat_model(
         shift_aware: when ``True`` (the default), fake-quantize weights during training and prepare
             them for SiMa's power-of-two requantization. Set this to ``False`` to retain the legacy
             observer-only weight behavior.
+        activation_observer: activation range estimator: ``moving_average``,
+            ``minmax``, or ``histogram``. The default preserves the installed
+            environment's policy.
+        full_range_ste: use a full-range straight-through activation fake
+            quantizer. This keeps gradients outside the observed INT8 range.
+        learn_scales: make activation scales trainable when ``full_range_ste``
+            is enabled.
 
     Returns:
         GraphModule: a compiled version of the given graph with QAT annotations, ready to begin training.
@@ -139,7 +149,13 @@ def sima_prepare_qat_model(
     m = _export_training_graph(input_graph, inputs)
     m = replace_dropout(m)
 
-    cfg = get_sima_quantization_config(is_qat=True, shift_aware=shift_aware)
+    cfg = get_sima_quantization_config(
+        is_qat=True,
+        shift_aware=shift_aware,
+        activation_observer=activation_observer,
+        full_range_ste=full_range_ste,
+        learn_scales=learn_scales,
+    )
     quantizer = SimaQuantizer().set_global(cfg)
     gm = prepare_qat_pt2e(m, quantizer)
     sima_mod = SimaQatWrapper(source=gm, label='scaffold', shift_aware=shift_aware)
@@ -380,12 +396,26 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
     # in FQ mode, we always remain in eval mode.
     sima_mod.eval()
     sima_mod = replace_batchnorm(sima_mod)
+    # These two buffers are training/checkpoint control-plane state, not model
+    # tensors. Keeping them on the inference-only wrapper perturbs legacy ONNX
+    # export's generated initializer numbering even though neither buffer is
+    # reachable from the graph. Finalized models cannot resume training, so
+    # remove the dead metadata before export and keep the qualified Q/DQ graph
+    # byte-stable across package revisions.
+    del sima_mod.shift_aware_qat
+    del sima_mod.qat_frozen
     return sima_mod
 
 
-def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: str, input_names: Optional[List[str]] = None, 
-                     output_names: Optional[List[str]] = None,
-                     device: Optional[Union[str, torch.device]] = None) -> GraphModule:
+def sima_export_onnx(
+    qat_model: nn.Module,
+    inputs: Tuple[Tensor],
+    output_file: str,
+    input_names: Optional[List[str]] = None,
+    output_names: Optional[List[str]] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    export_device: Optional[Union[str, torch.device]] = None,
+) -> GraphModule:
     """This function exports a finalized QAT model to ONNX format.
 
     Args:
@@ -397,18 +427,25 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
         output_names: a list of tensor names used to label the ONNX model outputs.
         device: optional device to restore the returned model to after CPU ONNX export.
             If unset, the model returns to its original device.
+        export_device: optional device on which to trace and constant-fold the
+            ONNX graph. CPU is the portable default. Set this explicitly when
+            reproducing a device-qualified export whose constant-folding
+            contract was established on an accelerator.
     """
     if not isinstance(qat_model, nn.Module):
         raise RuntimeError(f"Input graph to export function must be of type nn.Module, found {type(qat_model)}")
 
     original_device = _get_module_device(qat_model)
     restore_device = torch.device(device) if device is not None else original_device
-    export_device_arg = "cpu"
-    export_device = torch.device(export_device_arg)
+    selected_export_device = torch.device(export_device or "cpu")
+    if selected_export_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "Cannot export the QAT model on CUDA because CUDA is unavailable."
+        )
 
-    qat_model.to(export_device)
-    export_inputs = _move_value_to_device(inputs, export_device)
-    qat_model = check_graph_nodes(qat_model, device=export_device_arg)
+    qat_model.to(selected_export_device)
+    export_inputs = _move_value_to_device(inputs, selected_export_device)
+    qat_model = check_graph_nodes(qat_model, device=selected_export_device)
     torch.onnx.export(
         qat_model,
         export_inputs[0],
@@ -419,6 +456,7 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
         input_names = input_names,
         output_names = output_names,
     )
+    onnx_ops.canonicalize_repeated_input_concat_qdq(output_file)
 
     if restore_device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Cannot restore exported QAT model to CUDA because CUDA is unavailable.")

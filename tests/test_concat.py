@@ -52,6 +52,18 @@ class Model(torch.nn.Module):
         return x
 
 
+class RepeatedInputConcatModel(torch.nn.Module):
+    """C1-to-C16 ABI packing must remain on one activation grid."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, 1, kernel_size=1)
+
+    def forward(self, x):
+        depth = torch.relu(self.conv(x))
+        return torch.cat((depth,) * 16, dim=1)
+
+
 @pytest.mark.regression
 @pytest.mark.parametrize("model", [Model()])
 def test_concat(model: torch.nn.Module):
@@ -89,3 +101,35 @@ def test_concat(model: torch.nn.Module):
     # Concat must preserve distinct per-input quantization scales (not collapse them).
     assert len(scales) >= 2
     assert not all(x == scales[0] for x in scales)
+
+
+@pytest.mark.regression
+def test_repeated_input_concat_is_quantized_on_shared_grid():
+    model = RepeatedInputConcatModel().eval()
+    input_tensor = torch.randn(1, 3, 8, 8)
+    prepared = sima_prepare_qat_model(model, (input_tensor,), "cpu")
+    prepared(input_tensor)
+
+    cat = next(
+        node
+        for node in prepared.graph.nodes
+        if node.target == torch.ops.aten.cat.default
+    )
+    assert any(node.op == "call_module" for node in cat.users)
+
+    converted = sima_finalize_qat_model(prepared)
+    cat = next(
+        node
+        for node in converted.graph.nodes
+        if node.target == torch.ops.aten.cat.default
+    )
+    quantize = next(iter(cat.users))
+    assert (
+        quantize.target
+        == torch.ops.quantized_decomposed.quantize_per_tensor.default
+    )
+    dequantize_inputs = list(cat.args[0])
+    assert len(dequantize_inputs) == 16
+    assert len({node for node in dequantize_inputs}) == 1
+    input_dequantize = dequantize_inputs[0]
+    assert quantize.args[1:3] == input_dequantize.args[1:3]

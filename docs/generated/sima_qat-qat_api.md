@@ -4,7 +4,7 @@ Source: `sima_qat/qat_api.py`
 
 ## Public API
 
-### Function: `sima_prepare_qat_model(input_graph, inputs, device, shift_aware)`
+### Function: `sima_prepare_qat_model(input_graph, inputs, device, shift_aware, activation_observer, full_range_ste, learn_scales)`
 
 This function is the first transformation needed to perform QAT on a Pytorch model. It takes an
 eager-mode reference to the ML model and produces an FX version of the graph with special annotations
@@ -27,6 +27,13 @@ Args:
     shift_aware: when ``True`` (the default), fake-quantize weights during training and prepare
         them for SiMa's power-of-two requantization. Set this to ``False`` to retain the legacy
         observer-only weight behavior.
+    activation_observer: activation range estimator: ``moving_average``,
+        ``minmax``, or ``histogram``. The default preserves the installed
+        environment's policy.
+    full_range_ste: use a full-range straight-through activation fake
+        quantizer. This keeps gradients outside the observed INT8 range.
+    learn_scales: make activation scales trainable when ``full_range_ste``
+        is enabled.
 
 Returns:
     GraphModule: a compiled version of the given graph with QAT annotations, ready to begin training.
@@ -52,7 +59,7 @@ Returns:
     GraphModule: an inference-only version of the QAT model, which can be run in Pytorch
         `eval(True)` mode, or exported via ONNX.
 
-### Function: `sima_export_onnx(qat_model, inputs, output_file, input_names, output_names, device)`
+### Function: `sima_export_onnx(qat_model, inputs, output_file, input_names, output_names, device, export_device)`
 
 This function exports a finalized QAT model to ONNX format.
 
@@ -65,6 +72,10 @@ Args:
     output_names: a list of tensor names used to label the ONNX model outputs.
     device: optional device to restore the returned model to after CPU ONNX export.
         If unset, the model returns to its original device.
+    export_device: optional device on which to trace and constant-fold the
+        ONNX graph. CPU is the portable default. Set this explicitly when
+        reproducing a device-qualified export whose constant-folding
+        contract was established on an accelerator.
 
 ### Class: `SimaQatWrapper`
 

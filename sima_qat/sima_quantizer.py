@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import copy
 import operator
-import warnings
 import functools
 import itertools
+import os
+import math
 
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -42,6 +43,7 @@ import torch._dynamo as torchdynamo
 import torch.nn.functional as F
 from torch.ao.quantization.fake_quantize import (
     FakeQuantize,
+    FusedMovingAvgObsFakeQuantize,
 )
 from torch.ao.quantization.observer import (
     HistogramObserver,
@@ -58,6 +60,7 @@ from torch.ao.quantization.quantizer import (
     QuantizationSpec, 
     Quantizer,
     QuantizationAnnotation,
+    SharedQuantizationSpec,
 )
 
 from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import (
@@ -90,34 +93,33 @@ try:
     from torch.ao.quantization.pt2e.utils import (
         _conv1d_bn_example_inputs,
         _conv2d_bn_example_inputs,
+        get_aten_graph_module,
     )
 except ImportError:
-    # torch >= 2.5 turned these conv-bn example inputs into function-local variables,
-    # so they are no longer importable. They are stable constants -- define them inline.
-    _conv1d_bn_example_inputs = (
-        torch.randn(1, 1, 3),  # x
-        torch.randn(1, 1, 1),  # conv_weight
-        torch.randn(1),        # conv_bias
-        torch.randn(1),        # bn_weight
-        torch.randn(1),        # bn_bias
-        torch.randn(1),        # bn_running_mean
-        torch.randn(1),        # bn_running_var
-    )
-    _conv2d_bn_example_inputs = (
-        torch.randn(1, 1, 3, 3),  # x
-        torch.randn(1, 1, 1, 1),  # conv_weight
-        torch.randn(1),           # conv_bias
-        torch.randn(1),           # bn_weight
-        torch.randn(1),           # bn_bias
-        torch.randn(1),           # bn_running_mean
-        torch.randn(1),           # bn_running_var
-    )
-try:
-    from torch.ao.quantization.pt2e.utils import get_aten_graph_module
-except ImportError:
-    # Renamed in torch 2.4.x
+    # torch 2.8 renamed the pattern exporter and stopped publishing the two
+    # small example tuples.  Their concrete values are irrelevant; only the
+    # ranks/shapes are used to capture Conv+BN patterns.
     from torch.ao.quantization.pt2e.utils import (
         _get_aten_graph_module_for_pattern as get_aten_graph_module,
+    )
+
+    _conv1d_bn_example_inputs = (
+        torch.ones(1, 1, 3),
+        torch.ones(1, 1, 1),
+        torch.ones(1),
+        torch.ones(1),
+        torch.ones(1),
+        torch.ones(1),
+        torch.ones(1),
+    )
+    _conv2d_bn_example_inputs = (
+        torch.ones(1, 1, 3, 3),
+        torch.ones(1, 1, 1, 1),
+        torch.ones(1),
+        torch.ones(1),
+        torch.ones(1),
+        torch.ones(1),
+        torch.ones(1),
     )
 from torch.fx.passes.utils.matcher_with_name_node_map_utils import (
     SubgraphMatcherWithNameNodeMap,
@@ -173,6 +175,141 @@ class SimaMovingAverageMinMaxObserver(MovingAverageMinMaxObserver):
         return x_orig
 
 
+class FullRangeSTEFakeQuantize(FakeQuantize):
+    """Fake INT8 forward with an identity backward, including clipped values.
+
+    PyTorch's native fake-quant backward zeroes gradients outside the observed
+    range. DepthART's recurrent state can temporarily exceed that range early
+    in QAT, which otherwise blocks the very gradient needed to pull it back.
+    The forward remains bit-identical to native fake quantization; only the
+    training surrogate gradient changes.
+    """
+
+    def __init__(self, *args, learn_scale: Optional[bool] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        # QAT on a deeply recurrent graph can fail if every activation is
+        # switched from float to INT8 in one step.  Keep the deploy default at
+        # one, while allowing the training driver to introduce the exact INT8
+        # forward progressively.  This is deliberately non-persistent: a
+        # reloaded/exported checkpoint always executes the strict INT8
+        # simulation unless its training session explicitly changes it.
+        self.quant_strength = 1.0
+        # Integer MLA kernels can differ from the float-QDQ reference by one
+        # output code because accumulation and requantization happen in the
+        # integer domain. QAT may explicitly inject that measured error as a
+        # robustness augmentation. Reloaded/exported checkpoints default to
+        # zero and remain deterministic.
+        self.target_code_noise_probability = 0.0
+        self.learn_scale = (
+            os.environ.get("SIMA_QAT_LEARN_SCALES", "0") == "1"
+            if learn_scale is None
+            else bool(learn_scale)
+        )
+        if self.learn_scale:
+            self.log_scale = torch.nn.Parameter(self.scale.detach().clamp_min(1e-12).log())
+
+    @torch.no_grad()
+    def initialize_learned_scale(self):
+        if self.learn_scale:
+            self.log_scale.copy_(self.scale.detach().clamp_min(1e-12).log())
+
+    @torch.no_grad()
+    def sync_learned_scale(self):
+        if self.learn_scale:
+            self.scale.copy_(self.log_scale.detach().exp().clamp_min(1e-12))
+
+    def set_quant_strength(self, value: float) -> None:
+        value = float(value)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"quantization strength must be in [0, 1], found {value}")
+        self.quant_strength = value
+
+    def set_target_code_noise_probability(self, value: float) -> None:
+        value = float(value)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(
+                "target code-noise probability must be in [0, 1], "
+                f"found {value}"
+            )
+        self.target_code_noise_probability = value
+
+    def _apply_target_code_noise(self, quantized: torch.Tensor) -> torch.Tensor:
+        """Randomly perturb activation codes by +/-1 without changing the STE.
+
+        This training-only augmentation preserves a valid signed-INT8 code at
+        every forward boundary and never applies to per-channel weights.
+        """
+        probability = self.target_code_noise_probability
+        if probability <= 0.0 or self.is_per_channel:
+            return quantized
+        scale = self.scale.to(device=quantized.device, dtype=quantized.dtype)
+        zero_point = self.zero_point.to(device=quantized.device, dtype=quantized.dtype)
+        code = torch.round(quantized.detach() / scale + zero_point)
+        draw = torch.rand_like(quantized)
+        delta = torch.where(
+            draw < probability * 0.5,
+            -torch.ones_like(draw),
+            torch.where(draw < probability, torch.ones_like(draw), torch.zeros_like(draw)),
+        )
+        noisy_code = (code + delta).clamp(
+            self.activation_post_process.quant_min,
+            self.activation_post_process.quant_max,
+        )
+        noisy = (noisy_code - zero_point) * scale
+        return quantized + (noisy - quantized).detach()
+
+    def forward(self, x):
+        if self.observer_enabled[0] == 1:
+            self.activation_post_process(x.detach())
+            # Observer-only calibration intentionally bypasses fake quant and
+            # defers the potentially expensive qparam search until all samples
+            # have been seen. During ordinary QAT, fake quant is enabled and
+            # qparams continue to track the observer as usual.
+            if self.fake_quant_enabled[0] == 1:
+                scale, zero_point = self.calculate_qparams()
+                scale = scale.to(self.scale.device)
+                zero_point = zero_point.to(self.zero_point.device)
+                if self.scale.shape != scale.shape:
+                    self.scale.resize_(scale.shape)
+                    self.zero_point.resize_(zero_point.shape)
+                self.scale.copy_(scale)
+                self.zero_point.copy_(zero_point)
+                self.initialize_learned_scale()
+        if self.fake_quant_enabled[0] != 1:
+            return x
+        if self.learn_scale and not self.is_per_channel:
+            scale = self.log_scale.exp().clamp_min(1e-12)
+            with torch.no_grad():
+                self.scale.copy_(scale.detach())
+            zero_point = self.zero_point.to(x.dtype)
+            code = torch.round(x.detach() / scale.detach() + zero_point).clamp(
+                self.activation_post_process.quant_min,
+                self.activation_post_process.quant_max,
+            )
+            dequantized = (code - zero_point) * scale.detach()
+            dequantized = self._apply_target_code_noise(dequantized)
+            # Identity STE for x plus the LSQ scale surrogate. The latter has
+            # exactly zero forward value and a normalized gradient for log(s).
+            base = x + self.quant_strength * (dequantized - x).detach()
+            scale_error = code - zero_point - x.detach() / scale.detach()
+            grad_factor = 1.0 / math.sqrt(max(1, x.numel()) * max(1, self.quant_max))
+            return base + (scale - scale.detach()) * scale_error * grad_factor
+        if self.is_per_channel:
+            quantized = torch.fake_quantize_per_channel_affine(
+                x, self.scale, self.zero_point, self.ch_axis,
+                self.activation_post_process.quant_min,
+                self.activation_post_process.quant_max,
+            )
+        else:
+            quantized = torch.fake_quantize_per_tensor_affine(
+                x, self.scale, self.zero_point,
+                self.activation_post_process.quant_min,
+                self.activation_post_process.quant_max,
+            )
+        quantized = self._apply_target_code_noise(quantized)
+        return x + self.quant_strength * (quantized - x).detach()
+
+
 def _supported_symmetric_quantized_operators() -> Dict[str, List[OperatorPatternType]]:
     supported_operators: Dict[str, List[OperatorPatternType]] = {
         # Both conv and linear should be able to handle relu + hardtanh fusion since
@@ -184,6 +321,8 @@ def _supported_symmetric_quantized_operators() -> Dict[str, List[OperatorPattern
             [F.conv2d, F.relu],
         ],
         "linear": [[torch.nn.Linear], [F.linear]],
+        "matmul": [[torch.matmul], [operator.matmul]],
+        "softmax": [[torch.nn.Softmax], [F.softmax]],
         "add": [[torch.add]],
         "max_pool2d": [[torch.nn.MaxPool2d], [F.max_pool2d]],
         "adaptive_avg_pool2d": [
@@ -209,15 +348,14 @@ def _get_supported_symmetric_config_and_operators() -> List[OperatorConfig]:
     return copy.deepcopy(supported_config_and_operators)
 
 
-@functools.lru_cache
 def get_sima_quantization_config(
     is_qat: bool = False,
     shift_aware: bool = True,
+    activation_observer: Optional[str] = None,
+    full_range_ste: Optional[bool] = None,
+    learn_scales: Optional[bool] = None,
 ):
-    # This configuration function selects QAT/PTQ and, for QAT, whether the
-    # weights are fake-quantized during training.  Weight fake quantization is
-    # required for shift-aware QAT; ``shift_aware=False`` preserves the legacy
-    # observer-only behavior.
+    # This configuration function only has one parameter (use QAT or not).
     # Sima has a preferred encoding for activation and weight tensors that give 
     # best possible results. Since QAT is a high-effort activity, we only use the
     # best quantization settings possible here.
@@ -227,8 +365,37 @@ def get_sima_quantization_config(
     # ---------------------------------------------------
     act_extra_args: Dict[str, Any] = {"eps": 2**-12}
     if is_qat:
-        act_observer_or_fake_quant_ctr = FakeQuantize
-        act_extra_args["observer"] = SimaMovingAverageMinMaxObserver
+        use_full_range_ste = (
+            os.environ.get("SIMA_QAT_FULL_RANGE_STE", "0") == "1"
+            if full_range_ste is None
+            else bool(full_range_ste)
+        )
+        act_observer_or_fake_quant_ctr = (
+            FullRangeSTEFakeQuantize if use_full_range_ste else FakeQuantize
+        )
+        observer_mode = (
+            activation_observer
+            or os.environ.get("SIMA_QAT_ACTIVATION_OBSERVER", "moving_average")
+        ).lower()
+        if use_full_range_ste and learn_scales is not None:
+            act_extra_args["learn_scale"] = bool(learn_scales)
+        if observer_mode == "minmax":
+            # State-space recurrences can contain rare but legitimate channel
+            # outliers.  An EMA of per-sample extrema clips those values by
+            # orders of magnitude after calibration; a global MinMaxObserver
+            # gives the strict INT8 graph a conservative, non-saturating range.
+            act_extra_args["observer"] = MinMaxObserver
+        elif observer_mode == "histogram":
+            # HistogramObserver searches a clipped range that minimizes the
+            # reconstruction L2 error, closely matching AFE's MSE calibration.
+            act_extra_args["observer"] = HistogramObserver
+        elif observer_mode == "moving_average":
+            act_extra_args["observer"] = SimaMovingAverageMinMaxObserver
+        else:
+            raise ValueError(
+                "SIMA_QAT_ACTIVATION_OBSERVER must be moving_average, minmax, or histogram, "
+                f"found {observer_mode!r}"
+            )
     else:
         # If QAT is disabled, we can add histogram observers to collect data.
         act_observer_or_fake_quant_ctr = HistogramObserver  # type: ignore[assignment]
@@ -252,9 +419,14 @@ def get_sima_quantization_config(
     # Weights will always be captured as per-channel symmetric.
     wt_extra_args: Dict[str, Any] = {"eps": 2**-12}
     if is_qat and shift_aware:
+        # Shift-aware QAT must expose quantized weights during the forward
+        # pass. A bare observer postpones weight rounding until conversion and
+        # cannot recover accuracy after the target grids are locked.
         weight_observer_or_fake_quant_ctr = FakeQuantize
         wt_extra_args["observer"] = MovingAveragePerChannelMinMaxObserver
     elif is_qat:
+        # Explicit compatibility path for checkpoints created before
+        # shift-aware weight fake quantization became the default.
         weight_observer_or_fake_quant_ctr = PerChannelMinMaxObserver
     else:
         weight_observer_or_fake_quant_ctr = PlaceholderObserver
@@ -288,7 +460,7 @@ def _get_supported_config_and_operators() -> List[OperatorConfig]:
 
 class SimaQuantizer(Quantizer):
     """ This quantizer definition uses XNNPACK implementation for the majority of ops. This is because
-        the XNNPACK code looks for appropriate patterns and applies the QuantizationAnnotation
+        the XNNPACK code simply looks for appropriate patterns, and applies the QuantizationAnnotation
         attributes accordingly. The quantization rules are defined separately, and specified here using
         Sima properties.
     """
@@ -304,8 +476,11 @@ class SimaQuantizer(Quantizer):
     STATIC_OPS = [
         "linear_relu",
         "linear",
+        "sima_matmul",
+        "sima_softmax",
         "sima_conv_add_or_mul_const",
         "sima_conv_hardtanh",
+        "sima_conv_transpose2d",
         "conv_relu",
         "conv",
         "adaptive_avg_pool2d",
@@ -317,6 +492,7 @@ class SimaQuantizer(Quantizer):
         "mul",
         "sima_cat",
         "sima_sigmoid",
+        "sima_erf",
         "sima_silu",
         "sima_slice_select_unsqueeze",
         "sima_batchnorm"
@@ -418,18 +594,17 @@ class SimaQuantizer(Quantizer):
         if quantization_config is None:
             return model
 
-        ops = []
         if quantization_config.is_qat:
-            ops += self.STATIC_QAT_ONLY_OPS
-        ops += self.STATIC_OPS
-        for op in ops:
+            for op in self.STATIC_QAT_ONLY_OPS:
+                OP_TO_ANNOTATOR[op](model, quantization_config, filter_fn)
+        for op in self.STATIC_OPS:
             annotator = OP_TO_ANNOTATOR.get(op)
-            if annotator is None:
-                # Some built-in annotators (e.g. 'max_pool2d') were dropped from the
-                # reference xnnpack quantizer in newer torch. They are shared-qspec
-                # pass-throughs, so skipping leaves the surrounding Q/DQ intact.
-                warnings.warn(f"No annotator registered for '{op}'; skipping.")
+            if annotator is None and op == "max_pool2d":
+                # torch 2.8 propagates the producer quantization grid through
+                # MaxPool and no longer exposes a standalone XNNPACK annotator.
                 continue
+            if annotator is None:
+                raise KeyError(f"missing PT2E annotator for {op!r}")
             annotator(model, quantization_config, filter_fn)
         return model
 
@@ -461,6 +636,67 @@ class SimaQuantizer(Quantizer):
     @classmethod
     def get_supported_operators(cls) -> List[OperatorConfig]:
         return cls.supported_config_and_operators
+
+
+@register_annotator("sima_conv_transpose2d")
+def _sima_annotate_conv_transpose2d(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    """Annotate ConvTranspose2d with target-exact symmetric INT8 weights.
+
+    PyTorch stores ConvTranspose2d weights as ``[C_in, C_out/groups, kH, kW]``.
+    PT2E 2.3 rewrites a requested axis-1 quantizer to axis 0 for this operator,
+    which would silently quantize input rather than output channels.  Use a
+    symmetric per-tensor grid for this single layer instead.  It remains strict
+    W8A8, is faithfully simulated during training, and exports without an
+    ambiguous channel-axis contract.
+    """
+    if quantization_config is None:
+        return []
+    annotated_partitions: List[List[Node]] = []
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.conv_transpose2d.input:
+            continue
+        partition = [node]
+        weight = node.args[1]
+        if not isinstance(weight, Node):
+            raise RuntimeError("ConvTranspose2d weight must be an FX node")
+        partition.append(weight)
+        bias = node.args[2] if len(node.args) > 2 else None
+        if isinstance(bias, Node):
+            partition.append(bias)
+        if _is_annotated(partition):
+            continue
+        if filter_fn and any(not filter_fn(member) for member in partition):
+            continue
+        base_weight_qspec = get_weight_qspec(quantization_config)
+        weight_qspec = QuantizationSpec(
+            dtype=base_weight_qspec.dtype,
+            quant_min=base_weight_qspec.quant_min,
+            quant_max=base_weight_qspec.quant_max,
+            qscheme=torch.per_tensor_symmetric,
+            is_dynamic=False,
+            observer_or_fake_quant_ctr=FakeQuantize.with_args(
+                observer=MovingAverageMinMaxObserver,
+                eps=2**-12,
+            ),
+        )
+        input_qspec_map = {
+            node.args[0]: get_input_act_qspec(quantization_config),
+            weight: weight_qspec,
+        }
+        if isinstance(bias, Node):
+            input_qspec_map[bias] = get_bias_qspec(quantization_config)
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            output_qspec=get_output_act_qspec(quantization_config),
+            _annotated=True,
+        )
+        _mark_nodes_as_annotated(partition)
+        annotated_partitions.append(partition)
+    return annotated_partitions
 
 
 def _annotate_single_op(
@@ -500,6 +736,85 @@ def _annotate_single_op(
     return annotated_partitions
 
 
+@register_annotator("sima_matmul")
+def _sima_annotate_matmul(
+    model: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Annotate activation-by-activation matrix multiplication."""
+    targets = {
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.matmul.default,
+        torch.ops.aten.mm.default,
+    }
+    annotated_partitions = []
+    for node in model.graph.nodes:
+        if node.op != "call_function" or node.target not in targets:
+            continue
+        if filter_fn is not None and not filter_fn(node):
+            continue
+        if _is_annotated([node]):
+            continue
+
+        input_qspec = get_input_act_qspec(quantization_config)
+        input_nodes = []
+        for input_node in node.args[:2]:
+            if not isinstance(input_node, Node):
+                break
+            if _is_input_large_scalar(input_node, model) or _is_input_non_float_tensor(input_node):
+                break
+            input_nodes.append(input_node)
+        if len(input_nodes) != 2:
+            continue
+        # A self-product can use the same activation for both operands. One
+        # map entry correctly shares its fake-quantized value across both
+        # edges; requiring two unique nodes would silently skip that MatMul.
+        input_qspec_map = {input_node: input_qspec for input_node in input_nodes}
+
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            output_qspec=get_output_act_qspec(quantization_config),
+            _annotated=True,
+        )
+        annotated_partitions.append([node])
+    return annotated_partitions
+
+
+@register_annotator("sima_softmax")
+def _sima_annotate_softmax(
+    model: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Annotate Softmax input and output activations."""
+    targets = {
+        torch.ops.aten._softmax.default,
+        torch.ops.aten.softmax.int,
+    }
+    annotated_partitions = []
+    for node in model.graph.nodes:
+        if node.op != "call_function" or node.target not in targets:
+            continue
+        if filter_fn is not None and not filter_fn(node):
+            continue
+        if _is_annotated([node]):
+            continue
+
+        input_node = node.args[0]
+        if not isinstance(input_node, Node):
+            continue
+        if _is_input_non_float_tensor(input_node):
+            continue
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map={input_node: get_input_act_qspec(quantization_config)},
+            output_qspec=get_output_act_qspec(quantization_config),
+            _annotated=True,
+        )
+        annotated_partitions.append([node])
+    return annotated_partitions
+
+
 @register_annotator("sima_sigmoid")
 def _sima_annotate_sigmoid(
     gm: torch.fx.GraphModule,
@@ -522,6 +837,36 @@ def _sima_annotate_sigmoid(
         quantization_config = quantization_config,
         op_partitions = sig_partitions,
         op_check = _sig_target_check,
+    )
+
+
+@register_annotator("sima_erf")
+def _sima_annotate_erf(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    """Quantize explicit Erf inputs/outputs used by target-realizable GELU.
+
+    AFE lowers GELU into primitive INT8 stages and therefore materializes an
+    INT8 grid at Erf.  PT2E has no stock Erf annotator, so without this rule
+    QAT cannot see the target boundary even when GELU is explicitly
+    decomposed in PyTorch.
+    """
+    partitions = get_source_partitions(gm.graph, [torch.erf], filter_fn)
+    partitions = list(itertools.chain.from_iterable(partitions.values()))
+
+    def _erf_target_check(erf_node: Node) -> bool:
+        if erf_node.target != torch.ops.aten.erf.default:
+            raise Exception(
+                f"Expected erf node torch.ops.aten.erf.default, found {erf_node.target}"
+            )
+        return True
+
+    return _annotate_single_op(
+        quantization_config=quantization_config,
+        op_partitions=partitions,
+        op_check=_erf_target_check,
     )
 
 
@@ -793,6 +1138,22 @@ def _sima_annotate_conv_add_or_mul_const(
             continue
 
         op_node = n
+        # AFE recognizes Conv -> (x * 1/sqrt(2)) -> Erf as the primitive
+        # lowering of GELU and materializes an INT8 grid between Conv and the
+        # scale Multiply. Treating this Multiply as the generic fused
+        # Conv+constant pattern hides that grid from PT2E QAT. Leave the pair
+        # unfused so the normal Conv and Mul annotators expose both target
+        # boundaries. This is semantic target matching, not a model-specific
+        # name check.
+        if (
+            n.target == torch.ops.aten.mul.Tensor
+            and any(
+                user.op == "call_function"
+                and user.target == torch.ops.aten.erf.default
+                for user in n.users
+            )
+        ):
+            continue
         maybe_conv_node = n.args[conv_node_id]
         if (
             not isinstance(maybe_conv_node, Node)
@@ -1012,9 +1373,36 @@ def _sima_annotate_cat(
 ) -> Optional[List[List[Node]]]:
     cat_partitions = get_source_partitions(gm.graph, [torch.cat], filter_fn)
     cat_partitions = list(itertools.chain.from_iterable(cat_partitions.values()))
+    # ``get_source_partitions`` does not return a partition for a cat whose
+    # input list aliases one tensor repeatedly (for example a parameter-free
+    # C1 -> C16 public-output pack).  Such cats are still ordinary aten cats
+    # and must not silently escape QAT.  Add unpartitioned aten nodes as
+    # single-node partitions while retaining source-partition filtering for
+    # the common case.
+    partitioned_cat_nodes = {
+        partition.output_nodes[0] for partition in cat_partitions
+    }
+    quantize_all_concat = os.environ.get("SIMA_QAT_QUANTIZE_ALL_CONCAT", "1") == "1"
+    fallback_cat_nodes = [
+        node
+        for node in gm.graph.nodes
+        if node.target == torch.ops.aten.cat.default
+        and node not in partitioned_cat_nodes
+        and (
+            quantize_all_concat
+            or (
+                isinstance(node.args[0], (list, tuple))
+                and len(node.args[0]) >= 2
+                and all(value is node.args[0][0] for value in node.args[0])
+            )
+        )
+        and (filter_fn is None or filter_fn(node))
+    ]
+    cat_nodes = [
+        partition.output_nodes[0] for partition in cat_partitions
+    ] + fallback_cat_nodes
     annotated_partitions = []
-    for cat_partition in cat_partitions:
-        cat_node = cat_partition.output_nodes[0]
+    for cat_node in cat_nodes:
         if _is_annotated([cat_node]):
             continue
 
@@ -1025,7 +1413,7 @@ def _sima_annotate_cat(
                 " please check if you are calling the correct capture API"
             )
 
-        annotated_partitions.append(cat_partition.nodes)
+        annotated_partitions.append([cat_node])
 
         input_act_qspec = get_input_act_qspec(quantization_config)
         inputs = cat_node.args[0]
@@ -1037,7 +1425,15 @@ def _sima_annotate_cat(
                 continue
             input_qspec_map[input_act] = input_act_qspec
 
-        output_act_qspec = get_output_act_qspec(quantization_config)
+        # When every list entry is the same tensor, concatenation is only a
+        # layout/public-ABI operation.  Sharing its output grid with that
+        # tensor makes QAT and export model the exact integer-code repeat,
+        # rather than learning a gratuitous terminal requantization.
+        output_act_qspec = (
+            SharedQuantizationSpec(inputs[0])
+            if inputs and all(input_act is inputs[0] for input_act in inputs)
+            else get_output_act_qspec(quantization_config)
+        )
 
         cat_node.meta["quantization_annotation"] = QuantizationAnnotation(
             input_qspec_map=input_qspec_map,

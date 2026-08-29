@@ -65,6 +65,20 @@ qat_model = sima_finalize_qat_model(qat_model)
 sima_export_onnx(qat_model, example_inputs, 'model.onnx', device='cuda')
 ```
 
+For recurrent or state-space vision models, select the stricter activation
+policy explicitly instead of relying on process environment variables:
+
+```python
+qat_model = sima_prepare_qat_model(
+    model,
+    example_inputs,
+    device="cuda",
+    activation_observer="minmax",
+    full_range_ste=True,
+    learn_scales=False,
+)
+```
+
 Shift-aware QAT constrains each convolution or linear weight scale so that the
 Model Compiler can use its native integer shift requantization without
 rescaling the learned INT8 weight codes. Calling
@@ -86,6 +100,17 @@ qat_model = sima_prepare_qat_model(
 | `sima_freeze_qat(qat_model)` | Freeze observers and lock AFE-compatible weight scales before final fine-tuning. |
 | `sima_finalize_qat_model(qat_model)` | Fold the trained scaffolding into an inference-only quantized graph. |
 | `sima_export_onnx(qat_model, inputs, output_file, ...)` | Export the finalized model to an ONNX QuantizeLinear/DequantizeLinear graph. |
+
+The quantizer has regression coverage for Conv2d, ConvTranspose2d, Linear,
+Add, Multiply, average/max pooling, BatchNorm, Sigmoid, SiLU, Erf, slicing,
+selection, unsqueeze, and Concat. Repeated-input Concat uses one shared INT8
+grid so aligned C1-to-C16 output publication does not introduce a floating
+requantization. Unsupported operators remain visible in the exported graph and
+must be resolved in the model architecture before claiming strict INT8.
+
+ONNX export runs on CPU by default. Use `export_device="cuda"` only when
+reproducing an already-qualified accelerator-side constant-folding contract;
+`device` controls where the returned model is restored after export.
 
 ## Examples
 
