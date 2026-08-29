@@ -27,6 +27,8 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
+import warnings
+from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
@@ -54,7 +56,12 @@ from torch.ao.quantization.quantize_pt2e import (
   prepare_qat_pt2e,
   convert_pt2e,
 )
-from torch.ao.quantization import move_exported_model_to_eval, move_exported_model_to_train
+from torch.ao.quantization import (
+    disable_observer,
+    move_exported_model_to_eval,
+    move_exported_model_to_train,
+)
+from torch.ao.quantization.fake_quantize import FakeQuantizeBase
 from torch.fx.graph_module import GraphModule
 
 
@@ -69,7 +76,12 @@ device_modifier_ops = [
 ]
 
 
-def sima_prepare_qat_model(input_graph: nn.Module, inputs: Tuple, device: torch.device) -> GraphModule:
+def sima_prepare_qat_model(
+    input_graph: nn.Module,
+    inputs: Tuple,
+    device: torch.device,
+    shift_aware: bool = True,
+) -> GraphModule:
     """This function is the first transformation needed to perform QAT on a Pytorch model. It takes an
     eager-mode reference to the ML model and produces an FX version of the graph with special annotations
     needed for QAT. Internally, it will scaffold the graph using observers and fakequant nodes needed 
@@ -88,6 +100,9 @@ def sima_prepare_qat_model(input_graph: nn.Module, inputs: Tuple, device: torch.
             process to build the compiled FX representation.
         device: a Pytorch `device` identifier. This will be the device on which the prepared model will
             be located after the preparation step is complete.
+        shift_aware: when ``True`` (the default), fake-quantize weights during training and prepare
+            them for SiMa's power-of-two requantization. Set this to ``False`` to retain the legacy
+            observer-only weight behavior.
 
     Returns:
         GraphModule: a compiled version of the given graph with QAT annotations, ready to begin training.
@@ -105,15 +120,183 @@ def sima_prepare_qat_model(input_graph: nn.Module, inputs: Tuple, device: torch.
     m = _export_training_graph(input_graph, inputs)
     m = replace_dropout(m)
 
-    cfg = get_sima_quantization_config(is_qat=True)
+    cfg = get_sima_quantization_config(is_qat=True, shift_aware=shift_aware)
     quantizer = SimaQuantizer().set_global(cfg)
     gm = prepare_qat_pt2e(m, quantizer)
-    sima_mod = SimaQatWrapper(source=gm, label='scaffold')
+    sima_mod = SimaQatWrapper(source=gm, label='scaffold', shift_aware=shift_aware)
     sima_mod.to(device)
     sima_mod.train()
     sima_mod = check_graph_nodes(sima_mod, device)
 
     return sima_mod
+
+
+_SHIFT_AWARE_OPS = {
+    torch.ops.aten.conv1d.default,
+    torch.ops.aten.conv2d.default,
+    torch.ops.aten.linear.default,
+}
+_MIN_REQUANT_SHIFT = 0
+_MAX_REQUANT_SHIFT = 31
+
+
+def _resolve_attr(module: nn.Module, target: str) -> Any:
+    value: Any = module
+    for atom in target.split("."):
+        value = getattr(value, atom)
+    return value
+
+
+def _fake_quant_module(module: GraphModule, node: Any) -> Optional[FakeQuantizeBase]:
+    if getattr(node, "op", None) != "call_module":
+        return None
+    candidate = module.get_submodule(node.target)
+    return candidate if isinstance(candidate, FakeQuantizeBase) else None
+
+
+def _find_output_fake_quant(module: GraphModule, op_node: Any) -> Optional[FakeQuantizeBase]:
+    """Find the nearest per-tensor fake quantizer following an annotated op.
+
+    PT2E can place the output observer after a fused activation such as ReLU,
+    rather than directly after the convolution. Stop at another weighted op so
+    that an unrelated downstream quantizer cannot be selected accidentally.
+    """
+    pending = list(op_node.users)
+    visited = set()
+    while pending:
+        node = pending.pop(0)
+        if node in visited:
+            continue
+        visited.add(node)
+        fake_quant = _fake_quant_module(module, node)
+        if fake_quant is not None and fake_quant.qscheme in (
+            torch.per_tensor_affine,
+            torch.per_tensor_symmetric,
+        ):
+            return fake_quant
+        if node.op == "call_function" and node.target in _SHIFT_AWARE_OPS:
+            continue
+        pending.extend(node.users)
+    return None
+
+
+def _safe_power_of_two_weight_scale(
+    input_scale: Tensor,
+    output_scale: Tensor,
+    weight: Tensor,
+) -> Tensor:
+    """Return per-channel scales satisfying sx * sw / sy ~= 2**-shift.
+
+    Scales are rounded one float32 ULP toward zero when necessary. This keeps
+    the normalized multiplier on the safe side of AFE's power-of-two boundary,
+    preventing a value infinitesimally above the boundary from selecting the
+    next shift and a 0.5 correction factor.
+    """
+    if weight.ndim < 1:
+        raise RuntimeError("Shift-aware weight tensors must have an output-channel dimension")
+
+    sx = float(input_scale.reshape(-1)[0].detach().cpu())
+    sy = float(output_scale.reshape(-1)[0].detach().cpu())
+    if sx <= 0.0 or sy <= 0.0:
+        raise RuntimeError(f"Observed activation scales must be positive, found input={sx}, output={sy}")
+
+    reduce_dims = tuple(range(1, weight.ndim))
+    max_abs = weight.detach().abs().amax(dim=reduce_dims).to(torch.float64).cpu()
+    required_scale = torch.clamp(max_abs / 127.0, min=torch.finfo(torch.float32).tiny)
+    minimum_ratio = (sx / sy) * required_scale
+    unclamped_shift = torch.floor(-torch.log2(minimum_ratio))
+    shifts = unclamped_shift.clamp(_MIN_REQUANT_SHIFT, _MAX_REQUANT_SHIFT).to(torch.int32)
+
+    target_ratio = torch.pow(torch.tensor(2.0, dtype=torch.float64), -shifts.to(torch.float64))
+    scales = ((sy / sx) * target_ratio).to(torch.float32)
+
+    # Work with the exact float32 values AFE will ingest. One or two ULP steps
+    # are normally sufficient. Always start one ULP below the exact boundary so
+    # alternate float32 multiplication order cannot move it to the unsafe side.
+    zero = torch.zeros_like(scales)
+    scales = torch.nextafter(scales, zero)
+    for _ in range(4):
+        imported_ratio = (float(torch.tensor(sx, dtype=torch.float32)) * scales.to(torch.float64)
+                          / float(torch.tensor(sy, dtype=torch.float32)))
+        too_high = imported_ratio > target_ratio
+        if not bool(too_high.any()):
+            break
+        scales = torch.where(too_high, torch.nextafter(scales, zero), scales)
+    imported_ratio = (float(torch.tensor(sx, dtype=torch.float32)) * scales.to(torch.float64)
+                      / float(torch.tensor(sy, dtype=torch.float32)))
+    if bool((imported_ratio > target_ratio).any()):
+        raise RuntimeError("Unable to represent shift-aware weight scale safely in float32")
+
+    return scales.to(weight.device)
+
+
+def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
+    """Freeze QAT observers and lock SiMa-compatible power-of-two weight scales.
+
+    Call this after observer warm-up, then continue fine-tuning with fake quantization
+    enabled. For a model prepared with ``shift_aware=False``, this only freezes the
+    existing activation observers and therefore retains the legacy behavior.
+    """
+    if not isinstance(qat_model, GraphModule):
+        raise RuntimeError(f"Input graph to freeze function must be a GraphModule, found {type(qat_model)}")
+    if bool(getattr(qat_model, "qat_frozen", torch.tensor([0])).item()):
+        return qat_model
+
+    shift_aware = bool(getattr(qat_model, "shift_aware_qat", torch.tensor([0])).item())
+    locked_scales = []
+    skipped = []
+    if shift_aware:
+        for node in qat_model.graph.nodes:
+            if node.op != "call_function" or node.target not in _SHIFT_AWARE_OPS:
+                continue
+            if len(node.args) < 2:
+                skipped.append(node.name)
+                continue
+
+            input_fq = _fake_quant_module(qat_model, node.args[0])
+            weight_fq = _fake_quant_module(qat_model, node.args[1])
+            output_fq = _find_output_fake_quant(qat_model, node)
+            weight_node = node.args[1].args[0] if getattr(node.args[1], "args", ()) else None
+            if (
+                input_fq is None
+                or weight_fq is None
+                or output_fq is None
+                or getattr(weight_node, "op", None) != "get_attr"
+                or weight_fq.qscheme not in (torch.per_channel_affine, torch.per_channel_symmetric)
+            ):
+                skipped.append(node.name)
+                continue
+
+            weight = _resolve_attr(qat_model, weight_node.target)
+            scales = _safe_power_of_two_weight_scale(
+                input_fq.scale,
+                output_fq.scale,
+                weight,
+            )
+            locked_scales.append((weight_fq, scales))
+
+        if skipped:
+            raise RuntimeError(
+                "Shift-aware QAT could not determine complete input/weight/output quantization "
+                f"parameters for {len(skipped)} op(s): {', '.join(skipped)}"
+            )
+
+    # Do not mutate observer state until every shift-aware layer has validated.
+    qat_model.apply(disable_observer)
+    for weight_fq, scales in locked_scales:
+        weight_fq.scale.resize_(scales.shape).copy_(scales)
+        # Keep the symmetric zero point explicit and correctly sized.
+        weight_fq.zero_point.resize_(scales.shape).zero_()
+        # Keep observer state consistent with the locked qparams as well. This
+        # makes checkpoints self-describing and avoids restoring an old scale
+        # if observers are explicitly re-enabled by a training framework.
+        weight_observer = weight_fq.activation_post_process
+        locked_range = scales * 127.0
+        weight_observer.min_val.resize_(scales.shape).copy_(-locked_range)
+        weight_observer.max_val.resize_(scales.shape).copy_(locked_range)
+
+    qat_model.qat_frozen.fill_(1)
+    return qat_model
 
 
 def _ensure_bn_tracking_meta(gm: GraphModule) -> None:
@@ -154,10 +337,18 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
     
     if not isinstance(qat_model, GraphModule):
         return qat_model
+    shift_aware = bool(getattr(qat_model, "shift_aware_qat", torch.tensor([0])).item())
+    if shift_aware and not bool(getattr(qat_model, "qat_frozen", torch.tensor([0])).item()):
+        warnings.warn(
+            "Finalizing a shift-aware model before sima_freeze_qat(); scales will be locked now. "
+            "For best accuracy, freeze earlier and fine-tune with the locked scales.",
+            stacklevel=2,
+        )
+        sima_freeze_qat(qat_model)
     print(f"Removing QAT scaffold and quantizing network ...")
     _ensure_bn_tracking_meta(qat_model)
     m = convert_pt2e(qat_model, use_reference_representation=False)
-    sima_mod = SimaQatWrapper(source=m, label='fq')
+    sima_mod = SimaQatWrapper(source=m, label='fq', shift_aware=shift_aware)
     # We must call eval() to invoke internal functions to put the GraphModule in eval state. Once we are
     # in FQ mode, we always remain in eval mode.
     sima_mod.eval()
@@ -207,7 +398,7 @@ class SimaQatWrapper(GraphModule):
         'fq': 1,
     }
 
-    def __init__(self, source: GraphModule, label: str):
+    def __init__(self, source: GraphModule, label: str, shift_aware: bool = True):
         """This constructor creates a wrapper from a GraphModule. We can only create this object
         from an existing GraphModule class. Every time we create a wrapper, we also need to
         specify which phase of QAT we are representing, since each phase has different 
@@ -217,6 +408,7 @@ class SimaQatWrapper(GraphModule):
             source: A `GraphModule` produced by Pytorch call to some PT2E initialization. Must be
                 a compiled FX graph.
             label: One of the legal enumerated labels matching the phase of the QAT process.
+            shift_aware: whether this model uses SiMa power-of-two-aware weight quantization.
         """
         if not isinstance(source, GraphModule):
             raise RuntimeError(f"Sima supports only compiled graphs, found {type(source)}")
@@ -234,6 +426,8 @@ class SimaQatWrapper(GraphModule):
         # set whenever the Sima QAT API is invoked incrementally.
         state_id = self._tag_to_id[label]
         self.register_buffer("qat_state", torch.tensor([state_id], dtype=torch.int8))
+        self.register_buffer("shift_aware_qat", torch.tensor([shift_aware], dtype=torch.bool))
+        self.register_buffer("qat_frozen", torch.tensor([label == 'fq'], dtype=torch.bool))
 
     def train(self, use_train: bool = True) -> 'SimaQatWrapper':
         """This function emulates the behavior of train() on nn.Module.
@@ -290,13 +484,37 @@ class SimaQatWrapper(GraphModule):
         """
         if 'qat_state' not in state_dict:
             raise RuntimeError("Error: state_dict does not represent a QAT model")
-        
+
         state_id = self._tag_to_id[self.meta['qat_state']]
+        checkpoint_state_id = int(torch.as_tensor(state_dict['qat_state']).reshape(-1)[0].item())
+        if checkpoint_state_id != state_id:
+            raise RuntimeError(
+                f"Error: model QAT state {state_id} doesn't match checkpoint QAT state {checkpoint_state_id}"
+            )
 
-        if state_dict['qat_state'] != state_id:
-            raise RuntimeError(f"Error: model QAT state {state_id} doesn't match state_dict QAT state {state_dict['qat_state']}")
+        model_shift_aware = bool(self.shift_aware_qat.item())
+        checkpoint_mode = state_dict.get('shift_aware_qat')
+        if checkpoint_mode is None:
+            if model_shift_aware:
+                raise RuntimeError(
+                    "This checkpoint predates shift-aware QAT. Prepare the model with "
+                    "shift_aware=False before loading it."
+                )
+        else:
+            checkpoint_shift_aware = bool(torch.as_tensor(checkpoint_mode).reshape(-1)[0].item())
+            if checkpoint_shift_aware != model_shift_aware:
+                raise RuntimeError(
+                    "Checkpoint shift-aware mode does not match the prepared model: "
+                    f"checkpoint={checkpoint_shift_aware}, model={model_shift_aware}"
+                )
 
-        return super().load_state_dict(state_dict, strict, assign)
+        compatible_state = OrderedDict(state_dict)
+        if hasattr(state_dict, '_metadata'):
+            compatible_state._metadata = state_dict._metadata
+        compatible_state.setdefault('shift_aware_qat', self.shift_aware_qat.detach().clone())
+        compatible_state.setdefault('qat_frozen', torch.zeros_like(self.qat_frozen))
+
+        return super().load_state_dict(compatible_state, strict, assign)
 
 
 def check_graph_nodes(prepared_mod : GraphModule, device: torch.device) -> GraphModule:
@@ -338,4 +556,3 @@ def replace_batchnorm(m: GraphModule) -> GraphModule:
 
     torch.fx.replace_pattern(m, pattern, replacement)
     return m
-
