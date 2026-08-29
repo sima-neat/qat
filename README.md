@@ -35,12 +35,13 @@ source .venv/bin/activate
 
 ## Usage
 
-The API has three steps: **prepare → (train) → finalize → export**.
+The recommended workflow is **prepare → warm up → freeze → fine-tune → finalize → export**.
 
 ```python
 import torch
 from sima_qat.qat_api import (
     sima_prepare_qat_model,
+    sima_freeze_qat,
     sima_finalize_qat_model,
     sima_export_onnx,
 )
@@ -48,21 +49,40 @@ from sima_qat.qat_api import (
 model = ...                                  # any torch.nn.Module
 example_inputs = (torch.randn(1, 3, 224, 224),)
 
-# 1. Insert fake-quant scaffolding (returns an FX GraphModule ready for QAT training)
+# 1. Insert fake-quant scaffolding. Shift-aware QAT is enabled by default.
 qat_model = sima_prepare_qat_model(model, example_inputs, device='cuda')
 
-# 2. Fine-tune `qat_model` with your normal training loop ...
+# 2. Warm up observers with your normal training loop ...
 
-# 3. Convert to inference-only (fake-quant / INT8) form
+# 3. Lock AFE-compatible power-of-two scales, then fine-tune for a few more epochs.
+sima_freeze_qat(qat_model)
+# ... continue training qat_model ...
+
+# 4. Convert to inference-only (fake-quant / INT8) form
 qat_model = sima_finalize_qat_model(qat_model)
 
-# 4. Export to an INT8 Q/DQ ONNX graph
+# 5. Export to an INT8 Q/DQ ONNX graph
 sima_export_onnx(qat_model, example_inputs, 'model.onnx', device='cuda')
+```
+
+Shift-aware QAT constrains each convolution or linear weight scale so that AFE can use its native
+integer shift requantization without rescaling the learned INT8 weight codes. Calling
+`sima_freeze_qat` explicitly leaves time to fine-tune against those locked scales. Finalization will
+lock them automatically if necessary, but fine-tuning after the explicit call generally gives better
+accuracy.
+
+To reproduce the observer-only weight behavior from earlier releases, opt out during preparation:
+
+```python
+qat_model = sima_prepare_qat_model(
+    model, example_inputs, device='cuda', shift_aware=False
+)
 ```
 
 | function | purpose |
 |---|---|
-| `sima_prepare_qat_model(model, inputs, device)` | Capture the model to FX and insert SiMa fake-quant annotations for QAT. |
+| `sima_prepare_qat_model(model, inputs, device, shift_aware=True)` | Capture the model and insert SiMa fake-quant annotations. Power-of-two-aware weight QAT is the default; pass `False` for the legacy behavior. |
+| `sima_freeze_qat(qat_model)` | Freeze observers and lock AFE-compatible weight scales before final fine-tuning. |
 | `sima_finalize_qat_model(qat_model)` | Fold the trained scaffolding into an inference-only quantized graph. |
 | `sima_export_onnx(qat_model, inputs, output_file, ...)` | Export the finalized model to an ONNX QuantizeLinear/DequantizeLinear graph. |
 
