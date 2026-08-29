@@ -3,9 +3,8 @@
 #||   Unpublished Copyright (c) 2024 SiMa.ai, All Rights Reserved.       ||
 #**************************************************************************
 import onnxruntime
-import torch
 import pytest
-
+import torch
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
 from torch.ao.quantization.observer import PerChannelMinMaxObserver
 
@@ -126,6 +125,20 @@ def test_two_epoch_cpu_qat_locks_model_compiler_compatible_scales(tmp_path):
 
     assert checked == 2
 
+    # PyTorch's fake-quant kernel and ONNX Runtime's QuantizeLinear are both
+    # valid INT8 realizations, but CPU builds can resolve an exact half-way
+    # value to adjacent codes.  Capture the final activation quantum before
+    # stripping the scaffold so the parity check below permits that one-code
+    # ambiguity without hiding a larger export mismatch.
+    final_output_fake_quant = next(
+        _find_output_fake_quant(model, node)
+        for node in reversed(tuple(model.graph.nodes))
+        if node.op == "call_function"
+        and node.target in _SHIFT_AWARE_OPS
+        and _find_output_fake_quant(model, node) is not None
+    )
+    final_output_scale = float(final_output_fake_quant.scale.detach().abs().max())
+
     finalized = sima_finalize_qat_model(model)
     finalized_state = finalized.state_dict()
     assert "shift_aware_qat" not in finalized_state
@@ -137,7 +150,12 @@ def test_two_epoch_cpu_qat_locks_model_compiler_compatible_scales(tmp_path):
         pytorch_output = finalized(inputs[:2]).cpu()
     session = onnxruntime.InferenceSession(str(output_path), providers=["CPUExecutionProvider"])
     onnx_output = session.run(None, {session.get_inputs()[0].name: inputs[:2].numpy()})[0]
-    torch.testing.assert_close(torch.from_numpy(onnx_output), pytorch_output, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(
+        torch.from_numpy(onnx_output),
+        pytorch_output,
+        rtol=0,
+        atol=final_output_scale * (1 + 1e-5),
+    )
 
 
 @pytest.mark.regression
