@@ -35,8 +35,8 @@ source .venv/bin/activate
 
 ## Usage
 
-The recommended customer workflow is **prepare → calibrate → ordinary PyTorch
-training → freeze → validate → export**. The returned object is a normal
+The recommended customer workflow is **prepare → calibrate → freeze target
+grids → ordinary PyTorch training → validate → export**. The returned object is a normal
 `torch.nn.Module`, so it works with standard optimizers and training loops.
 
 ```python
@@ -53,20 +53,37 @@ qat = sima_qat.prepare(
     device="cuda",
 )
 
-qat.calibrate(calibration_loader, batches=64)
+# Uses the qualified recipe minimum. The state-space recipe consumes at least
+# 128 representative batches and checks power-of-two shift-tier stability.
+qat.calibrate(calibration_loader)
+qat.calibration_report.raise_for_failure()
+
+# Lock the exact power-of-two target grids before the first optimizer update.
+# QAT performed only before this call trains a different numerical function.
+qat.freeze()
 
 optimizer = torch.optim.AdamW(qat.parameters(), lr=1e-5)
-for images, labels in train_loader:
+total_steps = len(train_loader)
+for step, (images, labels) in enumerate(train_loader):
     optimizer.zero_grad()
+    quant_strength = qat.curriculum(
+        step,
+        total_steps,
+        # Optional for difficult recurrent graphs: elementwise QDrop is
+        # training-only and decays to strict Q/DQ before validation/export.
+        dropout_probability=0.5,
+        dropout_decay_fraction=0.75,
+    )
     prediction = qat(images)
     task_loss = criterion(prediction, labels)
 
-    # Adds the recipe's frozen-FP32 preservation loss.
-    loss = qat.loss(task_loss)
+    # feature_loss= is optional and may match any model-specific intermediate
+    # teacher/student features. FP32 output preservation is always included.
+    optional_feature_loss = None
+    loss = qat.loss(task_loss, feature_loss=optional_feature_loss)
     loss.backward()
     optimizer.step()
 
-qat.freeze()
 report = qat.validate(validation_loader, evaluator=evaluate_task)
 report.raise_for_failure()
 
@@ -137,9 +154,10 @@ qat_model = sima_prepare_qat_model(
 | function | purpose |
 |---|---|
 | `sima_qat.prepare(model, inputs, target="modalix", recipe="auto")` | Return the recommended lifecycle-managed QAT `nn.Module`. |
-| `qat.calibrate(data, batches=64)` | Collect activation ranges without applying fake quantization. |
-| `qat.loss(task_loss)` | Add scale-normalized frozen-FP32 preservation. |
-| `qat.freeze()` / `qat.validate()` / `qat.export(directory)` | Lock target grids, enforce structural gates, and create a content-bound ONNX bundle. |
+| `qat.calibrate(data, batches=None)` | Collect activation ranges without fake quantization. Omitted `batches` uses the recipe's qualified minimum; calibration records ordered sample IDs and shift-tier stability. |
+| `qat.curriculum(step, total_steps, dropout_probability=None, dropout_decay_fraction=None)` | Progressively introduce activation rounding and optionally decay training-only QDrop to zero. Weights and frozen target grids remain strict. |
+| `qat.loss(task_loss, feature_loss=None)` | Add optional intermediate-feature preservation and scale-normalized frozen-FP32 output preservation. |
+| `qat.freeze()` / `qat.validate()` / `qat.export(directory)` | Lock target grids before training, enforce structural gates, and create a content-bound ONNX bundle. |
 | `sima_prepare_qat_model(model, inputs, device, shift_aware=True)` | Capture the model and insert SiMa fake-quant annotations. Power-of-two-aware weight QAT is the default; pass `False` for the legacy behavior. |
 | `sima_freeze_qat(qat_model)` | Freeze observers and lock AFE-compatible weight scales before final fine-tuning. |
 | `sima_finalize_qat_model(qat_model)` | Fold the trained scaffolding into an inference-only quantized graph. |

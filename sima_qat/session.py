@@ -66,7 +66,14 @@ class QATRecipe:
     full_range_ste: bool = False
     learn_scales: bool = False
     shadow_weight: float = 0.1
+    feature_weight: float = 0.1
+    activation_ramp_fraction: float = 0.0
+    activation_dropout_probability: float = 0.0
+    activation_dropout_decay_fraction: float = 1.0
     strict_int8: bool = True
+    minimum_calibration_batches: int = 1
+    calibration_window_batches: int = 0
+    require_shift_tier_stability: bool = False
 
     def __post_init__(self) -> None:
         if self.activation_observer not in {"moving_average", "minmax", "histogram"}:
@@ -78,20 +85,64 @@ class QATRecipe:
             raise ValueError("learn_scales requires full_range_ste=True")
         if not math.isfinite(self.shadow_weight) or self.shadow_weight < 0:
             raise ValueError("shadow_weight must be a finite non-negative value")
+        if not math.isfinite(self.feature_weight) or self.feature_weight < 0:
+            raise ValueError("feature_weight must be a finite non-negative value")
+        if (
+            not math.isfinite(self.activation_ramp_fraction)
+            or not 0 <= self.activation_ramp_fraction <= 1
+        ):
+            raise ValueError("activation_ramp_fraction must be in [0, 1]")
+        if (
+            not math.isfinite(self.activation_dropout_probability)
+            or not 0 <= self.activation_dropout_probability <= 1
+        ):
+            raise ValueError("activation_dropout_probability must be in [0, 1]")
+        if (
+            not math.isfinite(self.activation_dropout_decay_fraction)
+            or not 0 < self.activation_dropout_decay_fraction <= 1
+        ):
+            raise ValueError(
+                "activation_dropout_decay_fraction must be in (0, 1]"
+            )
         if not self.strict_int8:
             raise ValueError(
                 "The SiMa customer QAT session currently supports strict INT8 only"
             )
+        if self.minimum_calibration_batches < 1:
+            raise ValueError("minimum_calibration_batches must be positive")
+        if self.calibration_window_batches < 0:
+            raise ValueError("calibration_window_batches cannot be negative")
+        if (
+            self.require_shift_tier_stability
+            and self.calibration_window_batches < 1
+        ):
+            raise ValueError(
+                "require_shift_tier_stability needs calibration_window_batches > 0"
+            )
 
 
 _BUILTIN_RECIPES: dict[str, QATRecipe] = {
-    "strict_int8": QATRecipe(name="strict_int8"),
+    "strict_int8": QATRecipe(
+        name="strict_int8",
+        minimum_calibration_batches=64,
+        calibration_window_batches=32,
+        require_shift_tier_stability=True,
+    ),
     "strict_int8_ssm": QATRecipe(
         name="strict_int8_ssm",
         activation_observer="minmax",
         full_range_ste=True,
         learn_scales=False,
         shadow_weight=0.1,
+        feature_weight=0.1,
+        activation_ramp_fraction=0.25,
+        # Recurrent state-space ranges contain rare, legitimate outliers. The
+        # qualified DepthART flow needs at least 128 deployment-shaped samples;
+        # 64 samples can both clip late SS2D states and cross a power-of-two
+        # output-grid tier at the first encoder Conv.
+        minimum_calibration_batches=128,
+        calibration_window_batches=32,
+        require_shift_tier_stability=True,
     ),
 }
 
@@ -178,6 +229,32 @@ class QATReport:
         ]
         lines.extend(f"Issue: {issue}" for issue in self.issues)
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class QATCalibrationReport:
+    """Calibration sufficiency and target-grid stability evidence."""
+
+    passed: bool
+    observed_batches: int
+    required_batches: int
+    window_batches: int
+    windows: tuple[Mapping[str, Any], ...]
+    shift_tier_changes_in_last_window: int
+    sample_ids: tuple[str, ...]
+    ordered_sample_ids_sha256: str | None
+    issues: tuple[str, ...] = ()
+
+    def raise_for_failure(self) -> QATCalibrationReport:
+        if not self.passed:
+            raise RuntimeError(
+                "SiMa QAT calibration is not sufficient: "
+                + "; ".join(self.issues)
+            )
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -307,6 +384,9 @@ class QATSession(nn.Module):
         self.state_space_regions = state_space_regions
         self.state = "prepared"
         self.calibration_batches = 0
+        self.calibration_report: QATCalibrationReport | None = None
+        self._calibration_snapshots: list[dict[str, Any]] = []
+        self._calibration_sample_ids: list[str] = []
         self._last_forward: tuple[Any, Any] | None = None
         self._last_loss_terms: dict[str, float] = {}
         weighted, covered, issues = _weighted_op_coverage(model)
@@ -390,12 +470,20 @@ class QATSession(nn.Module):
             self._last_forward = None
         return quantized_output
 
-    def loss(self, task_loss: Tensor, shadow_weight: float | None = None) -> Tensor:
-        """Add scale-normalized FP32-shadow preservation to a task loss.
+    def loss(
+        self,
+        task_loss: Tensor,
+        shadow_weight: float | None = None,
+        *,
+        feature_loss: Tensor | None = None,
+        feature_weight: float | None = None,
+    ) -> Tensor:
+        """Add optional feature and scale-normalized FP32-shadow preservation.
 
         Call this immediately after the forward that produced ``task_loss``.
-        The default coefficient comes from the selected recipe.  Passing zero
-        returns the task loss unchanged.
+        Coefficients default to the selected recipe. ``feature_loss`` is a
+        model-defined scalar over matched teacher/student intermediates; the
+        lifecycle API deliberately does not prescribe a feature topology.
         """
 
         if not isinstance(task_loss, Tensor) or task_loss.numel() != 1:
@@ -405,9 +493,27 @@ class QATSession(nn.Module):
         )
         if not math.isfinite(weight) or weight < 0:
             raise ValueError("shadow_weight must be a finite non-negative value")
+        selected_feature_weight = (
+            self.recipe.feature_weight
+            if feature_weight is None
+            else float(feature_weight)
+        )
+        if not math.isfinite(selected_feature_weight) or selected_feature_weight < 0:
+            raise ValueError("feature_weight must be a finite non-negative value")
+        if feature_loss is not None and (
+            not isinstance(feature_loss, Tensor) or feature_loss.numel() != 1
+        ):
+            raise TypeError("feature_loss must be a scalar torch.Tensor")
+        feature_term = (
+            task_loss.new_zeros(()) if feature_loss is None else feature_loss
+        )
         if weight == 0:
-            self._last_loss_terms = {"task": float(task_loss.detach()), "shadow": 0.0}
-            return task_loss
+            self._last_loss_terms = {
+                "task": float(task_loss.detach()),
+                "feature": float(feature_term.detach()),
+                "shadow": 0.0,
+            }
+            return task_loss + selected_feature_weight * feature_term
         if self._last_forward is None:
             raise RuntimeError(
                 "qat.loss() must immediately follow a training-mode qat(...) forward"
@@ -426,23 +532,109 @@ class QATSession(nn.Module):
         consistency = torch.stack(consistency_terms).mean()
         self._last_loss_terms = {
             "task": float(task_loss.detach()),
+            "feature": float(feature_term.detach()),
             "shadow": float(consistency.detach()),
         }
         self._last_forward = None
-        return task_loss + weight * consistency
+        return (
+            task_loss
+            + selected_feature_weight * feature_term
+            + weight * consistency
+        )
+
+    def curriculum(
+        self,
+        step: int,
+        total_steps: int,
+        ramp_fraction: float | None = None,
+        *,
+        dropout_probability: float | None = None,
+        dropout_decay_fraction: float | None = None,
+    ) -> float:
+        """Set progressive activation-quantization strength for this update.
+
+        ``step`` is zero based. Weight fake quantization and the frozen target
+        grids remain strict throughout. Activation rounding can be blended in
+        during the initial ramp and QDrop-style activation bypass can decay to
+        zero. The returned strength is useful for logging. ``recipe="auto"``
+        uses a 25% ramp for state-space models and no dropout by default.
+        """
+
+        if self.state != "frozen":
+            raise RuntimeError("qat.curriculum() requires qat.freeze() first")
+        if not isinstance(step, int) or step < 0:
+            raise ValueError("step must be a non-negative integer")
+        if not isinstance(total_steps, int) or total_steps < 1:
+            raise ValueError("total_steps must be a positive integer")
+        fraction = (
+            self.recipe.activation_ramp_fraction
+            if ramp_fraction is None
+            else float(ramp_fraction)
+        )
+        if not math.isfinite(fraction) or not 0 <= fraction <= 1:
+            raise ValueError("ramp_fraction must be in [0, 1]")
+        ramp_steps = math.ceil(total_steps * fraction)
+        strength = (
+            1.0 if ramp_steps == 0 else min(1.0, (step + 1) / ramp_steps)
+        )
+        initial_dropout = (
+            self.recipe.activation_dropout_probability
+            if dropout_probability is None
+            else float(dropout_probability)
+        )
+        decay_fraction = (
+            self.recipe.activation_dropout_decay_fraction
+            if dropout_decay_fraction is None
+            else float(dropout_decay_fraction)
+        )
+        if not math.isfinite(initial_dropout) or not 0 <= initial_dropout <= 1:
+            raise ValueError("dropout_probability must be in [0, 1]")
+        if not math.isfinite(decay_fraction) or not 0 < decay_fraction <= 1:
+            raise ValueError("dropout_decay_fraction must be in (0, 1]")
+        decay_steps = max(1, math.ceil(total_steps * decay_fraction))
+        dropout = initial_dropout * max(0.0, 1.0 - (step + 1) / decay_steps)
+        changed = 0
+        for module in self.model.modules():
+            if not isinstance(module, FakeQuantizeBase):
+                continue
+            if module.qscheme in (
+                torch.per_channel_affine,
+                torch.per_channel_symmetric,
+            ):
+                continue
+            setter = getattr(module, "set_quant_strength", None)
+            if setter is not None:
+                setter(strength)
+                module.set_quantization_dropout_probability(dropout)
+                changed += 1
+        if fraction and not changed:
+            raise RuntimeError(
+                "The selected QAT fake quantizer does not support an activation ramp"
+            )
+        return strength
 
     def calibrate(
         self,
         data: Iterable[Any],
-        batches: int = 64,
+        batches: int | None = None,
         input_adapter: InputAdapter | None = None,
     ) -> QATSession:
-        """Collect activation ranges without fake-quantizing calibration data."""
+        """Collect ranges and verify that target power-of-two tiers are stable.
 
-        if self.state != "prepared":
+        When ``batches`` is omitted, the selected recipe's qualified minimum is
+        used (128 for automatically detected state-space models). Explicitly
+        requesting fewer samples is recorded but cannot pass ``qat.freeze()``.
+        Calibration can be extended by calling this method again with more
+        representative data.
+        """
+
+        if self.state not in {"prepared", "calibrated"}:
             raise RuntimeError(
-                f"Calibration requires a prepared session, found state={self.state!r}"
+                "Calibration requires a prepared or calibrated session, "
+                f"found state={self.state!r}"
             )
+        if batches is None:
+            batches = self.recipe.minimum_calibration_batches
         if batches <= 0:
             raise ValueError("batches must be positive")
 
@@ -455,21 +647,149 @@ class QATSession(nn.Module):
             device = _get_module_device(self.model)
             with torch.no_grad():
                 for batch in data:
+                    self._calibration_sample_ids.extend(
+                        _sample_ids_from_batch(batch)
+                    )
                     args, kwargs = self._calibration_call(batch, input_adapter)
                     args = _move_value_to_device(args, device)
                     kwargs = _move_value_to_device(kwargs, device)
                     self.model(*args, **kwargs)
                     observed += 1
+                    total = self.calibration_batches + observed
+                    window = self.recipe.calibration_window_batches
+                    if window and total % window == 0:
+                        self._calibration_snapshots.append(
+                            _calibration_snapshot(self.model, total)
+                        )
                     if observed >= batches:
                         break
         finally:
             self.model.apply(enable_fake_quant)
+            # Deployment calibration owns activation ranges. Batch-1 QAT
+            # must not replace representative global extrema with the current
+            # training sample. Weight observers remain live so their
+            # per-channel grids follow optimizer updates until qat.freeze().
+            for module in self.model.modules():
+                if not isinstance(module, FakeQuantizeBase):
+                    continue
+                if module.qscheme in (
+                    torch.per_channel_affine,
+                    torch.per_channel_symmetric,
+                ):
+                    enable_observer(module)
+                else:
+                    # Calibration deliberately ran with fake quantization
+                    # disabled, so FakeQuantize.forward did not copy the final
+                    # observer qparams into its live buffers. Synchronize them
+                    # once here. This is essential for optional LSQ range
+                    # tuning: log_scale must start at the calibrated grid, not
+                    # at FakeQuantize's construction default of one.
+                    scale, zero_point = (
+                        module.activation_post_process.calculate_qparams()
+                    )
+                    scale = scale.to(
+                        device=module.scale.device, dtype=module.scale.dtype
+                    )
+                    zero_point = zero_point.to(
+                        device=module.zero_point.device,
+                        dtype=module.zero_point.dtype,
+                    )
+                    module.scale.resize_(scale.shape).copy_(scale)
+                    module.zero_point.resize_(zero_point.shape).copy_(zero_point)
+                    initialize = getattr(module, "initialize_learned_scale", None)
+                    if initialize is not None:
+                        initialize()
+                    torch.ao.quantization.disable_observer(module)
             self.train(was_training)
         if observed == 0:
             raise RuntimeError("Calibration data produced zero batches")
         self.calibration_batches += observed
+        window = self.recipe.calibration_window_batches
+        if (
+            window
+            and (
+                not self._calibration_snapshots
+                or self._calibration_snapshots[-1]["batch"]
+                != self.calibration_batches
+            )
+        ):
+            self._calibration_snapshots.append(
+                _calibration_snapshot(self.model, self.calibration_batches)
+            )
+        self.calibration_report = self._build_calibration_report()
         self.state = "calibrated"
         return self
+
+    def _build_calibration_report(self) -> QATCalibrationReport:
+        windows = []
+        for previous, current in zip(
+            self._calibration_snapshots, self._calibration_snapshots[1:]
+        ):
+            ratios = []
+            for name, scale in previous["activation_scales"].items():
+                current_scale = current["activation_scales"].get(name)
+                if scale > 0 and current_scale is not None and current_scale > 0:
+                    ratios.append(max(current_scale / scale, scale / current_scale))
+            previous_tiers = previous["shift_tiers"]
+            current_tiers = current["shift_tiers"]
+            tier_changes = [
+                name
+                for name, tier in previous_tiers.items()
+                if current_tiers.get(name) != tier
+            ]
+            ratios.sort()
+            p99_index = max(0, math.ceil(0.99 * len(ratios)) - 1)
+            windows.append(
+                {
+                    "from_batch": previous["batch"],
+                    "to_batch": current["batch"],
+                    "maximum_scale_ratio": max(ratios, default=1.0),
+                    "p99_scale_ratio": ratios[p99_index] if ratios else 1.0,
+                    "scale_ratio_over_1_25_fraction": (
+                        sum(ratio > 1.25 for ratio in ratios) / len(ratios)
+                        if ratios else 0.0
+                    ),
+                    "shift_tier_changes": len(tier_changes),
+                    "shift_tier_changed_operators": tier_changes,
+                }
+            )
+
+        issues = []
+        if self.calibration_batches < self.recipe.minimum_calibration_batches:
+            issues.append(
+                f"observed {self.calibration_batches} calibration batch(es), but "
+                f"recipe {self.recipe.name!r} requires at least "
+                f"{self.recipe.minimum_calibration_batches}"
+            )
+        last_tier_changes = windows[-1]["shift_tier_changes"] if windows else 0
+        if self.recipe.require_shift_tier_stability:
+            if len(self._calibration_snapshots) < 2:
+                issues.append(
+                    "power-of-two shift stability needs at least two calibration windows"
+                )
+            elif last_tier_changes:
+                issues.append(
+                    f"{last_tier_changes} weighted operator shift tier(s) changed "
+                    "in the last calibration window"
+                )
+
+        sample_ids = tuple(self._calibration_sample_ids)
+        sample_digest = None
+        if sample_ids:
+            sample_digest = hashlib.sha256(
+                json.dumps(sample_ids, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+        return QATCalibrationReport(
+            passed=not issues,
+            observed_batches=self.calibration_batches,
+            required_batches=self.recipe.minimum_calibration_batches,
+            window_batches=self.recipe.calibration_window_batches,
+            windows=tuple(windows),
+            shift_tier_changes_in_last_window=last_tier_changes,
+            sample_ids=sample_ids,
+            ordered_sample_ids_sha256=sample_digest,
+            issues=tuple(issues),
+        )
 
     def _calibration_call(
         self,
@@ -516,6 +836,11 @@ class QATSession(nn.Module):
             return self
         if self.state not in {"prepared", "calibrated"}:
             raise RuntimeError(f"Cannot freeze a QAT session in state={self.state!r}")
+        if self.calibration_report is None:
+            raise RuntimeError(
+                "Cannot freeze without qualified calibration. Call qat.calibrate(...) first."
+            )
+        self.calibration_report.raise_for_failure()
         uninitialized = _uninitialized_activation_observers(self.model)
         if uninitialized:
             raise RuntimeError(
@@ -565,6 +890,35 @@ class QATSession(nn.Module):
         issues = list(coverage_issues)
         if self.state not in self._EXPORTABLE_STATES:
             issues.append("QAT grids are not frozen")
+        if self.state not in {"finalized", "exported"}:
+            non_strict_strengths = [
+                float(module.quant_strength)
+                for module in self.model.modules()
+                if isinstance(module, FakeQuantizeBase)
+                and module.qscheme
+                not in (torch.per_channel_affine, torch.per_channel_symmetric)
+                and hasattr(module, "quant_strength")
+                and float(module.quant_strength) != 1.0
+            ]
+            if non_strict_strengths:
+                issues.append(
+                    f"{len(non_strict_strengths)} activation fake quantizer(s) "
+                    "are below strict strength 1.0"
+                )
+            nonzero_dropouts = [
+                float(module.quantization_dropout_probability)
+                for module in self.model.modules()
+                if isinstance(module, FakeQuantizeBase)
+                and module.qscheme
+                not in (torch.per_channel_affine, torch.per_channel_symmetric)
+                and hasattr(module, "quantization_dropout_probability")
+                and float(module.quantization_dropout_probability) != 0.0
+            ]
+            if nonzero_dropouts:
+                issues.append(
+                    f"{len(nonzero_dropouts)} activation fake quantizer(s) "
+                    "still have training-only quantization dropout enabled"
+                )
         if weighted == 0:
             issues.append("prepared graph contains no supported weighted operators")
 
@@ -619,6 +973,11 @@ class QATSession(nn.Module):
             ),
             "weight constraints: Model Compiler power-of-two requantization is locked by qat.freeze()",
             f"fp32 preservation: qat.loss() shadow_weight={self.recipe.shadow_weight}",
+            (
+                "calibration: at least "
+                f"{self.recipe.minimum_calibration_batches} representative batch(es), "
+                f"checked every {self.recipe.calibration_window_batches or 'disabled'} batch(es)"
+            ),
         ]
         if selected_regions:
             lines.append("state-space regions: " + ", ".join(selected_regions))
@@ -671,6 +1030,10 @@ class QATSession(nn.Module):
             "precision": "W8A8",
             "strict_int8_requested": self.recipe.strict_int8,
             "recipe": asdict(self.recipe),
+            "calibration": (
+                self.calibration_report.to_dict()
+                if self.calibration_report is not None else None
+            ),
             "example_inputs": [
                 _tensor_descriptor(value) for value in self.example_inputs
             ],
@@ -711,6 +1074,89 @@ def _apply_to_tensors(value: Any, fn: Callable[[Tensor], Tensor]) -> Any:
     if isinstance(value, Mapping):
         return {key: _apply_to_tensors(item, fn) for key, item in value.items()}
     return value
+
+
+def _sample_ids_from_batch(batch: Any) -> list[str]:
+    """Extract ordered, non-executable sample identities when a loader has them."""
+
+    if not isinstance(batch, Mapping):
+        return []
+    value = None
+    for key in ("sample_id", "sample_ids", "id", "ids"):
+        if key in batch:
+            value = batch[key]
+            break
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Tensor):
+        return [str(item) for item in value.detach().cpu().reshape(-1).tolist()]
+    if isinstance(value, (tuple, list)):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _calibration_snapshot(model: nn.Module, batch: int) -> dict[str, Any]:
+    """Snapshot activation grids and the implied compiler right-shift tiers."""
+
+    activation_scales: dict[str, float] = {}
+    name_by_module_id: dict[int, str] = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, FakeQuantizeBase):
+            continue
+        if module.qscheme in (torch.per_channel_affine, torch.per_channel_symmetric):
+            continue
+        scale, _ = module.activation_post_process.calculate_qparams()
+        scalar = float(scale.detach().reshape(-1)[0].cpu())
+        if math.isfinite(scalar) and scalar > 0:
+            activation_scales[name] = scalar
+            name_by_module_id[id(module)] = name
+
+    shift_tiers: dict[str, int] = {}
+    if hasattr(model, "graph"):
+        for node in model.graph.nodes:
+            if node.op != "call_function" or node.target not in _SHIFT_AWARE_OPS:
+                continue
+            input_fq = _fake_quant_module(model, node.args[0])
+            weight_fq = _fake_quant_module(model, node.args[1])
+            output_fq = _find_output_fake_quant(model, node)
+            weight_node = (
+                node.args[1].args[0]
+                if len(node.args) > 1 and getattr(node.args[1], "args", ())
+                else None
+            )
+            try:
+                weight = _resolve_static_weight(model, weight_node)
+            except RuntimeError:
+                continue
+            input_name = name_by_module_id.get(id(input_fq))
+            output_name = name_by_module_id.get(id(output_fq))
+            if input_name is None or output_name is None or weight_fq is None:
+                continue
+            input_scale = activation_scales[input_name]
+            output_scale = activation_scales[output_name]
+            reduce_dims = tuple(range(1, weight.ndim))
+            minimum_weight_scale = float(
+                weight_fq.activation_post_process.eps.detach().reshape(-1).max().cpu()
+            )
+            required_scale = torch.clamp(
+                weight.detach().abs().amax(dim=reduce_dims).to(torch.float64).cpu()
+                / 127.0,
+                min=minimum_weight_scale,
+            )
+            maximum_ratio = float(
+                ((input_scale / output_scale) * required_scale).max()
+            )
+            shift_tiers[node.name] = (
+                max(0, math.ceil(math.log2(maximum_ratio)))
+                if maximum_ratio > 1.0 else 0
+            )
+    return {
+        "batch": batch,
+        "activation_scales": activation_scales,
+        "shift_tiers": shift_tiers,
+    }
 
 
 def _tensor_descriptor(value: Any) -> dict[str, Any]:
@@ -852,6 +1298,7 @@ def prepare(
 
 __all__ = [
     "QATBundle",
+    "QATCalibrationReport",
     "QATRecipe",
     "QATReport",
     "QATSession",

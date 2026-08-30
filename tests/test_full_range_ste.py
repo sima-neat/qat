@@ -87,6 +87,75 @@ def test_activation_quantization_strength_rejects_invalid_values(monkeypatch):
             raise AssertionError(f"accepted invalid strength {value}")
 
 
+def test_activation_quantization_dropout_is_training_only_and_nonpersistent():
+    fake_quant = FullRangeSTEFakeQuantize(
+        observer=MinMaxObserver,
+        quant_min=-128,
+        quant_max=127,
+        dtype=torch.int8,
+        qscheme=torch.per_tensor_affine,
+    )
+    value = torch.tensor([-1.3, -0.1, 0.2, 1.7], dtype=torch.float32)
+    fake_quant(value)
+    torch.ao.quantization.disable_observer(fake_quant)
+    strict = fake_quant(value)
+
+    fake_quant.set_quantization_dropout_probability(1.0)
+    fake_quant.train()
+    torch.testing.assert_close(fake_quant(value), value, rtol=0, atol=0)
+    fake_quant.eval()
+    torch.testing.assert_close(fake_quant(value), strict, rtol=0, atol=0)
+    assert "quantization_dropout_probability" not in fake_quant.state_dict()
+
+    for probability in (-0.01, 1.01):
+        try:
+            fake_quant.set_quantization_dropout_probability(probability)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted invalid probability {probability}")
+
+
+def test_activation_quantization_dropout_preserves_identity_input_gradient():
+    fake_quant = FullRangeSTEFakeQuantize(
+        observer=MinMaxObserver,
+        quant_min=-128,
+        quant_max=127,
+        dtype=torch.int8,
+        qscheme=torch.per_tensor_affine,
+    )
+    value = torch.tensor([-2.0, -0.1, 0.2, 3.0], requires_grad=True)
+    fake_quant(value.detach())
+    torch.ao.quantization.disable_observer(fake_quant)
+    fake_quant.set_quantization_dropout_probability(0.5)
+    torch.manual_seed(11)
+    fake_quant(value).sum().backward()
+    torch.testing.assert_close(value.grad, torch.ones_like(value))
+
+
+def test_learned_scale_gradient_tracks_quantization_strength():
+    fake_quant = FullRangeSTEFakeQuantize(
+        observer=MinMaxObserver,
+        quant_min=-128,
+        quant_max=127,
+        dtype=torch.int8,
+        qscheme=torch.per_tensor_affine,
+        learn_scale=True,
+    )
+    value = torch.tensor([-1.3, -0.1, 0.2, 1.7], dtype=torch.float32)
+    fake_quant(value)
+    torch.ao.quantization.disable_observer(fake_quant)
+
+    gradients = []
+    for strength in (1.0, 0.25):
+        fake_quant.log_scale.grad = None
+        fake_quant.set_quant_strength(strength)
+        fake_quant(value).sum().backward()
+        gradients.append(fake_quant.log_scale.grad.detach().clone())
+
+    torch.testing.assert_close(gradients[1], 0.25 * gradients[0])
+
+
 def test_target_code_noise_is_opt_in_and_stays_on_int8_grid(monkeypatch):
     monkeypatch.setenv("SIMA_QAT_LEARN_SCALES", "0")
     fake_quant = FullRangeSTEFakeQuantize(

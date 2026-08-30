@@ -27,11 +27,21 @@ sima-cli neat install qat/arm64
    default auto recipe detects recurrent/state-space modules. Use the low-level
    `sima_prepare_qat_model` only when a framework integration needs individual
    PT2E control points.
-3. Run `qat.calibrate(calibration_data, batches=N)` on representative data.
-4. Train normally and wrap each task loss with `qat.loss(task_loss)` to retain
-   the frozen FP32 teacher behavior.
-5. Call `qat.freeze()` to lock Model Compiler-compatible power-of-two weight
-   scales, then continue fine-tuning when the model recipe requires it.
+3. Run `qat.calibrate(calibration_data)` on representative, deterministically
+   ordered data. Omit `batches` to use the recipe-qualified minimum (128 for
+   state-space models), then require
+   `qat.calibration_report.raise_for_failure()`. Never replace a qualified
+   calibration prefix with an arbitrary random subset.
+4. Call `qat.freeze()` to lock Model Compiler-compatible power-of-two weight
+   scales before the first optimizer update. Training only on the pre-freeze
+   grids optimizes a different function and is not target-aware QAT.
+5. Train normally. Call `qat.curriculum(step, total_steps)` before the forward,
+   then wrap each task loss with
+   `qat.loss(task_loss, feature_loss=optional_feature_loss)` to retain matched
+   intermediate features and frozen-FP32 behavior. A frozen session remains
+   trainable. For a qualified difficult recurrent graph,
+   `dropout_probability=` enables training-only elementwise QDrop and
+   `dropout_decay_fraction=` must bring it to zero before strict validation.
 6. Run `qat.validate(...).raise_for_failure()`.
 7. Export with `qat.export(output_directory)`. The bundle contains `model.onnx`
    and a checksum-bound `qat_manifest.json`. CPU export is the default; use

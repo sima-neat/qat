@@ -176,13 +176,17 @@ class _LearnedScaleSTE(torch.autograd.Function):
         ).to(torch.float16)
         ctx.save_for_backward(scale_error)
         ctx.grad_factor = grad_factor
+        ctx.quant_strength = float(quant_strength)
         return value + float(quant_strength) * (dequantized - value)
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         (scale_error,) = ctx.saved_tensors
         grad_scale = (
-            grad_output.float() * scale_error.float() * ctx.grad_factor
+            grad_output.float()
+            * scale_error.float()
+            * ctx.grad_factor
+            * ctx.quant_strength
         ).sum().reshape(1)
         return grad_output, grad_scale, None, None, None, None, None
 
@@ -242,6 +246,11 @@ class FullRangeSTEFakeQuantize(FakeQuantize):
         # reloaded/exported checkpoint always executes the strict INT8
         # simulation unless its training session explicitly changes it.
         self.quant_strength = 1.0
+        # QDrop-style activation bypass is a training-only regularizer.  A
+        # probability of zero is the strict deployment behavior.  Keep this
+        # as ordinary (non-persistent) Python state so loading or exporting a
+        # checkpoint can never accidentally retain a relaxed forward.
+        self.quantization_dropout_probability = 0.0
         # Integer MLA kernels can differ from the float-QDQ reference by one
         # output code because accumulation and requantization happen in the
         # integer domain. QAT may explicitly inject that measured error as a
@@ -271,6 +280,50 @@ class FullRangeSTEFakeQuantize(FakeQuantize):
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"quantization strength must be in [0, 1], found {value}")
         self.quant_strength = value
+
+    def set_quantization_dropout_probability(self, value: float) -> None:
+        """Set the probability that an activation element bypasses Q/DQ.
+
+        Dropout is active only in training mode and only for per-tensor
+        activations.  The strict inference graph is unchanged.  In training,
+        for a Bernoulli keep mask ``m`` the forward is
+
+        ``x + m * (Q(x) - x)``.
+
+        Its input surrogate gradient is exactly one, while stochastic float
+        bypasses prevent every layer from fitting the same deterministic
+        activation-rounding error on every update.
+        """
+
+        value = float(value)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(
+                "quantization-dropout probability must be in [0, 1], "
+                f"found {value}"
+            )
+        self.quantization_dropout_probability = value
+
+    def _apply_quantization_dropout(
+        self,
+        value: torch.Tensor,
+        quantized: torch.Tensor,
+        *,
+        detach_residual: bool,
+    ) -> torch.Tensor:
+        probability = self.quantization_dropout_probability
+        if (
+            not self.training
+            or probability <= 0.0
+            or self.is_per_channel
+        ):
+            return quantized
+        if probability >= 1.0:
+            return value
+        keep = torch.rand_like(value) >= probability
+        residual = quantized - value
+        if detach_residual:
+            residual = residual.detach()
+        return value + keep.to(value.dtype) * residual
 
     def set_target_code_noise_probability(self, value: float) -> None:
         value = float(value)
@@ -346,7 +399,13 @@ class FullRangeSTEFakeQuantize(FakeQuantize):
                 self.quant_strength,
                 grad_factor,
             )
-            return self._apply_target_code_noise(quantized)
+            quantized = self._apply_target_code_noise(quantized)
+            # _LearnedScaleSTE already supplies the identity input gradient.
+            # Do not detach here: the mask must also gate the learned-scale
+            # gradient for the elements whose quantization was bypassed.
+            return self._apply_quantization_dropout(
+                x, quantized, detach_residual=False
+            )
         if self.is_per_channel:
             quantized = torch.fake_quantize_per_channel_affine(
                 x, self.scale, self.zero_point, self.ch_axis,
@@ -360,6 +419,9 @@ class FullRangeSTEFakeQuantize(FakeQuantize):
                 self.activation_post_process.quant_max,
             )
         quantized = self._apply_target_code_noise(quantized)
+        quantized = self._apply_quantization_dropout(
+            x, quantized, detach_residual=True
+        )
         return x + self.quant_strength * (quantized - x).detach()
 
 

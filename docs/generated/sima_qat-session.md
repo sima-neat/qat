@@ -32,6 +32,10 @@ cannot silently alter the quantization policy.
 
 Structural and optional task-quality result from :meth:`QATSession.validate`.
 
+### Class: `QATCalibrationReport`
+
+Calibration sufficiency and target-grid stability evidence.
+
 ### Class: `QATBundle`
 
 Paths and content digests emitted by :meth:`QATSession.export`.
@@ -45,6 +49,13 @@ model included in ``parameters()`` and ``state_dict()``.  The frozen FP32
 teacher is intentionally kept out of module registration: it follows
 device moves but does not double checkpoints, optimizer state, or DDP
 parameter broadcasts.
+
+### Method: `QATSession.curriculum(step, total_steps, ramp_fraction=None, *, dropout_probability=None, dropout_decay_fraction=None)`
+
+Apply the recipe's activation-rounding curriculum. Optional QDrop bypasses a
+random subset of activation elements during training and decays linearly to
+zero. Evaluation is always strict Q/DQ, and validation fails while a nonzero
+training dropout remains configured.
 
 ### Function: `prepare(model, example_inputs, target, device, recipe, shadow_weight)`
 

@@ -6,6 +6,7 @@ import json
 
 import pytest
 import torch
+from torch.ao.quantization.fake_quantize import FakeQuantizeBase
 
 import sima_qat
 from sima_qat.session import QATRecipe, load_recipe
@@ -59,22 +60,36 @@ def test_session_prepare_calibrate_train_freeze_validate_and_export(tmp_path):
         not parameter.requires_grad for parameter in qat.float_teacher.parameters()
     )
 
-    qat.calibrate([(images[:2], targets[:2]), (images[2:], targets[2:])], batches=2)
+    calibration = [
+        (images[:2], targets[:2]),
+        (images[2:], targets[2:]),
+    ] * 32
+    qat.calibrate(calibration)
     assert qat.state == "calibrated"
-    assert qat.calibration_batches == 2
+    assert qat.calibration_batches == 64
+    assert qat.calibration_report.passed
+    assert qat.calibration_report.shift_tier_changes_in_last_window == 0
     assert qat.training
+
+    # Target grids must be locked before optimizer updates. Frozen sessions
+    # deliberately remain trainable.
+    qat.freeze()
+    assert qat.state == "frozen"
 
     optimizer = torch.optim.SGD(qat.parameters(), lr=1e-3)
     optimizer.zero_grad()
     prediction = qat(images[:2])
     task_loss = torch.nn.functional.mse_loss(prediction, targets[:2])
-    loss = qat.loss(task_loss)
+    feature_loss = prediction.square().mean()
+    loss = qat.loss(task_loss, feature_loss=feature_loss)
     loss.backward()
     optimizer.step()
     assert torch.isfinite(loss)
     assert loss >= task_loss
+    assert qat._last_loss_terms["feature"] == pytest.approx(
+        float(feature_loss.detach())
+    )
 
-    qat.freeze()
     report = qat.validate()
     report.raise_for_failure()
     assert report.weighted_ops == 2
@@ -116,7 +131,7 @@ def test_session_enforces_lifecycle_and_loss_order(tmp_path):
         qat.loss(torch.tensor(1.0))
     with pytest.raises(RuntimeError, match=r"qat.freeze\(\)"):
         qat.export(tmp_path)
-    with pytest.raises(RuntimeError, match="observers see data"):
+    with pytest.raises(RuntimeError, match="qualified calibration"):
         qat.freeze()
 
 
@@ -131,9 +146,63 @@ def test_auto_recipe_detects_state_space_model_and_supports_mapping_calibration(
     assert qat.recipe.full_range_ste
     assert qat.state_space_regions == ("<root>",)
 
-    qat.calibrate([{"image": image, "unused_label": torch.zeros(1)}], batches=1)
+    short = [{"image": image, "sample_id": ["short"]}] * 64
+    qat.calibrate(short, batches=64)
+    assert not qat.calibration_report.passed
+    with pytest.raises(RuntimeError, match="requires at least 128"):
+        qat.freeze()
+
+    remainder = [
+        {"image": image, "sample_id": [f"sample-{index:03d}"]}
+        for index in range(64, 128)
+    ]
+    qat.calibrate(remainder, batches=64)
+    assert qat.calibration_report.passed
+    assert qat.calibration_report.observed_batches == 128
+    assert qat.calibration_report.ordered_sample_ids_sha256
     qat.freeze()
+    assert qat.curriculum(0, 100) == pytest.approx(0.04)
+    assert not qat.validate().passed
+    assert qat.curriculum(24, 100) == pytest.approx(1.0)
     assert qat.validate().passed
+
+    qat.curriculum(
+        0,
+        100,
+        dropout_probability=0.5,
+        dropout_decay_fraction=0.25,
+    )
+    assert not qat.validate().passed
+    qat.curriculum(
+        24,
+        100,
+        dropout_probability=0.5,
+        dropout_decay_fraction=0.25,
+    )
+    assert qat.validate().passed
+
+
+@pytest.mark.regression
+def test_calibration_initializes_learned_ranges_from_observer_qparams():
+    image = torch.randn(1, 3, 8, 8)
+    recipe = QATRecipe(
+        name="learned_ranges",
+        full_range_ste=True,
+        learn_scales=True,
+    )
+    qat = sima_qat.prepare(TinyRegressor(), image, recipe=recipe)
+    qat.calibrate([image])
+    learned = [
+        module
+        for module in qat.model.modules()
+        if isinstance(module, FakeQuantizeBase)
+        and module.qscheme
+        not in (torch.per_channel_affine, torch.per_channel_symmetric)
+        and getattr(module, "learn_scale", False)
+    ]
+    assert learned
+    for module in learned:
+        torch.testing.assert_close(module.log_scale.exp(), module.scale)
 
 
 @pytest.mark.regression

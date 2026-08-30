@@ -8,6 +8,7 @@ from sima_qat.qat_api import (
 )
 from sima_qat.session import (
     QATBundle,
+    QATCalibrationReport,
     QATRecipe,
     QATReport,
     QATSession,
@@ -17,6 +18,7 @@ from sima_qat.session import (
 
 __all__ = [
     "QATBundle",
+    "QATCalibrationReport",
     "QATRecipe",
     "QATReport",
     "QATSession",
