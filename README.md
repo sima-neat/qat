@@ -84,6 +84,15 @@ for step, (images, labels) in enumerate(train_loader):
     loss.backward()
     optimizer.step()
 
+# Optional for difficult recurrent graphs. This evaluates existing Q/DQ range
+# candidates on a held-out, re-iterable validation loader and keeps a change
+# only when the requested task metric improves. It adds no graph operators.
+range_report = qat.refine_ranges(
+    validation_loader,
+    evaluate_task,
+    metric="d1",
+)
+
 report = qat.validate(validation_loader, evaluator=evaluate_task)
 report.raise_for_failure()
 
@@ -111,6 +120,15 @@ quantizer counts, and weighted-operator coverage. `qat.explain()` explains the
 selected policy. Export creates `model.onnx` and `qat_manifest.json`; the
 manifest binds the ONNX checksum and clearly distinguishes host QAT/ONNX
 validation from stock Model Compiler and board evidence.
+
+`qat.refine_ranges(...)` is an optional post-QAT recovery step. Its automatic
+policy is intentionally narrow: it searches positive unit-grid Multiply
+outputs inside recurrent/state-space regions, excludes grids directly coupled
+to Conv/Linear operators, and transactionally restores the original ranges if
+the task metric does not improve. The winning grid is persisted through the
+PT2E observer contract and the full search receipt is included in
+`qat_manifest.json`. Use `ActivationRangeSelector` only when qualifying a
+broader model family.
 
 The session keeps its frozen FP32 teacher out of `parameters()` and
 `state_dict()`, so it does not double optimizer or checkpoint size. Loading a
@@ -157,6 +175,7 @@ qat_model = sima_prepare_qat_model(
 | `qat.calibrate(data, batches=None)` | Collect activation ranges without fake quantization. Omitted `batches` uses the recipe's qualified minimum; calibration records ordered sample IDs and shift-tier stability. |
 | `qat.curriculum(step, total_steps, dropout_probability=None, dropout_decay_fraction=None)` | Progressively introduce activation rounding and optionally decay training-only QDrop to zero. Weights and frozen target grids remain strict. |
 | `qat.loss(task_loss, feature_loss=None)` | Add optional intermediate-feature preservation and scale-normalized frozen-FP32 output preservation. |
+| `qat.refine_ranges(data, evaluator, metric=..., factors=(1, 2, 4))` | Optionally search export-stable activation ranges on held-out task data; commit only an improvement and otherwise roll back. |
 | `qat.freeze()` / `qat.validate()` / `qat.export(directory)` | Lock target grids before training, enforce structural gates, and create a content-bound ONNX bundle. |
 | `sima_prepare_qat_model(model, inputs, device, shift_aware=True)` | Capture the model and insert SiMa fake-quant annotations. Power-of-two-aware weight QAT is the default; pass `False` for the legacy behavior. |
 | `sima_freeze_qat(qat_model)` | Freeze observers and lock AFE-compatible weight scales before final fine-tuning. |

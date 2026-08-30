@@ -43,6 +43,11 @@ from sima_qat.qat_api import (
     sima_freeze_qat,
     sima_prepare_qat_model,
 )
+from sima_qat.range_refinement import (
+    ActivationRangeRefinementReport,
+    ActivationRangeSelector,
+    refine_activation_ranges,
+)
 
 ExampleInputs = Tensor | Sequence[Any]
 InputAdapter = Callable[
@@ -411,6 +416,7 @@ class QATSession(nn.Module):
         self._calibration_sample_ids: list[str] = []
         self._last_forward: tuple[Any, Any] | None = None
         self._last_loss_terms: dict[str, float] = {}
+        self.range_refinement_reports: list[ActivationRangeRefinementReport] = []
         weighted, covered, issues = _weighted_op_coverage(model)
         self._prepared_coverage = (weighted, covered, tuple(issues))
         self._prepared_activation_fake_quantizers = sum(
@@ -634,6 +640,50 @@ class QATSession(nn.Module):
                 "The selected QAT fake quantizer does not support an activation ramp"
             )
         return strength
+
+    def refine_ranges(
+        self,
+        data: Iterable[Any],
+        evaluator: Evaluator,
+        *,
+        metric: str | None = None,
+        factors: Sequence[float] = (1.0, 2.0, 4.0),
+        higher_is_better: bool = True,
+        min_improvement: float = 0.0,
+        policy: str | ActivationRangeSelector = "auto",
+        group_by: str = "module",
+    ) -> ActivationRangeRefinementReport:
+        """Keep a task-improving activation-range candidate or roll it back.
+
+        The default ``policy="auto"`` targets unit-grid Multiply outputs in
+        recurrent/state-space regions and excludes grids directly adjacent to
+        weighted operators. No graph operators are added or removed. For an
+        advanced selection, pass :class:`ActivationRangeSelector`.
+
+        Example::
+
+            report = qat.refine_ranges(
+                validation_loader,
+                evaluate_depth,
+                metric="d1",
+            )
+        """
+
+        if self.state != "frozen":
+            raise RuntimeError("qat.refine_ranges() requires qat.freeze() first")
+        report = refine_activation_ranges(
+            self.model,
+            data,
+            evaluator,
+            metric=metric,
+            factors=factors,
+            higher_is_better=higher_is_better,
+            min_improvement=min_improvement,
+            policy=policy,
+            group_by=group_by,
+        )
+        self.range_refinement_reports.append(report)
+        return report
 
     def calibrate(
         self,
@@ -1076,6 +1126,10 @@ class QATSession(nn.Module):
                 self.calibration_report.to_dict()
                 if self.calibration_report is not None else None
             ),
+            "range_refinements": [
+                refinement.to_dict()
+                for refinement in self.range_refinement_reports
+            ],
             "example_inputs": [
                 _tensor_descriptor(value) for value in self.example_inputs
             ],
@@ -1412,6 +1466,8 @@ def prepare(
 
 
 __all__ = [
+    "ActivationRangeRefinementReport",
+    "ActivationRangeSelector",
     "QATBundle",
     "QATCalibrationReport",
     "QATRecipe",
