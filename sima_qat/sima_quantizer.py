@@ -278,16 +278,44 @@ class FullRangeSTEFakeQuantize(FakeQuantize):
         )
         if self.learn_scale:
             self.log_scale = torch.nn.Parameter(self.scale.detach().clamp_min(1e-12).log())
+            # Training-only anchor for an exactly projected float32 scale.
+            # ``exp(log(scale))`` is not generally bit-identical to ``scale``;
+            # retaining the anchor avoids a one-ULP grid change between target
+            # projection and final export while preserving LSQ gradients.
+            self._learned_scale_anchor = None
+            self._learned_log_scale_anchor = None
 
     @torch.no_grad()
     def initialize_learned_scale(self):
         if self.learn_scale:
             self.log_scale.copy_(self.scale.detach().clamp_min(1e-12).log())
+            self._learned_scale_anchor = self.scale.detach().clone()
+            self._learned_log_scale_anchor = self.log_scale.detach().clone()
+
+    def current_learned_scale(self):
+        if self._learned_scale_anchor is None:
+            return self.log_scale.exp().clamp_min(1e-12)
+        anchor_scale = self._learned_scale_anchor.to(
+            device=self.log_scale.device, dtype=self.log_scale.dtype
+        )
+        anchor_log = self._learned_log_scale_anchor.to(
+            device=self.log_scale.device, dtype=self.log_scale.dtype
+        )
+        return (anchor_scale * (self.log_scale - anchor_log).exp()).clamp_min(1e-12)
+
+    @torch.no_grad()
+    def set_projected_learned_scale(self, scale):
+        scale = scale.detach().to(
+            device=self.log_scale.device, dtype=self.log_scale.dtype
+        ).clamp_min(1e-12)
+        self.log_scale.copy_(scale.log())
+        self._learned_scale_anchor = scale.clone()
+        self._learned_log_scale_anchor = self.log_scale.detach().clone()
 
     @torch.no_grad()
     def sync_learned_scale(self):
         if self.learn_scale:
-            self.scale.copy_(self.log_scale.detach().exp().clamp_min(1e-12))
+            self.scale.copy_(self.current_learned_scale().detach())
 
     def set_quant_strength(self, value: float) -> None:
         value = float(value)
@@ -399,7 +427,7 @@ class FullRangeSTEFakeQuantize(FakeQuantize):
         if self.fake_quant_enabled[0] != 1:
             return x
         if self.learn_scale and not self.is_per_channel:
-            scale = self.log_scale.exp().clamp_min(1e-12)
+            scale = self.current_learned_scale()
             with torch.no_grad():
                 self.scale.copy_(scale.detach())
             if self.log_scale.requires_grad:

@@ -1,7 +1,11 @@
 import torch
 from torch.ao.quantization.observer import MinMaxObserver
 
-from sima_qat.qat_api import sima_prepare_qat_model
+from sima_qat.qat_api import (
+    sima_freeze_qat,
+    sima_prepare_qat_model,
+    sima_project_qat_to_target_grids,
+)
 from sima_qat.sima_quantizer import FullRangeSTEFakeQuantize, _LearnedScaleSTE
 
 
@@ -12,6 +16,51 @@ class TinyConv(torch.nn.Module):
 
     def forward(self, value):
         return self.conv(value)
+
+
+def test_target_grid_projection_makes_live_qat_equal_to_final_freeze():
+    value = torch.randn(1, 3, 4, 4)
+    prepared = sima_prepare_qat_model(
+        TinyConv(),
+        (value,),
+        "cpu",
+        shift_aware=True,
+        full_range_ste=True,
+        learn_scales=True,
+    )
+    prepared(value)
+    torch.ao.quantization.disable_observer(prepared)
+    live_scales = [
+        module
+        for module in prepared.modules()
+        if hasattr(module, "log_scale") and not module.is_per_channel
+    ]
+    assert live_scales
+    with torch.no_grad():
+        live_scales[-1].log_scale.add_(0.2)
+
+    sima_project_qat_to_target_grids(prepared)
+    assert not bool(prepared.qat_frozen.item())
+    assert all(module.learn_scale for module in live_scales)
+    projected = prepared(value)
+    projected_qparams = [
+        (module.scale.detach().clone(), module.zero_point.detach().clone())
+        for module in prepared.modules()
+        if isinstance(module, torch.ao.quantization.FakeQuantizeBase)
+    ]
+
+    sima_freeze_qat(prepared)
+    frozen = prepared(value)
+    frozen_qparams = [
+        (module.scale.detach().clone(), module.zero_point.detach().clone())
+        for module in prepared.modules()
+        if isinstance(module, torch.ao.quantization.FakeQuantizeBase)
+    ]
+    torch.testing.assert_close(frozen, projected, rtol=0, atol=0)
+    assert len(frozen_qparams) == len(projected_qparams)
+    for projected_pair, frozen_pair in zip(projected_qparams, frozen_qparams):
+        torch.testing.assert_close(frozen_pair[0], projected_pair[0], rtol=0, atol=0)
+        torch.testing.assert_close(frozen_pair[1], projected_pair[1], rtol=0, atol=0)
 
 
 def test_prepare_options_override_process_environment(monkeypatch):

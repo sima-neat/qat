@@ -1042,6 +1042,53 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
     return qat_model
 
 
+@torch.no_grad()
+def sima_project_qat_to_target_grids(qat_model: GraphModule) -> GraphModule:
+    """Project live learned grids onto the exact shift-realizable target set.
+
+    Learned activation scales and power-of-two Conv/Linear weight scales are a
+    coupled discrete system.  Training them independently and solving the
+    coupling only in :func:`sima_freeze_qat` changes the model at freeze time.
+    This operation runs the same fail-atomic solver used by freeze, then
+    re-enables precisely the activation scales which were live beforehand.
+    Calling it after an optimizer step therefore makes the next QAT forward
+    identical to the grids that a subsequent freeze/export will retain.
+
+    Observer updates remain disabled; this is constraint projection, not a new
+    calibration pass.  The projected activation scale is copied back into the
+    corresponding ``log_scale`` parameter so optimizer-visible state and the
+    executable fake quantizer cannot drift apart.
+    """
+    if not isinstance(qat_model, GraphModule):
+        raise RuntimeError(
+            "Input graph to target-grid projection must be a GraphModule, "
+            f"found {type(qat_model)}"
+        )
+    learned_state = [
+        (module, bool(getattr(module, "learn_scale", False)))
+        for module in qat_model.modules()
+        if hasattr(module, "log_scale")
+    ]
+    if hasattr(qat_model, "qat_frozen"):
+        qat_model.qat_frozen.fill_(0)
+    sima_freeze_qat(qat_model)
+    for fake_quant, was_live in learned_state:
+        if not was_live:
+            continue
+        if hasattr(fake_quant, "set_projected_learned_scale"):
+            fake_quant.set_projected_learned_scale(fake_quant.scale)
+        else:
+            fake_quant.log_scale.copy_(
+                fake_quant.scale.detach().to(
+                    device=fake_quant.log_scale.device,
+                    dtype=fake_quant.log_scale.dtype,
+                ).clamp_min(1e-12).log()
+            )
+        fake_quant.learn_scale = True
+    qat_model.qat_frozen.fill_(0)
+    return qat_model
+
+
 def _ensure_bn_tracking_meta(gm: GraphModule) -> None:
     """torch >= 2.8 `convert_pt2e` QAT bn-folding reads `node.meta["source_fn_stack"]`
     on the BatchNorm `num_batches_tracked += 1` in-place add nodes, but graphs produced
