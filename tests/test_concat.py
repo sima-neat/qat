@@ -83,6 +83,18 @@ class IdentityPaddingConcatModel(torch.nn.Module):
         return torch.cat((prefix, x[:-1]), dim=0)
 
 
+class SingleInputConcatEinsumModel(torch.nn.Module):
+    """A one-iteration eager loop may emit Cat([Einsum]) in the FX graph."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.eye(3))
+
+    def forward(self, x):
+        projected = torch.einsum("nchw,oc->nohw", x, self.weight)
+        return torch.cat([projected], dim=0)
+
+
 @pytest.mark.regression
 @pytest.mark.parametrize("model", [Model()])
 def test_concat(model: torch.nn.Module):
@@ -177,3 +189,26 @@ def test_identity_padding_concat_uses_payload_grid(identity):
     )
     assert input_dequantize[0].args[1:3] == input_dequantize[1].args[1:3]
     assert output_quantize.args[1:3] == input_dequantize[1].args[1:3]
+
+
+@pytest.mark.regression
+def test_single_input_concat_has_concrete_shared_grid_root():
+    model = SingleInputConcatEinsumModel().eval()
+    input_tensor = torch.randn(1, 3, 8, 8)
+    prepared = sima_prepare_qat_model(model, (input_tensor,), "cpu")
+    prepared(input_tensor)
+    converted = sima_finalize_qat_model(prepared)
+
+    cat = next(
+        node
+        for node in converted.graph.nodes
+        if node.target == torch.ops.aten.cat.default
+    )
+    input_dequantize = list(cat.args[0])
+    assert len(input_dequantize) == 1
+    output_quantize = next(
+        node
+        for node in cat.users
+        if node.target == torch.ops.quantized_decomposed.quantize_per_tensor.default
+    )
+    assert output_quantize.args[1:3] == input_dequantize[0].args[1:3]
