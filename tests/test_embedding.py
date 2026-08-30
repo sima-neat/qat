@@ -5,6 +5,7 @@ from sima_qat.qat_api import (
     sima_finalize_qat_model,
     sima_freeze_qat,
     sima_prepare_qat_model,
+    sima_export_onnx,
 )
 
 
@@ -19,7 +20,7 @@ class EmbeddingProjection(torch.nn.Module):
 
 
 @pytest.mark.regression
-def test_embedding_table_is_w8_and_indices_remain_int64():
+def test_embedding_table_is_w8_and_indices_remain_int64(tmp_path):
     indices = torch.tensor([[1, 2, 3]], dtype=torch.int64)
     prepared = sima_prepare_qat_model(
         EmbeddingProjection(),
@@ -47,3 +48,11 @@ def test_embedding_table_is_w8_and_indices_remain_int64():
     sima_freeze_qat(prepared)
     finalized = sima_finalize_qat_model(prepared)
     assert finalized(indices).shape == actual.shape
+    sima_export_onnx(
+        finalized,
+        (indices,),
+        str(tmp_path / "embedding_w8.onnx"),
+        input_names=["indices"],
+        output_names=["output"],
+    )
+    assert (tmp_path / "embedding_w8.onnx").is_file()
