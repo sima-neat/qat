@@ -328,7 +328,7 @@ def test_checkpoint_resume_and_legacy_compatibility():
 
 
 @pytest.mark.regression
-def test_freeze_uses_exact_observer_qparams_for_learned_activation_scales():
+def test_freeze_persists_learned_activation_scales_as_exact_observer_qparams():
     inputs = torch.randn(2, 3, 8, 8)
     model = sima_prepare_qat_model(
         TinyClassifier(), (inputs,), "cpu", full_range_ste=True, learn_scales=True
@@ -343,12 +343,20 @@ def test_freeze_uses_exact_observer_qparams_for_learned_activation_scales():
     ]
     assert learned_fake_quantizers
 
-    # Simulate learned-scale training drifting away from observer/export
-    # qparams while keeping all scale ratios unchanged and representable.
+    observer_scales_before = {
+        id(fake_quant): fake_quant.activation_post_process.calculate_qparams()[0].clone()
+        for fake_quant in learned_fake_quantizers
+    }
+    # Simulate learned-scale training drifting away from the calibration
+    # observer while keeping all scale ratios unchanged and representable.
     with torch.no_grad():
         for fake_quant in learned_fake_quantizers:
             fake_quant.log_scale.add_(0.25)
             fake_quant.sync_learned_scale()
+    requested_scales = {
+        id(fake_quant): fake_quant.scale.detach().clone()
+        for fake_quant in learned_fake_quantizers
+    }
     assert any(
         not torch.equal(
             fake_quant.scale,
@@ -363,6 +371,17 @@ def test_freeze_uses_exact_observer_qparams_for_learned_activation_scales():
         scale, zero_point = fake_quant.activation_post_process.calculate_qparams()
         torch.testing.assert_close(fake_quant.scale, scale, rtol=0, atol=0)
         torch.testing.assert_close(fake_quant.zero_point, zero_point, rtol=0, atol=0)
+        if fake_quant in learned_fake_quantizers:
+            torch.testing.assert_close(
+                fake_quant.scale,
+                requested_scales[id(fake_quant)],
+                rtol=1e-6,
+                atol=0,
+            )
+            assert not torch.equal(
+                fake_quant.scale,
+                observer_scales_before[id(fake_quant)],
+            )
         if hasattr(fake_quant, "learn_scale"):
             assert not fake_quant.learn_scale
         locked.append(fake_quant.scale.detach().clone())

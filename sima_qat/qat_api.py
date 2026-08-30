@@ -193,6 +193,7 @@ _STATIC_WEIGHT_VALUE_OPS = {
     operator.getitem,
     torch.ops.aten.add.Tensor,
     torch.ops.aten.cat.default,
+    torch.ops.aten.chunk.default,
     torch.ops.aten.clone.default,
     torch.ops.aten.detach.default,
     torch.ops.aten.div.Tensor,
@@ -413,6 +414,54 @@ def _stage_coarser_activation_grid(
     return persisted_scale, persisted_zero_point, lower, upper
 
 
+def _stage_learned_activation_grid(
+    fake_quant: FakeQuantizeBase,
+    requested_scale: Tensor,
+    zero_point: Tensor,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Persist a learned per-tensor activation scale through PT2E export.
+
+    PT2E conversion recalculates qparams from the observer.  Merely copying a
+    learned scale into ``FakeQuantize.scale`` therefore loses the QAT result at
+    conversion time.  Stage an equivalent observer range on a private copy and
+    return the exact qparams that conversion will reproduce.
+    """
+
+    if requested_scale.numel() != 1 or zero_point.numel() != 1:
+        raise RuntimeError("Learned activation grids must use per-tensor qparams")
+    if not bool(torch.isfinite(requested_scale).all()) or bool((requested_scale <= 0).any()):
+        raise RuntimeError("Learned activation scale must be finite and positive")
+    observer = copy.deepcopy(fake_quant.activation_post_process)
+    if not hasattr(observer, "min_val") or not hasattr(observer, "max_val"):
+        raise RuntimeError(
+            f"Activation observer {type(observer).__name__} cannot persist a learned grid"
+        )
+    requested_scale = requested_scale.detach().to(
+        device=zero_point.device, dtype=fake_quant.scale.dtype
+    )
+    requested_zero_point = zero_point.detach()
+    lower = (
+        (observer.quant_min - requested_zero_point.to(requested_scale.dtype))
+        * requested_scale
+    ).to(device=observer.min_val.device, dtype=observer.min_val.dtype)
+    upper = (
+        (observer.quant_max - requested_zero_point.to(requested_scale.dtype))
+        * requested_scale
+    ).to(device=observer.max_val.device, dtype=observer.max_val.dtype)
+    observer.min_val.resize_(lower.shape).copy_(lower)
+    observer.max_val.resize_(upper.shape).copy_(upper)
+    persisted_scale, persisted_zero_point = observer.calculate_qparams()
+    persisted_scale = persisted_scale.to(
+        device=fake_quant.scale.device, dtype=fake_quant.scale.dtype
+    )
+    persisted_zero_point = persisted_zero_point.to(
+        device=fake_quant.zero_point.device, dtype=fake_quant.zero_point.dtype
+    )
+    if not bool(torch.isfinite(persisted_scale).all()) or bool((persisted_scale <= 0).any()):
+        raise RuntimeError("Persisted learned activation grid is non-finite or non-positive")
+    return persisted_scale, persisted_zero_point, lower, upper
+
+
 def _stage_weight_grid(
     weight_fq: FakeQuantizeBase,
     scales: Tensor,
@@ -469,6 +518,13 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
         ):
             continue
         scale, zero_point = fake_quant.activation_post_process.calculate_qparams()
+        lower = upper = None
+        if bool(getattr(fake_quant, "learn_scale", False)) and hasattr(fake_quant, "log_scale"):
+            scale, zero_point, lower, upper = _stage_learned_activation_grid(
+                fake_quant,
+                fake_quant.log_scale.detach().exp(),
+                zero_point,
+            )
         activation_qparams.append([
             fake_quant,
             scale.to(device=fake_quant.scale.device, dtype=fake_quant.scale.dtype),
@@ -476,8 +532,8 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
                 device=fake_quant.zero_point.device,
                 dtype=fake_quant.zero_point.dtype,
             ),
-            None,
-            None,
+            lower,
+            upper,
         ])
     activation_qparams_by_id = {
         id(row[0]): row for row in activation_qparams
@@ -924,11 +980,32 @@ def check_graph_nodes(prepared_mod : GraphModule, device: torch.device) -> Graph
     """ Checks the prepared model for inconsistent device paramterers and 
         also for setting the dropout layers to inactive mode
     """
+    target_device = torch.device(device)
+    if target_device.type == "cuda" and target_device.index is None:
+        target_device = torch.device("cuda", torch.cuda.current_device())
+    # Preserve the public argument's representation for existing callers. In
+    # particular, the legacy helper and its serialized graph tests use the
+    # string ``"cpu"``, while QATSession passes a concrete torch.device.
+    replacement_device = (
+        str(target_device) if isinstance(device, str) else target_device
+    )
     for n in prepared_mod.graph.nodes:
-        #check for parameters not being in the same device as the model
-        if n.target in device_modifier_ops:
+        # export_for_training specializes tensor factories and metadata checks
+        # to the capture device.  Grounding DINO has explicit device kwargs on
+        # nodes outside the small factory allowlist above, so rewrite every
+        # explicit torch.device while preserving all other kwargs.
+        explicit_device = n.kwargs.get("device")
+        explicit_target = (
+            torch.device(explicit_device)
+            if isinstance(explicit_device, (str, torch.device))
+            else None
+        )
+        if (
+            n.target in device_modifier_ops
+            or (explicit_target is not None and explicit_target != target_device)
+        ):
             new_kwargs = dict(n.kwargs)
-            new_kwargs['device'] = device
+            new_kwargs['device'] = replacement_device
             n.kwargs = new_kwargs
 
     prepared_mod.recompile()

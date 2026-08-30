@@ -57,6 +57,7 @@ from torch.ao.quantization.observer import (
 from torch.ao.quantization.qconfig import _ObserverOrFakeQuantizeConstructor
 
 from torch.ao.quantization.quantizer import (
+    FixedQParamsQuantizationSpec,
     QuantizationSpec, 
     Quantizer,
     QuantizationAnnotation,
@@ -137,6 +138,53 @@ __all__ = [
     "SimaQuantizer",
     "get_sima_quantization_config",
 ]
+
+
+class _LearnedScaleSTE(torch.autograd.Function):
+    """Memory-bounded LSQ surrogate for large exported activation graphs.
+
+    Building ``scale_error`` with ordinary autograd keeps another full-sized
+    tensor alive at every fake-quant boundary.  Attention models have thousands
+    of those boundaries and can OOM before the first backward.  Recompute the
+    inexpensive code error in backward while retaining only references to the
+    input and scalar qparams.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        value: Tensor,
+        scale: Tensor,
+        zero_point: Tensor,
+        quant_min: int,
+        quant_max: int,
+        quant_strength: float,
+        grad_factor: float,
+    ) -> Tensor:
+        detached_scale = scale.detach()
+        detached_zero_point = zero_point.detach().to(value.dtype)
+        code = torch.round(
+            value.detach() / detached_scale + detached_zero_point
+        ).clamp(quant_min, quant_max)
+        dequantized = (code - detached_zero_point) * detached_scale
+        # The LSQ error is the only activation-dependent value needed for the
+        # scalar scale gradient.  Saving it in FP16 is substantially smaller
+        # than retaining the FP32 activation (or both activation and code) at
+        # every boundary; the reduction is accumulated in FP32 in backward.
+        scale_error = (
+            code - detached_zero_point - value.detach() / detached_scale
+        ).to(torch.float16)
+        ctx.save_for_backward(scale_error)
+        ctx.grad_factor = grad_factor
+        return value + float(quant_strength) * (dequantized - value)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        (scale_error,) = ctx.saved_tensors
+        grad_scale = (
+            grad_output.float() * scale_error.float() * ctx.grad_factor
+        ).sum().reshape(1)
+        return grad_output, grad_scale, None, None, None, None, None
 
 
 class SimaMovingAverageMinMaxObserver(MovingAverageMinMaxObserver):
@@ -259,6 +307,12 @@ class FullRangeSTEFakeQuantize(FakeQuantize):
         return quantized + (noisy - quantized).detach()
 
     def forward(self, x):
+        # Structural masks and indices may inherit an annotation through PT2E
+        # propagation.  They are not activation tensors and cannot legally be
+        # fake-quantized (subtraction/rounding are undefined for bool).  Keep
+        # them byte-for-byte unchanged.
+        if not x.is_floating_point():
+            return x
         if self.observer_enabled[0] == 1:
             self.activation_post_process(x.detach())
             # Observer-only calibration intentionally bypasses fake quant and
@@ -282,18 +336,17 @@ class FullRangeSTEFakeQuantize(FakeQuantize):
             with torch.no_grad():
                 self.scale.copy_(scale.detach())
             zero_point = self.zero_point.to(x.dtype)
-            code = torch.round(x.detach() / scale.detach() + zero_point).clamp(
+            grad_factor = 1.0 / math.sqrt(max(1, x.numel()) * max(1, self.quant_max))
+            quantized = _LearnedScaleSTE.apply(
+                x,
+                scale,
+                zero_point,
                 self.activation_post_process.quant_min,
                 self.activation_post_process.quant_max,
+                self.quant_strength,
+                grad_factor,
             )
-            dequantized = (code - zero_point) * scale.detach()
-            dequantized = self._apply_target_code_noise(dequantized)
-            # Identity STE for x plus the LSQ scale surrogate. The latter has
-            # exactly zero forward value and a normalized gradient for log(s).
-            base = x + self.quant_strength * (dequantized - x).detach()
-            scale_error = code - zero_point - x.detach() / scale.detach()
-            grad_factor = 1.0 / math.sqrt(max(1, x.numel()) * max(1, self.quant_max))
-            return base + (scale - scale.detach()) * scale_error * grad_factor
+            return self._apply_target_code_noise(quantized)
         if self.is_per_channel:
             quantized = torch.fake_quantize_per_channel_affine(
                 x, self.scale, self.zero_point, self.ch_axis,
@@ -481,8 +534,10 @@ class SimaQuantizer(Quantizer):
     STATIC_OPS = [
         "linear_relu",
         "linear",
+        "sima_embedding",
         "sima_matmul",
         "sima_softmax",
+        "sima_grid_sample",
         "sima_conv_add_or_mul_const",
         "sima_conv_hardtanh",
         "sima_conv_transpose2d",
@@ -586,8 +641,187 @@ class SimaQuantizer(Quantizer):
         if self.global_config and self.global_config.input_activation.is_dynamic:  # type: ignore[union-attr]
             assert False, "Error: dynamic quantization is unsupported on Sima models."
         model = self._annotate_for_static_quantization_config(model)
+        self._remove_non_float_qspecs(model)
+        self._fuse_attention_score_softmax_boundaries(model)
+        self._fuse_transformer_residual_norm_boundaries(model)
+        self._fuse_deformable_weighted_reduction(model)
         propagate_annotation(model)
         return model
+
+    @staticmethod
+    def _remove_non_float_qspecs(model: torch.fx.GraphModule) -> None:
+        """Never insert activation Q/DQ on masks, indices, or shape tensors."""
+        def is_non_float(node: Node) -> bool:
+            value = node.meta.get("val")
+            return isinstance(value, torch.Tensor) and not value.is_floating_point()
+
+        for node in model.graph.nodes:
+            annotation = node.meta.get("quantization_annotation")
+            if annotation is None or not annotation._annotated:
+                continue
+            annotation.input_qspec_map = {
+                input_node: qspec
+                for input_node, qspec in annotation.input_qspec_map.items()
+                if not is_non_float(input_node)
+            }
+            if is_non_float(node):
+                annotation.output_qspec = None
+
+    @staticmethod
+    def _fuse_attention_score_softmax_boundaries(model: torch.fx.GraphModule) -> None:
+        """Keep QK score accumulation and masking inside fused attention.
+
+        Q/K/V operands and the Softmax result remain A8.  The score tensor is
+        not rounded once before applying the mask and again at Softmax input.
+        """
+        score_targets = {
+            torch.ops.aten.baddbmm.default,
+            torch.ops.aten.bmm.default,
+            torch.ops.aten.matmul.default,
+            torch.ops.aten.mm.default,
+        }
+        softmax_targets = {
+            torch.ops.aten._softmax.default,
+            torch.ops.aten.softmax.int,
+        }
+        for softmax in model.graph.nodes:
+            if softmax.op != "call_function" or softmax.target not in softmax_targets:
+                continue
+            if not softmax.args or not isinstance(softmax.args[0], Node):
+                continue
+            score = softmax.args[0]
+            # MultiheadAttention commonly inserts an Add mask between BMM and
+            # Softmax.  Only walk that single arithmetic boundary.
+            score_input = score
+            if (
+                score.op == "call_function"
+                and score.target == torch.ops.aten.add.Tensor
+                and score.args
+                and isinstance(score.args[0], Node)
+            ):
+                score_input = score.args[0]
+            if score_input.op != "call_function" or score_input.target not in score_targets:
+                continue
+            softmax_annotation = softmax.meta.get("quantization_annotation")
+            if softmax_annotation is not None and softmax_annotation._annotated:
+                softmax_annotation.input_qspec_map = {}
+            score_annotation = score_input.meta.get("quantization_annotation")
+            if score_annotation is not None and score_annotation._annotated:
+                score_annotation.output_qspec = None
+            if score is not score_input:
+                add_annotation = score.meta.get("quantization_annotation")
+                if add_annotation is not None and add_annotation._annotated:
+                    add_annotation.input_qspec_map = {}
+                    add_annotation.output_qspec = None
+
+    @staticmethod
+    def _fuse_transformer_residual_norm_boundaries(model: torch.fx.GraphModule) -> None:
+        """Keep projection accumulator and residual Add inside LayerNorm."""
+        pass_through = {
+            torch.ops.aten.view.default,
+            torch.ops.aten.reshape.default,
+            torch.ops.aten.transpose.int,
+            torch.ops.aten.permute.default,
+            torch.ops.aten.clone.default,
+            torch.ops.aten.contiguous.default,
+        }
+
+        def upstream(node: Node) -> Node:
+            while (
+                node.op == "call_function"
+                and node.target in pass_through
+                and node.args
+                and isinstance(node.args[0], Node)
+            ):
+                node = node.args[0]
+            return node
+
+        for norm in model.graph.nodes:
+            if norm.op != "call_function" or norm.target != torch.ops.aten.layer_norm.default:
+                continue
+            add = upstream(norm.args[0]) if norm.args and isinstance(norm.args[0], Node) else None
+            if add is None or add.op != "call_function" or add.target != torch.ops.aten.add.Tensor:
+                continue
+            add_annotation = add.meta.get("quantization_annotation")
+            if add_annotation is None or not add_annotation._annotated:
+                continue
+            add_annotation.input_qspec_map = {}
+            add_annotation.output_qspec = None
+            for value in add.args[:2]:
+                if not isinstance(value, Node):
+                    continue
+                producer = upstream(value)
+                if producer.op != "call_function" or producer.target != torch.ops.aten.linear.default:
+                    continue
+                producer_annotation = producer.meta.get("quantization_annotation")
+                if producer_annotation is not None and producer_annotation._annotated:
+                    producer_annotation.output_qspec = None
+
+    @staticmethod
+    def _fuse_deformable_weighted_reduction(model: torch.fx.GraphModule) -> None:
+        """Keep point weighting in the INT32 accumulator until ReduceSum."""
+        sum_targets = {
+            torch.ops.aten.sum.dim_IntList,
+            torch.ops.aten.sum.default,
+        }
+
+        def reaches_grid_sample(value: Node) -> bool:
+            pending = [value]
+            visited = set()
+            while pending and len(visited) < 32:
+                current = pending.pop()
+                if current in visited:
+                    continue
+                visited.add(current)
+                if current.target == torch.ops.aten.grid_sampler.default:
+                    return True
+                if current.op == "call_function" and current.target in {
+                    torch.ops.aten.cat.default,
+                    torch.ops.aten.mul.Tensor,
+                }:
+                    pending.extend(current.all_input_nodes)
+            return False
+
+        # Multiplication by the pre-quantization validity mask only clears
+        # sampled codes. It must retain the GridSample data/output grid and
+        # must not quantize the exact 0/1 mask on an independent affine grid.
+        for product in model.graph.nodes:
+            if product.op != "call_function" or product.target != torch.ops.aten.mul.Tensor:
+                continue
+            grid = next(
+                (
+                    value for value in product.all_input_nodes
+                    if value.target == torch.ops.aten.grid_sampler.default
+                ),
+                None,
+            )
+            if grid is None:
+                continue
+            annotation = product.meta.get("quantization_annotation")
+            if annotation is None or not annotation._annotated:
+                continue
+            data = grid.args[0]
+            if not isinstance(data, Node):
+                continue
+            shared = SharedQuantizationSpec((data, grid))
+            annotation.input_qspec_map = {grid: shared}
+            annotation.output_qspec = shared
+
+        for reduce_sum in model.graph.nodes:
+            if reduce_sum.op != "call_function" or reduce_sum.target not in sum_targets:
+                continue
+            if not reduce_sum.args or not isinstance(reduce_sum.args[0], Node):
+                continue
+            product = reduce_sum.args[0]
+            if product.op != "call_function" or product.target != torch.ops.aten.mul.Tensor:
+                continue
+            if not any(reaches_grid_sample(value) for value in product.all_input_nodes):
+                continue
+            annotation = product.meta.get("quantization_annotation")
+            if annotation is not None and annotation._annotated:
+                # Both operands remain A8. The product is accumulated at wide
+                # precision and narrowed only at the reduction's consumer.
+                annotation.output_qspec = None
 
     def _annotate_all_static_patterns(
         self,
@@ -786,6 +1020,55 @@ def _sima_annotate_matmul(
     return annotated_partitions
 
 
+@register_annotator("sima_embedding")
+def _sima_annotate_embedding(
+    model: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Store embedding tables and their lookup result on one signed-W8 grid.
+
+    Embedding indices are structural INT64 values, not activations.  A single
+    per-tensor table scale lets MLA implement the lookup as an exact INT8 copy;
+    per-row scales would require a data-dependent requantization after Gather.
+    """
+    base_weight_qspec = get_weight_qspec(quantization_config)
+    table_qspec = QuantizationSpec(
+        dtype=base_weight_qspec.dtype,
+        quant_min=base_weight_qspec.quant_min,
+        quant_max=base_weight_qspec.quant_max,
+        qscheme=torch.per_tensor_symmetric,
+        is_dynamic=False,
+        observer_or_fake_quant_ctr=FakeQuantize.with_args(
+            observer=MovingAverageMinMaxObserver,
+            eps=2**-12,
+        ),
+    )
+    annotated_partitions: List[List[Node]] = []
+    for node in model.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.embedding.default:
+            continue
+        if filter_fn is not None and not filter_fn(node):
+            continue
+        if len(node.args) < 2:
+            continue
+        weight = node.args[0]
+        indices = node.args[1]
+        if not isinstance(weight, Node) or not isinstance(indices, Node):
+            continue
+        partition = [node, weight]
+        if _is_annotated(partition):
+            continue
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map={weight: table_qspec},
+            output_qspec=SharedQuantizationSpec((weight, node)),
+            _annotated=True,
+        )
+        _mark_nodes_as_annotated(partition)
+        annotated_partitions.append(partition)
+    return annotated_partitions
+
+
 @register_annotator("sima_softmax")
 def _sima_annotate_softmax(
     model: torch.fx.GraphModule,
@@ -814,6 +1097,52 @@ def _sima_annotate_softmax(
         node.meta["quantization_annotation"] = QuantizationAnnotation(
             input_qspec_map={input_node: get_input_act_qspec(quantization_config)},
             output_qspec=get_output_act_qspec(quantization_config),
+            _annotated=True,
+        )
+        annotated_partitions.append([node])
+    return annotated_partitions
+
+
+@register_annotator("sima_grid_sample")
+def _sima_annotate_grid_sample(
+    model: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Annotate the strict MLA full-2D GridSample W8A8 contract.
+
+    MLA consumes signed INT8 normalized coordinates on the exact 1/128 grid.
+    Grounding DINO's explicit validity mask preserves zeros-padding semantics
+    for coordinates that would otherwise saturate onto the image border.
+    Its result uses the data input's activation grid, so the output shares that
+    edge qspec rather than introducing an independently observed requantizer.
+    """
+    grid_qspec = FixedQParamsQuantizationSpec(
+        dtype=torch.int8,
+        scale=1.0 / 128.0,
+        zero_point=0,
+        quant_min=-128,
+        quant_max=127,
+        qscheme=torch.per_tensor_affine,
+        is_dynamic=False,
+    )
+    annotated_partitions: List[List[Node]] = []
+    for node in model.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.grid_sampler.default:
+            continue
+        if filter_fn is not None and not filter_fn(node):
+            continue
+        if _is_annotated([node]):
+            continue
+        if len(node.args) < 2:
+            continue
+        data, grid = node.args[:2]
+        if not isinstance(data, Node) or not isinstance(grid, Node):
+            continue
+        data_qspec = get_input_act_qspec(quantization_config)
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map={data: data_qspec, grid: grid_qspec},
+            output_qspec=SharedQuantizationSpec((data, node)),
             _annotated=True,
         )
         annotated_partitions.append([node])
