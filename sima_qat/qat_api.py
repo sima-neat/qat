@@ -27,31 +27,18 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
+import math
 import warnings
 from collections import OrderedDict
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
-from packaging import version
 
-if (version.parse(torch.__version__) < version.parse("2.3.0") or
-    version.parse(torch.__version__) >= version.parse("2.9.0")):
-    raise RuntimeError(f"Sima QAT only supports torch version 2.3.x through 2.8.x, found {torch.__version__}")
+if tuple(int(part) for part in torch.__version__.split("+", 1)[0].split(".")[:2]) != (2, 8):
+    raise RuntimeError(f"Sima QAT requires torch 2.8.x, found {torch.__version__}")
 
-from torch import optim, nn, utils, Tensor
-
-try:
-    # torch <= 2.4: pre-autograd capture lives here.
-    from torch._export import capture_pre_autograd_graph as _capture_pre_autograd_graph
-
-    def _export_training_graph(mod, inputs):
-        return _capture_pre_autograd_graph(mod, inputs)
-except ImportError:
-    # torch >= 2.5: capture_pre_autograd_graph was removed in favor of export_for_training.
-    from torch.export import export_for_training as _export_for_training
-
-    def _export_training_graph(mod, inputs):
-        return _export_for_training(mod, inputs).module()
+from torch import nn, Tensor
+from torch.export import export_for_training
 from torch.ao.quantization.quantize_pt2e import (
   prepare_qat_pt2e,
   convert_pt2e,
@@ -63,6 +50,7 @@ from torch.ao.quantization import (
 )
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
 from torch.fx.graph_module import GraphModule
+from torch.fx.node import Node
 
 
 from sima_qat import onnx_ops
@@ -112,7 +100,7 @@ def sima_prepare_qat_model(
     # We have to move things to the CPU to do the scaffolding. We will return the model to the proper
     # device when we are done.
     input_graph.to("cpu")
-    m = _export_training_graph(input_graph, inputs)
+    m = export_for_training(input_graph, inputs).module()
     m = replace_dropout(m)
 
     cfg = get_sima_quantization_config(is_qat=True)
@@ -133,6 +121,15 @@ _SHIFT_AWARE_OPS = {
 }
 _MIN_REQUANT_SHIFT = 0
 _MAX_REQUANT_SHIFT = 31
+_STATIC_WEIGHT_FUNCTIONS = {
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.div.Tensor,
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.reshape.default,
+    torch.ops.aten.rsqrt.default,
+    torch.ops.aten.sqrt.default,
+    torch.ops.aten.view.default,
+}
 
 
 def _resolve_attr(module: nn.Module, target: str) -> Any:
@@ -175,54 +172,179 @@ def _find_output_fake_quant(module: GraphModule, op_node: Any) -> Optional[FakeQ
     return None
 
 
+def _evaluate_static_weight_arg(
+    module: GraphModule,
+    value: Any,
+    memo: Dict[Node, Any],
+) -> Any:
+    """Evaluate a parameter-only FX value without executing the model graph.
+
+    Only the small set of pure tensor operations emitted by PT2E Conv-BN
+    folding is accepted. Runtime inputs, modules, and unknown functions fail
+    closed so dynamic weights cannot be mistaken for compile-time constants.
+    """
+    if isinstance(value, Node):
+        if value in memo:
+            return memo[value]
+        if value.op == "placeholder":
+            raise RuntimeError(
+                f"static weight expression depends on runtime input {value.name!r}"
+            )
+        if value.op == "get_attr":
+            result = _resolve_attr(module, value.target)
+        elif value.op == "call_function":
+            if value.target not in _STATIC_WEIGHT_FUNCTIONS:
+                raise RuntimeError(
+                    f"static weight expression contains unsupported operation {value.target}"
+                )
+            args = _evaluate_static_weight_arg(module, value.args, memo)
+            kwargs = _evaluate_static_weight_arg(module, value.kwargs, memo)
+            with torch.no_grad():
+                result = value.target(*args, **kwargs)
+        else:
+            raise RuntimeError(
+                f"static weight expression contains unsupported FX node {value.op!r}"
+            )
+        memo[value] = result
+        return result
+    if isinstance(value, tuple):
+        return tuple(_evaluate_static_weight_arg(module, item, memo) for item in value)
+    if isinstance(value, list):
+        return [_evaluate_static_weight_arg(module, item, memo) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _evaluate_static_weight_arg(module, item, memo)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _resolve_static_weight_tensor(module: GraphModule, weight_source: Any) -> Tensor:
+    weight = _evaluate_static_weight_arg(module, weight_source, {})
+    if not isinstance(weight, Tensor):
+        raise RuntimeError(
+            f"static weight expression produced {type(weight).__name__}, expected Tensor"
+        )
+    return weight
+
+
+def _minimum_weight_scale(
+    module: GraphModule,
+    weight_fq_node: Any,
+) -> Tensor:
+    """Return the smallest scale that should be used when locking a weight.
+
+    The fake quantizer may consume either a direct Conv/Linear parameter or a
+    parameter-only expression produced by PT2E Conv-BN folding. Evaluate that
+    expression from current parameters and buffers so an optimizer step after
+    the last observer update cannot introduce clipping.
+    """
+    weight_source = weight_fq_node.args[0] if getattr(weight_fq_node, "args", ()) else None
+    weight = _resolve_static_weight_tensor(module, weight_source)
+    if weight.ndim < 1:
+        raise RuntimeError("Shift-aware weight tensors must have an output-channel dimension")
+    reduce_dims = tuple(range(1, weight.ndim))
+    max_abs = weight.detach().abs().amax(dim=reduce_dims)
+    return torch.clamp(max_abs / 127.0, min=torch.finfo(torch.float32).tiny)
+
+
 def _safe_power_of_two_weight_scale(
     input_scale: Tensor,
     output_scale: Tensor,
-    weight: Tensor,
+    minimum_weight_scale: Tensor,
 ) -> Tensor:
     """Return per-channel scales satisfying sx * sw / sy ~= 2**-shift.
+
+    ``minimum_weight_scale`` is derived from the current parameter range for a
+    direct weight, or from the learned fake-quant scale for an effective weight
+    computed by a PT2E QAT pattern such as Conv-BatchNorm folding.
 
     Scales are rounded one float32 ULP toward zero when necessary. This keeps
     the normalized multiplier on the safe side of AFE's power-of-two boundary,
     preventing a value infinitesimally above the boundary from selecting the
     next shift and a 0.5 correction factor.
     """
-    if weight.ndim < 1:
-        raise RuntimeError("Shift-aware weight tensors must have an output-channel dimension")
-
     sx = float(input_scale.reshape(-1)[0].detach().cpu())
     sy = float(output_scale.reshape(-1)[0].detach().cpu())
-    if sx <= 0.0 or sy <= 0.0:
-        raise RuntimeError(f"Observed activation scales must be positive, found input={sx}, output={sy}")
+    if not math.isfinite(sx) or not math.isfinite(sy) or sx <= 0.0 or sy <= 0.0:
+        raise RuntimeError(
+            "Observed activation scales must be finite and positive, "
+            f"found input={sx}, output={sy}"
+        )
 
-    reduce_dims = tuple(range(1, weight.ndim))
-    max_abs = weight.detach().abs().amax(dim=reduce_dims).to(torch.float64).cpu()
-    required_scale = torch.clamp(max_abs / 127.0, min=torch.finfo(torch.float32).tiny)
+    required_scale = minimum_weight_scale.detach().reshape(-1).to(torch.float64).cpu()
+    if (
+        required_scale.numel() == 0
+        or not bool(torch.isfinite(required_scale).all())
+        or bool((required_scale <= 0).any())
+    ):
+        raise RuntimeError("Observed per-channel weight scales must be finite and positive")
+    required_scale = torch.clamp(required_scale, min=torch.finfo(torch.float32).tiny)
     minimum_ratio = (sx / sy) * required_scale
     unclamped_shift = torch.floor(-torch.log2(minimum_ratio))
     shifts = unclamped_shift.clamp(_MIN_REQUANT_SHIFT, _MAX_REQUANT_SHIFT).to(torch.int32)
 
-    target_ratio = torch.pow(torch.tensor(2.0, dtype=torch.float64), -shifts.to(torch.float64))
-    scales = ((sy / sx) * target_ratio).to(torch.float32)
+    sx_float32 = float(torch.tensor(sx, dtype=torch.float32))
+    sy_float32 = float(torch.tensor(sy, dtype=torch.float32))
+    for _ in range(_MAX_REQUANT_SHIFT + 2):
+        target_ratio = torch.pow(
+            torch.tensor(2.0, dtype=torch.float64),
+            -shifts.to(torch.float64),
+        )
+        scales = ((sy / sx) * target_ratio).to(torch.float32)
 
-    # Work with the exact float32 values AFE will ingest. One or two ULP steps
-    # are normally sufficient. Always start one ULP below the exact boundary so
-    # alternate float32 multiplication order cannot move it to the unsafe side.
-    zero = torch.zeros_like(scales)
-    scales = torch.nextafter(scales, zero)
-    for _ in range(4):
-        imported_ratio = (float(torch.tensor(sx, dtype=torch.float32)) * scales.to(torch.float64)
-                          / float(torch.tensor(sy, dtype=torch.float32)))
-        too_high = imported_ratio > target_ratio
-        if not bool(too_high.any()):
+        # Work with the exact float32 values AFE will ingest. Always start one
+        # ULP below the exact boundary so alternate float32 multiplication
+        # order cannot move the imported ratio to the unsafe side.
+        zero = torch.zeros_like(scales)
+        scales = torch.nextafter(scales, zero)
+        for _ in range(4):
+            imported_ratio = sx_float32 * scales.to(torch.float64) / sy_float32
+            too_high = imported_ratio > target_ratio
+            if not bool(too_high.any()):
+                break
+            scales = torch.where(too_high, torch.nextafter(scales, zero), scales)
+
+        too_small = scales.to(torch.float64) < required_scale
+        if not bool(too_small.any()):
             break
-        scales = torch.where(too_high, torch.nextafter(scales, zero), scales)
-    imported_ratio = (float(torch.tensor(sx, dtype=torch.float32)) * scales.to(torch.float64)
-                      / float(torch.tensor(sy, dtype=torch.float32)))
+        if bool(((shifts == _MIN_REQUANT_SHIFT) & too_small).any()):
+            raise RuntimeError(
+                "Required weight scale exceeds the largest shift-realizable grid at shift 0"
+            )
+        shifts = torch.where(too_small, shifts - 1, shifts)
+    else:
+        raise RuntimeError("Unable to find a non-clipping shift-aware weight scale")
+
+    imported_ratio = sx_float32 * scales.to(torch.float64) / sy_float32
     if bool((imported_ratio > target_ratio).any()):
         raise RuntimeError("Unable to represent shift-aware weight scale safely in float32")
 
-    return scales.to(weight.device)
+    return scales.to(minimum_weight_scale.device)
+
+
+def _freeze_batchnorm_stats(module: GraphModule) -> None:
+    """Keep exported BatchNorm nodes in inference-statistics mode during recovery."""
+    tracking_nodes = []
+    for node in module.graph.nodes:
+        if node.op == "call_function" and node.target == torch.ops.aten.batch_norm.default:
+            if len(node.args) > 5 and node.args[5] is True:
+                args = list(node.args)
+                args[5] = False
+                node.args = tuple(args)
+        elif (
+            node.op == "call_function"
+            and node.target == torch.ops.aten.add_.Tensor
+            and len(node.args) >= 2
+            and getattr(node.args[0], "op", None) == "get_attr"
+            and str(node.args[0].target).endswith("num_batches_tracked")
+            and node.args[1] == 1
+        ):
+            tracking_nodes.append(node)
+
+    for node in tracking_nodes:
+        module.graph.erase_node(node)
+    module.recompile()
 
 
 def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
@@ -248,22 +370,25 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
         input_fq = _fake_quant_module(qat_model, node.args[0])
         weight_fq = _fake_quant_module(qat_model, node.args[1])
         output_fq = _find_output_fake_quant(qat_model, node)
-        weight_node = node.args[1].args[0] if getattr(node.args[1], "args", ()) else None
         if (
             input_fq is None
             or weight_fq is None
             or output_fq is None
-            or getattr(weight_node, "op", None) != "get_attr"
             or weight_fq.qscheme not in (torch.per_channel_affine, torch.per_channel_symmetric)
         ):
             skipped.append(node.name)
             continue
 
-        weight = _resolve_attr(qat_model, weight_node.target)
+        try:
+            minimum_weight_scale = _minimum_weight_scale(qat_model, node.args[1])
+        except RuntimeError as error:
+            skipped.append(f"{node.name} ({error})")
+            continue
+
         scales = _safe_power_of_two_weight_scale(
             input_fq.scale,
             output_fq.scale,
-            weight,
+            minimum_weight_scale,
         )
         locked_scales.append((weight_fq, scales))
 
@@ -275,6 +400,7 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
 
     # Do not mutate observer state until every shift-aware layer has validated.
     qat_model.apply(disable_observer)
+    _freeze_batchnorm_stats(qat_model)
     for weight_fq, scales in locked_scales:
         weight_fq.scale.resize_(scales.shape).copy_(scales)
         # Keep the symmetric zero point explicit and correctly sized.
@@ -439,6 +565,8 @@ class SimaQatWrapper(GraphModule):
 
         if use_train:
             move_exported_model_to_train(self)
+            if bool(getattr(self, "qat_frozen", torch.tensor([0])).item()):
+                _freeze_batchnorm_stats(self)
             self.training = True
         else:
             move_exported_model_to_eval(self)

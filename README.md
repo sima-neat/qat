@@ -6,7 +6,7 @@ It wraps PyTorch's PT2E quantization flow (`prepare_qat_pt2e` / `convert_pt2e`) 
 quantizer and ONNX exporter, so a standard `nn.Module` can be fine-tuned with fake-quantization and
 exported to an INT8 Q/DQ ONNX graph.
 
-**Supported PyTorch:** 2.3.x through 2.8.x (Python ≥ 3.10).
+**Required PyTorch:** 2.8.x (the provided environment pins 2.8.0; Python ≥ 3.10).
 
 ## Setup
 
@@ -39,7 +39,7 @@ The recommended workflow is **prepare → warm up → freeze → fine-tune → f
 
 ```python
 import torch
-from sima_qat.qat_api import (
+from sima_qat import (
     sima_prepare_qat_model,
     sima_freeze_qat,
     sima_finalize_qat_model,
@@ -82,7 +82,10 @@ accuracy.
 
 [examples/mnist](examples/mnist) and [examples/imagenet](examples/imagenet) are runnable
 PyTorch-Lightning workflows that wire the API into the `on_train_start` (prepare) /
-`on_train_end` (finalize) / `on_fit_end` (export) hooks. Each has the same four scripts:
+`on_train_epoch_start` (freeze) / `on_train_end` (finalize) / `on_fit_end` (export) hooks.
+By default, they freeze the quantization grids at the start of the final epoch, leaving that epoch
+for recovery training. Use `--freeze-epoch N` to select another zero-based epoch, or
+`--freeze-epoch -1` to retain the old finalize-only behavior. Each has the same four scripts:
 `*_lit.py` (the Lightning module holding the QAT calls), `train.py`, `export_onnx.py`, and
 `test_onnx.py`. Run them from inside the example directory; use `--help` for all options.
 
@@ -113,9 +116,19 @@ Pass `--disable-qat` to either `train.py` to train a plain float baseline instea
 pytest
 ```
 
-- `tests/*.py` — fast, synthetic graph-structure unit tests (one QAT op pattern each; no training).
-- `tests/end_to_end/` — full-model QAT runs on CIFAR10 (DenseNet, ResNet50) gated on accuracy. The
-  ResNet50 test trains on a GPU and is **skipped when no CUDA device is available**.
+- `tests/operators/` — matrix-driven coverage for every supported annotation pattern, including
+  shift-grid locking, finalization, and representative ONNX Runtime parity.
+- `tests/qat/` — scale-locking, BatchNorm, recovery-training, checkpoint, and failure regressions.
+- `tests/integration/` — graph-transformation and device-rewrite tests.
+- `tests/end_to_end/` — nightly CIFAR10 accuracy runs for DenseNet and ResNet50. ResNet50 requires
+  CUDA.
+
+Run only the fast/default regression tiers or the nightly model tests with:
+
+```bash
+pytest -m regression tests/operators tests/qat tests/integration
+pytest -m nightly tests/end_to_end
+```
 
 Generated ONNX models are written to `exported_models/` (gitignored).
 
@@ -123,10 +136,10 @@ Generated ONNX models are written to `exported_models/` (gitignored).
 
 ```
 sima_qat/            # the package
-  qat_api.py         # public API: prepare / finalize / export
+  qat_api.py         # public API: prepare / freeze / finalize / export
   sima_quantizer.py  # SiMa PT2E quantizer (annotators, fusion patterns)
   onnx_ops.py        # custom ONNX symbolic functions for Q/DQ ops
 examples/            # MNIST and ImageNet training + export examples
-tests/               # unit tests + end_to_end model tests
+tests/               # operator matrix, QAT lifecycle, integration, and nightly model tests
 setup_env.sh         # one-shot venv + dependency bootstrap
 ```

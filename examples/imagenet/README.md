@@ -34,6 +34,7 @@ The script `train.py` starts the training process, leveraging the `imagenet_lit.
 * QAT User API Usage -
 The user can directly leverage the `imagenet_lit.py` pyTorch lightning module which internally calls the QAT user APIs. 
     - The `on_train_start()` hook calls the `sima_prepare_qat_model()` which any Pytorch nn.Module and prepares it for QAT training. 
+    - The `on_train_epoch_start()` hook calls `sima_freeze_qat()` at the configured freeze epoch. By default this is the start of the final epoch, which provides one recovery epoch with fixed activation and shift-aware weight grids.
     - The `on_train_end()` hook calls the `sima_finalize_qat_model()` which takes a trained QAT model and converts it to a quantized model. It becomes inference-only after this point. 
     - The `on_fit_end()` hook calls the `sima_export_onnx()` which finalized QAT model and exports a ONNX graph for the same.
 
@@ -55,6 +56,7 @@ Below are the descriptions of the arguments:
 | `--samples-limit`       | `1281167`       | Limits the number of training samples used. Useful for testing or debugging with a smaller dataset.                  | `--samples-limit 10000`          |
 | `--export-on-end`       | `False`           | Export the trained model to ONNX format at the end of training.                                                     | `--export-on-end`                 |
 | `--disable-qat`         | `False`           | Disable Quantization Aware Training (QAT), which prepares the model for quantization during training.               | `--disable-qat`                   |
+| `--freeze-epoch`        | final epoch       | Zero-based epoch at which QAT grids are frozen. Use `-1` to retain finalize-only freezing.                          | `--freeze-epoch 8`                |
 | `--resume`              | `False`          | Resume training from the most recent checkpoint if available, allowing for interrupted training sessions to continue. | `--resume`                        |
 
 * Example Usage - 

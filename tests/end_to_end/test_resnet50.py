@@ -50,6 +50,7 @@ from torchvision import transforms
 from torchvision.datasets import CIFAR10
 from torchvision.models import resnet50
 
+pytest.importorskip("pytorch_lightning")
 import pytorch_lightning as L
 from pytorch_lightning.utilities import disable_possible_user_warnings
 
@@ -237,7 +238,7 @@ def _run_resnet50_qat(args: Namespace) -> bool:
         cc.build_dataloaders = orig_build_dataloaders
 
 
-@pytest.mark.regression
+@pytest.mark.nightly
 @pytest.mark.skipif(not torch.cuda.is_available(),
                     reason="ResNet50 full-CIFAR10 QAT run requires a CUDA GPU")
 def test_resnet50():

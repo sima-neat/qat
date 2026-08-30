@@ -86,14 +86,35 @@ class MNIST_Validation(MNIST):
 
 
 
+def _resolve_freeze_epoch(args: Namespace) -> int | None:
+    if args.disable_qat or args.freeze_epoch == -1:
+        return None
+    freeze_epoch = args.freeze_epoch
+    if freeze_epoch is None:
+        freeze_epoch = args.epochs - 1 if args.epochs > 1 else None
+    if freeze_epoch is not None and not 1 <= freeze_epoch < args.epochs:
+        raise ValueError(
+            "--freeze-epoch must be between 1 and epochs-1, or -1 to disable recovery"
+        )
+    return freeze_epoch
+
+
 def run_train(args: Namespace):
     """ Run the training regimen.
     """
+    freeze_epoch = _resolve_freeze_epoch(args)
     if args.resume:
         ckpt = find_latest_file_string(root_path='./checkpoints', tag_str='.ckpt')
-        classifier = MNIST_Trainer.load_from_checkpoint(ckpt)
+        classifier = MNIST_Trainer.load_from_checkpoint(
+            ckpt,
+            freeze_epoch=freeze_epoch,
+        )
     else:
-        classifier = MNIST_Trainer(export_on_end=args.export_on_end, use_qat=(not args.disable_qat))
+        classifier = MNIST_Trainer(
+            export_on_end=args.export_on_end,
+            use_qat=(not args.disable_qat),
+            freeze_epoch=freeze_epoch,
+        )
 
     classifier.to(args.device)
 
@@ -150,6 +171,12 @@ def get_args():
     parser.add_argument('--samples-limit', type=int, default=50000, help='Limit train samples to size N')
     parser.add_argument('--export-on-end', action='store_true', help='Export ONNX model at training end')
     parser.add_argument('--disable-qat', action='store_true', help='Disable QAT mode')
+    parser.add_argument(
+        '--freeze-epoch',
+        type=int,
+        default=None,
+        help='Zero-based epoch for locking QAT grids; defaults to the final epoch, -1 disables recovery',
+    )
     parser.add_argument('--resume', action='store_true', help='Resume training from most recent ckpt')
     all_args = parser.parse_args()
     return all_args
@@ -161,4 +188,3 @@ if __name__ == "__main__":
     run_args = get_args()
 
     run_train(run_args)
-

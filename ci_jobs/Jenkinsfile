@@ -5,7 +5,7 @@ def packageStage () {
   utils.record('pacakge.log') {
     utils.setPythonBuildEnv([]){
       sh """#!/bin/bash -ex
-                  rm -rf build dist swml-qat.egg-info || true
+                  rm -rf build dist sima_qat.egg-info || true
                   python3 setup.py bdist_wheel
               """
       archiveArtifacts artifacts: "dist/*.whl", fingerprint: true
