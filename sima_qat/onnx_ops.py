@@ -74,9 +74,13 @@ def fake_quantize_per_tensor_affine(
 ):
     # NOTE: (0, 127) is allowed as special case. PyTorch restricts activations to be in the range (0, 127).
     #   https://github.com/pytorch/pytorch/blob/b34b192d6b97325c9f78e5995c48c8498ede34bd/torch/ao/quantization/observer.py#L1422
-    if (quant_min, quant_max) not in [(0, 255), (-128, 127), (0, 127)]:
+    # ONNX carries the storage dtype, scale, and zero point but not an
+    # explicit used-code subrange.  Symmetric SiMa weights intentionally leave
+    # INT8 code -128 unused, so [-127, 127] is represented by the same signed
+    # QuantizeLinear type and remains clipped by the trained PyTorch graph.
+    if (quant_min, quant_max) not in [(0, 255), (-128, 127), (-127, 127), (0, 127)]:
         raise errors.SymbolicValueError(
-            "For (quant_min, quant_max), ONNX allows only (0, 127), (0, 255) and (-128, 127). "
+            "Unsupported ONNX quantization code range. "
             f"Got ({quant_min}, {quant_max})",
             inputs,
         )

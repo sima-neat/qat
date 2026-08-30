@@ -1035,11 +1035,8 @@ def _sima_annotate_embedding(
     base_weight_qspec = get_weight_qspec(quantization_config)
     table_qspec = QuantizationSpec(
         dtype=base_weight_qspec.dtype,
-        # ONNX Q/DQ supports the complete signed INT8 code domain.  The
-        # generic symmetric weight policy uses [-127, 127], which cannot be
-        # represented by QuantizeLinear's INT8 type contract.
-        quant_min=-128,
-        quant_max=127,
+        quant_min=base_weight_qspec.quant_min,
+        quant_max=base_weight_qspec.quant_max,
         qscheme=torch.per_tensor_symmetric,
         is_dynamic=False,
         observer_or_fake_quant_ctr=FakeQuantize.with_args(
