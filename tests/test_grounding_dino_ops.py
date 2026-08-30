@@ -34,6 +34,59 @@ class TinyAttention(torch.nn.Module):
         return torch.bmm(probability, value)
 
 
+class TinyPatchMerge(torch.nn.Module):
+    def forward(self, value):
+        top_left = value[:, 0::2, 0::2, :]
+        bottom_left = value[:, 1::2, 0::2, :]
+        top_right = value[:, 0::2, 1::2, :]
+        bottom_right = value[:, 1::2, 1::2, :]
+        return torch.cat(
+            (top_left, bottom_left, top_right, bottom_right), dim=-1
+        )
+
+
+@pytest.mark.regression
+def test_slice_concat_layout_tree_reuses_one_activation_grid():
+    value = torch.randn(1, 8, 8, 4)
+    prepared = sima_prepare_qat_model(
+        TinyPatchMerge(),
+        (value,),
+        "cpu",
+        full_range_ste=True,
+        learn_scales=True,
+    )
+    prepared(value)
+    cat = next(
+        node
+        for node in prepared.graph.nodes
+        if node.op == "call_function" and node.target == torch.ops.aten.cat.default
+    )
+    cat_inputs = list(cat.args[0])
+    input_fake_quants = [
+        prepared.get_submodule(node.target)
+        for node in cat_inputs
+        if node.op == "call_module"
+    ]
+    assert len(input_fake_quants) == 4
+    output_fake_quant_nodes = [
+        node
+        for node in cat.users
+        if node.op == "call_module"
+        and isinstance(
+            prepared.get_submodule(node.target),
+            torch.ao.quantization.FakeQuantizeBase,
+        )
+    ]
+    assert len(output_fake_quant_nodes) == 1
+    output_fake_quant = prepared.get_submodule(output_fake_quant_nodes[0].target)
+    shared = input_fake_quants + [output_fake_quant]
+    assert all(module.scale.data_ptr() == shared[0].scale.data_ptr() for module in shared)
+    assert all(
+        module.zero_point.data_ptr() == shared[0].zero_point.data_ptr()
+        for module in shared
+    )
+
+
 @pytest.mark.regression
 def test_attention_probability_domain_is_tagged_and_numerically_reported():
     query = torch.randn(1, 4, 8)

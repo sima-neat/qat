@@ -1863,6 +1863,48 @@ def _sima_annotate_cat(
         input_act_qspec = get_input_act_qspec(quantization_config)
         inputs = cat_node.args[0]
 
+        # A split/slice/view tree which is concatenated again is an integer
+        # layout transform, not a set of new numerical domains.  Grounding
+        # DINO's Swin PatchMerging is the canonical example: four strided
+        # slices of one feature map are concatenated along channels. Giving
+        # every slice an independently observed grid introduces four lossy
+        # requantizations before the following LayerNorm. Trace only exact
+        # unary layout operations and share the original producer's grid when
+        # every Cat payload has the same origin.
+        layout_targets = {
+            torch.ops.aten.slice.Tensor,
+            torch.ops.aten.select.int,
+            torch.ops.aten.unsqueeze.default,
+            torch.ops.aten.squeeze.dim,
+            torch.ops.aten.view.default,
+            torch.ops.aten.reshape.default,
+            torch.ops.aten.transpose.int,
+            torch.ops.aten.permute.default,
+            torch.ops.aten.clone.default,
+            torch.ops.aten.contiguous.default,
+        }
+
+        def layout_origin(value: Node) -> Node:
+            visited = set()
+            while (
+                value not in visited
+                and value.op == "call_function"
+                and value.target in layout_targets
+                and value.args
+                and isinstance(value.args[0], Node)
+            ):
+                visited.add(value)
+                value = value.args[0]
+            return value
+
+        common_layout_origin = None
+        common_layout_reference = None
+        if inputs and all(isinstance(value, Node) for value in inputs):
+            origins = [layout_origin(value) for value in inputs]
+            if all(origin is origins[0] for origin in origins):
+                common_layout_origin = origins[0]
+                common_layout_reference = inputs[0]
+
         # An inclusive tree scan shifts a tensor with an exact identity prefix:
         #   cat((zeros_like(x[:k]), x[:-k]))
         #   cat((ones_like(x[:k]),  x[:-k]))
@@ -1912,12 +1954,49 @@ def _sima_annotate_cat(
             # Einsum result, so make it a concrete root before sharing.
             ensure_concrete_output_qspec(inputs[0])
 
+        if common_layout_origin is not None:
+            # PT2E requires a concrete edge/node in its annotation catalogue as
+            # the union-find root. The distant common origin can already be a
+            # shared edge owned by another partition, so use the first Cat
+            # payload as this local class's concrete root.
+            root_annotation = common_layout_reference.meta.get(
+                "quantization_annotation"
+            )
+            if root_annotation is None:
+                root_annotation = QuantizationAnnotation()
+                common_layout_reference.meta[
+                    "quantization_annotation"
+                ] = root_annotation
+            root_annotation.output_qspec = input_act_qspec
+            root_annotation._annotated = True
+            shared_layout_qspec = SharedQuantizationSpec(common_layout_reference)
+            # Some unary layout nodes may already carry a propagated output
+            # annotation. Override that output with the proven common grid;
+            # retaining the old independent qspec would defeat the sharing at
+            # the Cat boundary.
+            for input_act in inputs:
+                if input_act is common_layout_reference:
+                    continue
+                annotation = input_act.meta.get("quantization_annotation")
+                if annotation is None:
+                    annotation = QuantizationAnnotation()
+                    input_act.meta["quantization_annotation"] = annotation
+                annotation.output_qspec = shared_layout_qspec
+                annotation._annotated = True
+
         input_qspec_map = {}
         for input_act in inputs:
-            if _is_annotated([input_act]):
+            if (
+                common_layout_reference is not None
+                and input_act is common_layout_reference
+            ):
+                continue
+            if _is_annotated([input_act]) and common_layout_origin is None:
                 continue
             input_qspec_map[input_act] = (
-                SharedQuantizationSpec(identity_padding_reference)
+                SharedQuantizationSpec(common_layout_reference)
+                if common_layout_origin is not None
+                else SharedQuantizationSpec(identity_padding_reference)
                 if identity_padding_concat
                 and input_act is not identity_padding_reference
                 else input_act_qspec
@@ -1927,7 +2006,9 @@ def _sima_annotate_cat(
         # layout/public-ABI operation.  Sharing its output grid with that
         # tensor makes QAT and export model the exact integer-code repeat,
         # rather than learning a gratuitous terminal requantization.
-        if identity_padding_concat:
+        if common_layout_origin is not None:
+            output_act_qspec = SharedQuantizationSpec(common_layout_reference)
+        elif identity_padding_concat:
             output_act_qspec = SharedQuantizationSpec(identity_padding_reference)
         elif repeated_input_concat:
             output_act_qspec = SharedQuantizationSpec(inputs[0])
