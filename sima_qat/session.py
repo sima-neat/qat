@@ -30,6 +30,8 @@ from torch.ao.quantization import disable_fake_quant, enable_fake_quant, enable_
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
 
 from sima_qat.qat_api import (
+    _MAX_REQUANT_SHIFT,
+    _MIN_REQUANT_SHIFT,
     _SHIFT_AWARE_OPS,
     _fake_quant_module,
     _find_output_fake_quant,
@@ -74,6 +76,8 @@ class QATRecipe:
     minimum_calibration_batches: int = 1
     calibration_window_batches: int = 0
     require_shift_tier_stability: bool = False
+    maximum_calibration_p99_scale_ratio: float = 1.10
+    maximum_calibration_scale_ratio_over_1_25_fraction: float = 0.01
 
     def __post_init__(self) -> None:
         if self.activation_observer not in {"moving_average", "minmax", "histogram"}:
@@ -118,6 +122,24 @@ class QATRecipe:
         ):
             raise ValueError(
                 "require_shift_tier_stability needs calibration_window_batches > 0"
+            )
+        if (
+            not math.isfinite(self.maximum_calibration_p99_scale_ratio)
+            or self.maximum_calibration_p99_scale_ratio < 1.0
+        ):
+            raise ValueError(
+                "maximum_calibration_p99_scale_ratio must be finite and >= 1"
+            )
+        if (
+            not math.isfinite(
+                self.maximum_calibration_scale_ratio_over_1_25_fraction
+            )
+            or not 0.0
+            <= self.maximum_calibration_scale_ratio_over_1_25_fraction
+            <= 1.0
+        ):
+            raise ValueError(
+                "maximum_calibration_scale_ratio_over_1_25_fraction must be in [0, 1]"
             )
 
 
@@ -772,6 +794,26 @@ class QATSession(nn.Module):
                     f"{last_tier_changes} weighted operator shift tier(s) changed "
                     "in the last calibration window"
                 )
+            elif windows:
+                last_window = windows[-1]
+                if (
+                    last_window["p99_scale_ratio"]
+                    > self.recipe.maximum_calibration_p99_scale_ratio
+                ):
+                    issues.append(
+                        "activation-grid p99 scale ratio changed by "
+                        f"{last_window['p99_scale_ratio']:.6g} in the last "
+                        "calibration window"
+                    )
+                if (
+                    last_window["scale_ratio_over_1_25_fraction"]
+                    > self.recipe.maximum_calibration_scale_ratio_over_1_25_fraction
+                ):
+                    issues.append(
+                        "too many activation grids changed by more than 25% in "
+                        "the last calibration window: "
+                        f"{last_window['scale_ratio_over_1_25_fraction']:.6g}"
+                    )
 
         sample_ids = tuple(self._calibration_sample_ids)
         sample_digest = None
@@ -1097,6 +1139,29 @@ def _sample_ids_from_batch(batch: Any) -> list[str]:
     return [str(value)]
 
 
+def _shift_tier_signature(minimum_ratio: Tensor) -> dict[str, Any]:
+    """Digest the exact per-channel compiler right-shift selection."""
+
+    if minimum_ratio.ndim != 1 or minimum_ratio.numel() == 0:
+        raise ValueError("minimum_ratio must be a non-empty channel vector")
+    if not bool(torch.isfinite(minimum_ratio).all()) or bool(
+        (minimum_ratio <= 0).any()
+    ):
+        raise ValueError("minimum_ratio values must be finite and positive")
+    if bool((minimum_ratio > 1.0).any()):
+        raise ValueError("minimum_ratio must be retargeted to <= 1 before shifts")
+    shifts = torch.floor(-torch.log2(minimum_ratio)).clamp(
+        _MIN_REQUANT_SHIFT, _MAX_REQUANT_SHIFT
+    ).to(torch.int16)
+    shift_bytes = shifts.contiguous().cpu().numpy().tobytes()
+    return {
+        "minimum_shift": int(shifts.min()),
+        "maximum_shift": int(shifts.max()),
+        "channel_count": shifts.numel(),
+        "channel_shift_sha256": hashlib.sha256(shift_bytes).hexdigest(),
+    }
+
+
 def _calibration_snapshot(model: nn.Module, batch: int) -> dict[str, Any]:
     """Snapshot activation grids and the implied compiler right-shift tiers."""
 
@@ -1113,8 +1178,9 @@ def _calibration_snapshot(model: nn.Module, batch: int) -> dict[str, Any]:
             activation_scales[name] = scalar
             name_by_module_id[id(module)] = name
 
-    shift_tiers: dict[str, int] = {}
+    shift_tiers: dict[str, Mapping[str, Any]] = {}
     if hasattr(model, "graph"):
+        contracts = []
         for node in model.graph.nodes:
             if node.op != "call_function" or node.target not in _SHIFT_AWARE_OPS:
                 continue
@@ -1145,13 +1211,62 @@ def _calibration_snapshot(model: nn.Module, batch: int) -> dict[str, Any]:
                 / 127.0,
                 min=minimum_weight_scale,
             )
-            maximum_ratio = float(
-                ((input_scale / output_scale) * required_scale).max()
+            contracts.append(
+                {
+                    "name": node.name,
+                    "input_id": id(input_fq),
+                    "output_id": id(output_fq),
+                    "input_scale": input_scale,
+                    "output_scale": output_scale,
+                    "required_scale": required_scale,
+                }
             )
-            shift_tiers[node.name] = (
-                max(0, math.ceil(math.log2(maximum_ratio)))
-                if maximum_ratio > 1.0 else 0
+
+        # Mirror sima_freeze_qat's graph-wide output-grid retargeting. A
+        # coarsened output can itself feed another weighted operator, so solve
+        # the shared activation-domain exponents to a fixed point before
+        # deriving any channel shifts.
+        grid_exponents: dict[int, int] = {}
+        for contract in contracts:
+            grid_exponents.setdefault(contract["input_id"], 0)
+            grid_exponents.setdefault(contract["output_id"], 0)
+        for _ in range(max(1, len(contracts) + 1)):
+            changed = False
+            for contract in contracts:
+                sx = contract["input_scale"] * (
+                    2.0 ** grid_exponents[contract["input_id"]]
+                )
+                sy = contract["output_scale"] * (
+                    2.0 ** grid_exponents[contract["output_id"]]
+                )
+                maximum_ratio = float(
+                    ((sx / sy) * contract["required_scale"]).max()
+                )
+                if maximum_ratio <= 1.0:
+                    continue
+                exponent = max(1, math.ceil(math.log2(maximum_ratio)))
+                grid_exponents[contract["output_id"]] += exponent
+                changed = True
+            if not changed:
+                break
+        else:
+            raise RuntimeError(
+                "Calibration shift-tier solver did not converge"
             )
+
+        for contract in contracts:
+            sx = contract["input_scale"] * (
+                2.0 ** grid_exponents[contract["input_id"]]
+            )
+            sy = contract["output_scale"] * (
+                2.0 ** grid_exponents[contract["output_id"]]
+            )
+            minimum_ratio = (sx / sy) * contract["required_scale"]
+            shift_tiers[contract["name"]] = {
+                "input_grid_exponent": grid_exponents[contract["input_id"]],
+                "output_grid_exponent": grid_exponents[contract["output_id"]],
+                **_shift_tier_signature(minimum_ratio),
+            }
     return {
         "batch": batch,
         "activation_scales": activation_scales,

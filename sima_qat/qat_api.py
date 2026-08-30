@@ -160,12 +160,165 @@ def sima_prepare_qat_model(
     )
     quantizer = SimaQuantizer().set_global(cfg)
     gm = prepare_qat_pt2e(m, quantizer)
+    _tag_qat_target_domains(gm)
     sima_mod = SimaQatWrapper(source=gm, label='scaffold', shift_aware=shift_aware)
     sima_mod.to(device)
     sima_mod.train()
     sima_mod = check_graph_nodes(sima_mod, device)
 
     return sima_mod
+
+
+def _tag_qat_target_domains(model: GraphModule) -> None:
+    """Bind each activation fake quantizer to its target arithmetic domain.
+
+    These non-persistent tags let training policies and diagnostics distinguish
+    an attention probability grid from an ordinary layer output without model-
+    name matching. The ONNX graph remains unchanged.
+    """
+
+    softmax_targets = {
+        torch.ops.aten._softmax.default,
+        torch.ops.aten.softmax.int,
+    }
+    tags = {}
+    for node in model.graph.nodes:
+        fake_quant = _fake_quant_module(model, node)
+        if fake_quant is None or not node.args or not hasattr(node.args[0], "target"):
+            continue
+        source = node.args[0]
+        kind = "activation"
+        if source.op == "call_function" and source.target in softmax_targets:
+            kind = "attention_probability"
+        elif (
+            source.op == "call_function"
+            and source.target == torch.ops.aten.grid_sampler.default
+        ):
+            kind = "deformable_sample"
+        elif (
+            source.op == "call_function"
+            and source.target == torch.ops.aten.layer_norm.default
+        ):
+            kind = "normalization_output"
+        elif (
+            source.op == "call_function"
+            and source.target in {
+                torch.ops.aten.bmm.default,
+                torch.ops.aten.matmul.default,
+                torch.ops.aten.mm.default,
+            }
+        ):
+            kind = "activation_matmul_output"
+        fake_quant.sima_domain_kind = kind
+        fake_quant.sima_source_node = source.name
+        tags[node.target] = {"kind": kind, "source": source.name}
+
+    # GridSample coordinates have a fixed signed INT8 geometry contract. Their
+    # raw Q/DQ error can look enormous because all out-of-bounds coordinates
+    # collapse to the same representable rail, while the paired validity mask
+    # still makes those samples exactly zero. Tag the coordinate boundary
+    # explicitly so diagnostics do not confuse it with feature degradation.
+    for node in model.graph.nodes:
+        if (
+            node.op != "call_function"
+            or node.target != torch.ops.aten.grid_sampler.default
+            or len(node.args) < 2
+        ):
+            continue
+        coordinate_node = node.args[1]
+        fake_quant = _fake_quant_module(model, coordinate_node)
+        if fake_quant is None:
+            continue
+        source = coordinate_node.args[0] if coordinate_node.args else coordinate_node
+        fake_quant.sima_domain_kind = "deformable_grid"
+        fake_quant.sima_source_node = getattr(source, "name", "")
+        tags[coordinate_node.target] = {
+            "kind": "deformable_grid",
+            "source": fake_quant.sima_source_node,
+        }
+    model.meta["sima_qat_target_domains"] = tags
+
+
+def sima_qat_activation_diagnostics(
+    qat_model: GraphModule,
+    inputs: Tuple[Any, ...],
+) -> List[Dict[str, Any]]:
+    """Measure strict fake-quant error at every activation boundary.
+
+    The report is a one-forward diagnostic, not calibration. It records the
+    quantities that determine whether an A8 domain can represent its signal:
+    RMS, RMSE, SQNR, step/RMS, saturation, and zero-code fraction.
+    """
+
+    if not isinstance(qat_model, GraphModule):
+        raise TypeError("qat_model must be a GraphModule")
+    rows: List[Dict[str, Any]] = []
+    handles = []
+
+    def register(name: str, fake_quant: FakeQuantizeBase) -> None:
+        def hook(_module, args, output):
+            if not args or not isinstance(args[0], Tensor) or not isinstance(output, Tensor):
+                return
+            value = args[0].detach()
+            quantized = output.detach()
+            if not value.is_floating_point() or value.numel() == 0:
+                return
+            scale = fake_quant.scale.detach().reshape(-1)
+            zero_point = fake_quant.zero_point.detach().reshape(-1)
+            if scale.numel() != 1 or zero_point.numel() != 1:
+                return
+            scalar_scale = scale[0].to(device=value.device, dtype=value.dtype)
+            scalar_zp = zero_point[0].to(device=value.device, dtype=value.dtype)
+            code = torch.round(quantized / scalar_scale + scalar_zp)
+            rms = value.float().square().mean().sqrt()
+            rmse = (quantized.float() - value.float()).square().mean().sqrt()
+            rms_value = float(rms.cpu())
+            rmse_value = float(rmse.cpu())
+            relative = rmse_value / max(rms_value, 1e-30)
+            rows.append(
+                {
+                    "name": name,
+                    "domain_kind": getattr(fake_quant, "sima_domain_kind", "activation"),
+                    "source_node": getattr(fake_quant, "sima_source_node", ""),
+                    "scale": float(scale[0].cpu()),
+                    "zero_point": int(zero_point[0].cpu()),
+                    "rms": rms_value,
+                    "rmse": rmse_value,
+                    "relative_rmse": relative,
+                    "sqnr_db": (
+                        float("inf") if rmse_value == 0.0
+                        else 20.0 * math.log10(max(rms_value, 1e-30) / rmse_value)
+                    ),
+                    "step_over_rms": float(scale[0].cpu()) / max(rms_value, 1e-30),
+                    "saturation_fraction": float(
+                        ((code <= fake_quant.quant_min) | (code >= fake_quant.quant_max))
+                        .float().mean().cpu()
+                    ),
+                    "zero_code_fraction": float((code == scalar_zp).float().mean().cpu()),
+                    "elements": value.numel(),
+                }
+            )
+
+        handles.append(fake_quant.register_forward_hook(hook))
+
+    for name, module in qat_model.named_modules():
+        if (
+            isinstance(module, FakeQuantizeBase)
+            and module.qscheme
+            not in (torch.per_channel_affine, torch.per_channel_symmetric)
+        ):
+            register(name, module)
+    was_training = qat_model.training
+    qat_model.eval()
+    try:
+        with torch.no_grad():
+            qat_model(*inputs)
+    finally:
+        for handle in handles:
+            handle.remove()
+        qat_model.train(was_training)
+    rows.sort(key=lambda row: row["relative_rmse"], reverse=True)
+    return rows
 
 
 _SHIFT_AWARE_OPS = {

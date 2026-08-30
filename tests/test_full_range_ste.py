@@ -2,7 +2,7 @@ import torch
 from torch.ao.quantization.observer import MinMaxObserver
 
 from sima_qat.qat_api import sima_prepare_qat_model
-from sima_qat.sima_quantizer import FullRangeSTEFakeQuantize
+from sima_qat.sima_quantizer import FullRangeSTEFakeQuantize, _LearnedScaleSTE
 
 
 class TinyConv(torch.nn.Module):
@@ -154,6 +154,43 @@ def test_learned_scale_gradient_tracks_quantization_strength():
         gradients.append(fake_quant.log_scale.grad.detach().clone())
 
     torch.testing.assert_close(gradients[1], 0.25 * gradients[0])
+
+
+def test_learned_scale_saturation_gradient_is_bounded_by_int8_rail():
+    value = torch.tensor([-1000.0, 0.6, 1000.0])
+    scale = torch.tensor([2.0], requires_grad=True)
+    zero_point = torch.tensor([0.0])
+    output = _LearnedScaleSTE.apply(
+        value, scale, zero_point, -128, 127, 1.0, 1.0
+    )
+    output.sum().backward()
+
+    # LSQ: lower rail + in-range rounding error + upper rail.
+    expected = -128.0 + (round(0.6 / 2.0) - 0.6 / 2.0) + 127.0
+    torch.testing.assert_close(scale.grad, torch.tensor([expected]))
+
+
+def test_frozen_learned_scale_uses_memory_bounded_full_range_ste(monkeypatch):
+    fake_quant = FullRangeSTEFakeQuantize(
+        observer=MinMaxObserver,
+        quant_min=-128,
+        quant_max=127,
+        dtype=torch.int8,
+        qscheme=torch.per_tensor_affine,
+        learn_scale=True,
+    )
+    seed = torch.tensor([-1.3, -0.1, 0.2, 1.7])
+    fake_quant(seed)
+    torch.ao.quantization.disable_observer(fake_quant)
+    fake_quant.log_scale.requires_grad_(False)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("frozen scale entered elementwise LSQ path")
+
+    monkeypatch.setattr(_LearnedScaleSTE, "apply", forbidden)
+    value = seed.clone().requires_grad_(True)
+    fake_quant(value).sum().backward()
+    torch.testing.assert_close(value.grad, torch.ones_like(value))
 
 
 def test_target_code_noise_is_opt_in_and_stays_on_int8_grid(monkeypatch):

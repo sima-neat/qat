@@ -163,16 +163,30 @@ class _LearnedScaleSTE(torch.autograd.Function):
     ) -> Tensor:
         detached_scale = scale.detach()
         detached_zero_point = zero_point.detach().to(value.dtype)
-        code = torch.round(
-            value.detach() / detached_scale + detached_zero_point
-        ).clamp(quant_min, quant_max)
+        normalized = value.detach() / detached_scale + detached_zero_point
+        code = torch.round(normalized).clamp(quant_min, quant_max)
         dequantized = (code - detached_zero_point) * detached_scale
         # The LSQ error is the only activation-dependent value needed for the
         # scalar scale gradient.  Saving it in FP16 is substantially smaller
         # than retaining the FP32 activation (or both activation and code) at
         # every boundary; the reduction is accumulated in FP32 in backward.
-        scale_error = (
-            code - detached_zero_point - value.detach() / detached_scale
+        # LSQ's scale surrogate is piecewise. Inside the representable range,
+        # dQ/ds = round(x/s + z) - (x/s + z). At either saturation rail it is
+        # the *rail code relative to zero*, not that expression continued past
+        # the rail. Continuing ``q - x/s`` outside the range makes a single
+        # outlier contribute an unbounded, wrong-sign scale gradient.
+        scale_error = torch.where(
+            normalized < quant_min,
+            torch.as_tensor(
+                quant_min, device=value.device, dtype=value.dtype
+            ) - detached_zero_point,
+            torch.where(
+                normalized > quant_max,
+                torch.as_tensor(
+                    quant_max, device=value.device, dtype=value.dtype
+                ) - detached_zero_point,
+                code - normalized,
+            ),
         ).to(torch.float16)
         ctx.save_for_backward(scale_error)
         ctx.grad_factor = grad_factor
@@ -388,24 +402,31 @@ class FullRangeSTEFakeQuantize(FakeQuantize):
             scale = self.log_scale.exp().clamp_min(1e-12)
             with torch.no_grad():
                 self.scale.copy_(scale.detach())
-            zero_point = self.zero_point.to(x.dtype)
-            grad_factor = 1.0 / math.sqrt(max(1, x.numel()) * max(1, self.quant_max))
-            quantized = _LearnedScaleSTE.apply(
-                x,
-                scale,
-                zero_point,
-                self.activation_post_process.quant_min,
-                self.activation_post_process.quant_max,
-                self.quant_strength,
-                grad_factor,
-            )
-            quantized = self._apply_target_code_noise(quantized)
-            # _LearnedScaleSTE already supplies the identity input gradient.
-            # Do not detach here: the mask must also gate the learned-scale
-            # gradient for the elements whose quantization was bypassed.
-            return self._apply_quantization_dropout(
-                x, quantized, detach_residual=False
-            )
+            if self.log_scale.requires_grad:
+                zero_point = self.zero_point.to(x.dtype)
+                grad_factor = 1.0 / math.sqrt(
+                    max(1, x.numel()) * max(1, self.quant_max)
+                )
+                quantized = _LearnedScaleSTE.apply(
+                    x,
+                    scale,
+                    zero_point,
+                    self.activation_post_process.quant_min,
+                    self.activation_post_process.quant_max,
+                    self.quant_strength,
+                    grad_factor,
+                )
+                quantized = self._apply_target_code_noise(quantized)
+                # _LearnedScaleSTE already supplies the identity input
+                # gradient. Do not detach here: the mask must also gate the
+                # learned-scale gradient for bypassed elements.
+                return self._apply_quantization_dropout(
+                    x, quantized, detach_residual=False
+                )
+            # A frozen log_scale does not need LSQ's elementwise saved tensor.
+            # Fall through to the ordinary full-range STE using the exact same
+            # live scale. This cuts activation memory from O(all QAT boundary
+            # elements) to O(only boundaries whose scale is trainable).
         if self.is_per_channel:
             quantized = torch.fake_quantize_per_channel_affine(
                 x, self.scale, self.zero_point, self.ch_axis,

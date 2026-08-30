@@ -9,7 +9,7 @@ import torch
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
 
 import sima_qat
-from sima_qat.session import QATRecipe, load_recipe
+from sima_qat.session import QATRecipe, _shift_tier_signature, load_recipe
 
 
 class TinyRegressor(torch.nn.Module):
@@ -38,6 +38,18 @@ def test_simple_session_api_is_exported():
     assert callable(sima_qat.prepare)
     assert callable(sima_qat.load_recipe)
     assert issubclass(sima_qat.QATSession, torch.nn.Module)
+
+
+@pytest.mark.regression
+def test_shift_tier_signature_matches_compiler_floor_log2_contract():
+    first = _shift_tier_signature(torch.tensor([0.13, 0.5], dtype=torch.float64))
+    second = _shift_tier_signature(torch.tensor([0.12, 0.5], dtype=torch.float64))
+
+    assert first["minimum_shift"] == 1
+    assert first["maximum_shift"] == 2
+    assert second["minimum_shift"] == 1
+    assert second["maximum_shift"] == 3
+    assert first["channel_shift_sha256"] != second["channel_shift_sha256"]
 
 
 @pytest.mark.regression
