@@ -61,6 +61,16 @@ class SlicedReshapedGroupedWeightModel(torch.nn.Module):
         )
 
 
+class ConvBatchNormModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, 4, 3, padding=1, bias=False)
+        self.bn = torch.nn.BatchNorm2d(4)
+
+    def forward(self, x):
+        return self.bn(self.conv(x))
+
+
 def _weight_fake_quantizers(model):
     return [
         module
@@ -101,6 +111,60 @@ def test_shift_aware_freeze_resolves_static_weight_slice_and_reshape():
     sima_freeze_qat(model)
     assert bool(model.qat_frozen.item())
     assert len(_weight_fake_quantizers(model)) == 2
+
+
+@pytest.mark.regression
+def test_shift_aware_freeze_resolves_static_conv_batchnorm_weight_expression():
+    inputs = torch.randn(2, 3, 8, 8)
+    eager = ConvBatchNormModel().eval()
+    model = sima_prepare_qat_model(eager, (inputs,), "cpu")
+    model(inputs)
+    assert any(
+        node.op == "call_function"
+        and node.target == torch.ops.aten.conv2d.default
+        and getattr(node.args[1].args[0], "op", None) == "call_function"
+        for node in model.graph.nodes
+    )
+    sima_freeze_qat(model)
+    assert bool(model.qat_frozen.item())
+
+
+@pytest.mark.regression
+def test_freeze_coarsens_infeasible_output_activation_grid_by_power_of_two():
+    inputs = torch.randn(2, 3, 8, 8)
+    model = sima_prepare_qat_model(TinyClassifier(), (inputs,), "cpu")
+    model(inputs)
+    first_conv = next(
+        node
+        for node in model.graph.nodes
+        if node.op == "call_function" and node.target in _SHIFT_AWARE_OPS
+    )
+    output_fq = _find_output_fake_quant(model, first_conv)
+    input_fq = _fake_quant_module(model, first_conv.args[0])
+    assert input_fq is not None and output_fq is not None
+    input_observer = input_fq.activation_post_process
+    input_observer.min_val.fill_(-1000.0)
+    input_observer.max_val.fill_(1000.0)
+    observer = output_fq.activation_post_process
+    observer.min_val.fill_(-1e-6)
+    observer.max_val.fill_(1e-6)
+    old_scale = float(observer.calculate_qparams()[0])
+
+    sima_freeze_qat(model)
+
+    assert float(output_fq.scale) > old_scale
+    persisted_scale, persisted_zero_point = observer.calculate_qparams()
+    torch.testing.assert_close(output_fq.scale, persisted_scale, rtol=0, atol=0)
+    torch.testing.assert_close(
+        output_fq.zero_point, persisted_zero_point, rtol=0, atol=0
+    )
+    retargets = model.meta["qat_activation_retargets"]
+    assert retargets
+    assert all(
+        row["power_of_two_multiplier"] >= 2
+        and row["power_of_two_multiplier"].bit_count() == 1
+        for row in retargets
+    )
 
 
 @pytest.mark.regression

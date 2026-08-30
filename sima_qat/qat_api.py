@@ -27,10 +27,12 @@
 # SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 #**************************************************************************
+import copy
 import math
+import operator
 import warnings
 from collections import OrderedDict
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 from packaging import version
@@ -39,7 +41,7 @@ if (version.parse(torch.__version__) < version.parse("2.3.0") or
     version.parse(torch.__version__) >= version.parse("2.9.0")):
     raise RuntimeError(f"Sima QAT only supports torch version 2.3.x through 2.8.x, found {torch.__version__}")
 
-from torch import optim, nn, utils, Tensor
+from torch import nn, Tensor
 
 try:
     # torch <= 2.4: pre-autograd capture lives here.
@@ -173,6 +175,11 @@ _SHIFT_AWARE_OPS = {
 }
 _MIN_REQUANT_SHIFT = 0
 _MAX_REQUANT_SHIFT = 31
+# Keep the shift solver on the same representable scale domain as the weight
+# observers. Conversion recalculates qparams from those observers, so a solver
+# value below their epsilon would be silently clamped and would destroy the
+# power-of-two ratio.
+_MIN_WEIGHT_QUANT_SCALE = torch.finfo(torch.float32).eps
 
 
 def _resolve_attr(module: nn.Module, target: str) -> Any:
@@ -180,6 +187,74 @@ def _resolve_attr(module: nn.Module, target: str) -> Any:
     for atom in target.split("."):
         value = getattr(value, atom)
     return value
+
+
+_STATIC_WEIGHT_VALUE_OPS = {
+    operator.getitem,
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.cat.default,
+    torch.ops.aten.clone.default,
+    torch.ops.aten.detach.default,
+    torch.ops.aten.div.Tensor,
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.neg.default,
+    torch.ops.aten.permute.default,
+    torch.ops.aten.reshape.default,
+    torch.ops.aten.rsqrt.default,
+    torch.ops.aten.select.int,
+    torch.ops.aten.slice.Tensor,
+    torch.ops.aten.sqrt.default,
+    torch.ops.aten.squeeze.dim,
+    torch.ops.aten.stack.default,
+    torch.ops.aten.sub.Tensor,
+    torch.ops.aten.t.default,
+    torch.ops.aten.transpose.int,
+    torch.ops.aten.unsqueeze.default,
+    torch.ops.aten.view.default,
+    torch.ops.aten._to_copy.default,
+    torch.ops.aten._unsafe_view.default,
+}
+
+
+def _resolve_static_value(module: nn.Module, value: Any) -> Any:
+    """Evaluate a closed, compile-time-only FX value expression.
+
+    PT2E QAT rewrites Conv-BatchNorm into a Conv whose weight is expressed as
+    ``weight * reshape(bn_weight / sqrt(running_var + eps))``.  It remains a
+    static weight even though it is no longer a direct ``get_attr`` node.  The
+    shift-aware solver must follow that expression rather than rejecting every
+    Conv-BN layer as dynamic.  Only explicitly allowlisted tensor views and
+    arithmetic are evaluated; placeholders and arbitrary callables fail
+    closed.
+    """
+
+    if isinstance(value, tuple):
+        return tuple(_resolve_static_value(module, item) for item in value)
+    if isinstance(value, list):
+        return [_resolve_static_value(module, item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _resolve_static_value(module, item)
+            for key, item in value.items()
+        }
+    if not hasattr(value, "op"):
+        return value
+    if value.op == "get_attr":
+        resolved = _resolve_attr(module, value.target)
+        if not isinstance(resolved, (Tensor, int, float, bool)):
+            raise RuntimeError(
+                f"Static attribute {value.target!r} has unsupported type {type(resolved)}"
+            )
+        return resolved
+    if value.op != "call_function" or value.target not in _STATIC_WEIGHT_VALUE_OPS:
+        raise RuntimeError(
+            "Static weight expression contains unsupported node "
+            f"{getattr(value, 'op', None)} {getattr(value, 'target', None)}"
+        )
+    args = _resolve_static_value(module, value.args)
+    kwargs = _resolve_static_value(module, value.kwargs)
+    with torch.no_grad():
+        return value.target(*args, **kwargs)
 
 
 def _resolve_static_weight(module: nn.Module, node: Any) -> Tensor:
@@ -190,39 +265,13 @@ def _resolve_static_weight(module: nn.Module, node: Any) -> Tensor:
     not make the tensor dynamic and must not exclude that layer from
     shift-aware QAT.
     """
-    if getattr(node, "op", None) == "get_attr":
-        value = _resolve_attr(module, node.target)
-        if not isinstance(value, Tensor):
-            raise RuntimeError(f"Static weight {node.target!r} is not a Tensor")
-        return value
-    if (
-        getattr(node, "op", None) == "call_function"
-        and node.target in {
-            torch.ops.aten.reshape.default,
-            torch.ops.aten.view.default,
-            torch.ops.aten._unsafe_view.default,
-        }
-        and len(node.args) >= 2
-    ):
-        source = _resolve_static_weight(module, node.args[0])
-        shape = tuple(int(value) for value in node.args[1])
-        return source.reshape(shape)
-    if (
-        getattr(node, "op", None) == "call_function"
-        and node.target == torch.ops.aten.slice.Tensor
-        and len(node.args) >= 1
-    ):
-        source = _resolve_static_weight(module, node.args[0])
-        dim = int(node.args[1]) if len(node.args) > 1 else 0
-        start = node.args[2] if len(node.args) > 2 else None
-        end = node.args[3] if len(node.args) > 3 else None
-        step = int(node.args[4]) if len(node.args) > 4 else 1
-        return torch.ops.aten.slice.Tensor(source, dim, start, end, step)
-    raise RuntimeError(
-        "Shift-aware weights must be parameters with optional static "
-        f"reshape/view/slice operations, found {getattr(node, 'op', None)} "
-        f"{getattr(node, 'target', None)}"
-    )
+    value = _resolve_static_value(module, node)
+    if not isinstance(value, Tensor):
+        raise RuntimeError(
+            "Shift-aware weight expression did not resolve to a Tensor, found "
+            f"{type(value)}"
+        )
+    return value
 
 
 def _fake_quant_module(module: GraphModule, node: Any) -> Optional[FakeQuantizeBase]:
@@ -262,6 +311,7 @@ def _safe_power_of_two_weight_scale(
     input_scale: Tensor,
     output_scale: Tensor,
     weight: Tensor,
+    minimum_scale: float = _MIN_WEIGHT_QUANT_SCALE,
 ) -> Tensor:
     """Return per-channel scales satisfying sx * sw / sy ~= 2**-shift.
 
@@ -282,7 +332,9 @@ def _safe_power_of_two_weight_scale(
     max_abs = weight.detach().abs().amax(dim=reduce_dims).to(torch.float64).cpu()
     if not bool(torch.isfinite(max_abs).all()):
         raise RuntimeError("Shift-aware weights must be finite")
-    required_scale = torch.clamp(max_abs / 127.0, min=torch.finfo(torch.float32).tiny)
+    if not math.isfinite(minimum_scale) or minimum_scale <= 0:
+        raise RuntimeError(f"Weight observer minimum scale must be positive, found {minimum_scale}")
+    required_scale = torch.clamp(max_abs / 127.0, min=minimum_scale)
     minimum_ratio = (sx / sy) * required_scale
     if bool((minimum_ratio > 1.0).any()):
         raise RuntimeError(
@@ -314,6 +366,83 @@ def _safe_power_of_two_weight_scale(
     return scales.to(weight.device)
 
 
+def _stage_coarser_activation_grid(
+    fake_quant: FakeQuantizeBase,
+    scale: Tensor,
+    zero_point: Tensor,
+    multiplier: int,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Derive an export-stable power-of-two-coarsened activation grid.
+
+    The calculation uses a private observer copy so ``sima_freeze_qat`` keeps
+    its fail-atomic contract.  The real observer is updated only after every
+    layer constraint has been solved.
+    """
+
+    if multiplier < 2 or multiplier & (multiplier - 1):
+        raise ValueError(f"activation-grid multiplier must be a power of two >= 2, found {multiplier}")
+    if scale.numel() != 1 or zero_point.numel() != 1:
+        raise RuntimeError("Shift-aware activation retargeting requires per-tensor qparams")
+    observer = copy.deepcopy(fake_quant.activation_post_process)
+    if not hasattr(observer, "min_val") or not hasattr(observer, "max_val"):
+        raise RuntimeError(
+            f"Activation observer {type(observer).__name__} cannot persist a retargeted grid"
+        )
+
+    requested_scale = scale.detach() * multiplier
+    requested_zero_point = torch.trunc(
+        zero_point.detach().to(torch.float64) / multiplier
+    ).to(zero_point.dtype)
+    lower = (
+        (observer.quant_min - requested_zero_point.to(requested_scale.dtype))
+        * requested_scale
+    ).to(device=observer.min_val.device, dtype=observer.min_val.dtype)
+    upper = (
+        (observer.quant_max - requested_zero_point.to(requested_scale.dtype))
+        * requested_scale
+    ).to(device=observer.max_val.device, dtype=observer.max_val.dtype)
+    observer.min_val.resize_(lower.shape).copy_(lower)
+    observer.max_val.resize_(upper.shape).copy_(upper)
+    persisted_scale, persisted_zero_point = observer.calculate_qparams()
+    persisted_scale = persisted_scale.to(device=scale.device, dtype=scale.dtype)
+    persisted_zero_point = persisted_zero_point.to(
+        device=zero_point.device, dtype=zero_point.dtype
+    )
+    if not bool(torch.isfinite(persisted_scale).all()) or bool((persisted_scale <= 0).any()):
+        raise RuntimeError("Retargeted activation grid is non-finite or non-positive")
+    return persisted_scale, persisted_zero_point, lower, upper
+
+
+def _stage_weight_grid(
+    weight_fq: FakeQuantizeBase,
+    scales: Tensor,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Derive the exact observer/export weight grid without mutating the model."""
+
+    observer = copy.deepcopy(weight_fq.activation_post_process)
+    locked_range = scales * 127.0
+    zero_range = torch.zeros_like(locked_range)
+    for _ in range(8):
+        observer.min_val.resize_(scales.shape).copy_(-locked_range)
+        observer.max_val.resize_(scales.shape).copy_(locked_range)
+        export_scale, export_zero_point = observer.calculate_qparams()
+        export_scale = export_scale.to(device=scales.device, dtype=scales.dtype)
+        too_high = export_scale > scales
+        if not bool(too_high.any()):
+            break
+        locked_range = torch.where(
+            too_high,
+            torch.nextafter(locked_range, zero_range),
+            locked_range,
+        )
+    if bool((export_scale > scales).any()):
+        raise RuntimeError(
+            "Unable to persist a safe shift-aware weight scale through "
+            "the PT2E observer qparam contract"
+        )
+    return export_scale, export_zero_point, locked_range
+
+
 def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
     """Freeze QAT observers and lock Model Compiler-compatible power-of-two weight scales.
 
@@ -340,23 +469,24 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
         ):
             continue
         scale, zero_point = fake_quant.activation_post_process.calculate_qparams()
-        activation_qparams.append(
-            (
-                fake_quant,
-                scale.to(device=fake_quant.scale.device, dtype=fake_quant.scale.dtype),
-                zero_point.to(
-                    device=fake_quant.zero_point.device,
-                    dtype=fake_quant.zero_point.dtype,
-                ),
-            )
-        )
+        activation_qparams.append([
+            fake_quant,
+            scale.to(device=fake_quant.scale.device, dtype=fake_quant.scale.dtype),
+            zero_point.to(
+                device=fake_quant.zero_point.device,
+                dtype=fake_quant.zero_point.dtype,
+            ),
+            None,
+            None,
+        ])
     activation_qparams_by_id = {
-        id(fake_quant): (scale, zero_point)
-        for fake_quant, scale, zero_point in activation_qparams
+        id(row[0]): row for row in activation_qparams
     }
     locked_scales = []
     skipped = []
+    activation_retargets = []
     if shift_aware:
+        contracts = []
         for node in qat_model.graph.nodes:
             if node.op != "call_function" or node.target not in _SHIFT_AWARE_OPS:
                 continue
@@ -382,18 +512,7 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
                 skipped.append(node.name)
                 continue
 
-            input_scale = activation_qparams_by_id.get(
-                id(input_fq), (input_fq.scale, input_fq.zero_point)
-            )[0]
-            output_scale = activation_qparams_by_id.get(
-                id(output_fq), (output_fq.scale, output_fq.zero_point)
-            )[0]
-            scales = _safe_power_of_two_weight_scale(
-                input_scale,
-                output_scale,
-                weight,
-            )
-            locked_scales.append((weight_fq, scales))
+            contracts.append((node, input_fq, weight_fq, output_fq, weight))
 
         if skipped:
             raise RuntimeError(
@@ -401,42 +520,109 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
                 f"parameters for {len(skipped)} op(s): {', '.join(skipped)}"
             )
 
-    # Do not mutate observer state until every shift-aware layer has validated.
+        # AFE encodes only non-negative right shifts.  An otherwise valid
+        # activation/weight grid can require a left shift when sx*sw/sy > 1.
+        # Solve that graph constraint by coarsening the Conv output grid by the
+        # smallest power of two that makes every channel representable.  The
+        # changed grid is visible to downstream contracts in the same pass;
+        # repeat to close shared-grid/back-edge constraints deterministically.
+        for _ in range(len(contracts) + 1):
+            changed = False
+            for node, input_fq, weight_fq, output_fq, weight in contracts:
+                input_row = activation_qparams_by_id[id(input_fq)]
+                output_row = activation_qparams_by_id[id(output_fq)]
+                input_scale = input_row[1]
+                output_scale = output_row[1]
+                sx = float(input_scale.reshape(-1)[0].detach().cpu())
+                sy = float(output_scale.reshape(-1)[0].detach().cpu())
+                reduce_dims = tuple(range(1, weight.ndim))
+                minimum_weight_scale = float(
+                    weight_fq.activation_post_process.eps.detach().reshape(-1).max().cpu()
+                )
+                required_scale = torch.clamp(
+                    weight.detach().abs().amax(dim=reduce_dims).to(torch.float64).cpu() / 127.0,
+                    min=minimum_weight_scale,
+                )
+                maximum_ratio = float(((sx / sy) * required_scale).max())
+                if maximum_ratio <= 1.0:
+                    continue
+                exponent = max(1, math.ceil(math.log2(maximum_ratio)))
+                multiplier = 1 << exponent
+                old_scale = float(output_row[1].reshape(-1)[0].detach().cpu())
+                old_zero_point = int(output_row[2].reshape(-1)[0].detach().cpu())
+                scale, zero_point, lower, upper = _stage_coarser_activation_grid(
+                    output_fq,
+                    output_row[1],
+                    output_row[2],
+                    multiplier,
+                )
+                new_scale = float(scale.reshape(-1)[0].detach().cpu())
+                if new_scale <= old_scale:
+                    raise RuntimeError(
+                        f"Activation observer for {node.name} could not persist a coarser grid"
+                    )
+                output_row[1] = scale
+                output_row[2] = zero_point
+                output_row[3] = lower
+                output_row[4] = upper
+                activation_retargets.append({
+                    "op": node.name,
+                    "scale_before": old_scale,
+                    "scale_after": new_scale,
+                    "zero_point_before": old_zero_point,
+                    "zero_point_after": int(zero_point.reshape(-1)[0].detach().cpu()),
+                    "power_of_two_multiplier": multiplier,
+                })
+                changed = True
+            if not changed:
+                break
+        else:
+            raise RuntimeError("Shift-aware activation-grid constraint solver did not converge")
+
+        for node, input_fq, weight_fq, output_fq, weight in contracts:
+            input_scale = activation_qparams_by_id[id(input_fq)][1]
+            output_scale = activation_qparams_by_id[id(output_fq)][1]
+            try:
+                scales = _safe_power_of_two_weight_scale(
+                    input_scale,
+                    output_scale,
+                    weight,
+                    minimum_scale=float(
+                        weight_fq.activation_post_process.eps.detach().reshape(-1).max().cpu()
+                    ),
+                )
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"Shift-aware QAT could not solve weight grid for {node.name}: {error}"
+                ) from error
+            locked_scales.append((weight_fq, scales))
+
+    locked_weight_qparams = []
+    for weight_fq, scales in locked_scales:
+        export_scale, export_zero_point, locked_range = _stage_weight_grid(
+            weight_fq, scales
+        )
+        locked_weight_qparams.append(
+            (weight_fq, export_scale, export_zero_point, locked_range)
+        )
+
+    # Do not mutate observer state until every activation and weight contract
+    # has validated and its exact export qparams have been staged.
     qat_model.apply(disable_observer)
-    for fake_quant, scale, zero_point in activation_qparams:
+    for fake_quant, scale, zero_point, lower, upper in activation_qparams:
+        if lower is not None:
+            observer = fake_quant.activation_post_process
+            observer.min_val.resize_(lower.shape).copy_(lower)
+            observer.max_val.resize_(upper.shape).copy_(upper)
         fake_quant.scale.resize_(scale.shape).copy_(scale)
         fake_quant.zero_point.resize_(zero_point.shape).copy_(zero_point)
-    for weight_fq, scales in locked_scales:
+    for weight_fq, export_scale, export_zero_point, locked_range in locked_weight_qparams:
         # Keep observer state consistent with the locked qparams as well. This
         # makes checkpoints self-describing and avoids restoring an old scale
         # if observers are explicitly re-enabled by a training framework.
         weight_observer = weight_fq.activation_post_process
-        locked_range = scales * 127.0
-        # Observer multiplication/division can move a nominal scale by one
-        # float32 ULP. Move the persisted range toward zero until the observer
-        # returns a scale no larger than the already-safe target boundary,
-        # then use that exact export scale for the live fake quantizer.
-        zero_range = torch.zeros_like(locked_range)
-        for _ in range(8):
-            weight_observer.min_val.resize_(scales.shape).copy_(-locked_range)
-            weight_observer.max_val.resize_(scales.shape).copy_(locked_range)
-            export_scale, export_zero_point = weight_observer.calculate_qparams()
-            export_scale = export_scale.to(
-                device=scales.device, dtype=scales.dtype
-            )
-            too_high = export_scale > scales
-            if not bool(too_high.any()):
-                break
-            locked_range = torch.where(
-                too_high,
-                torch.nextafter(locked_range, zero_range),
-                locked_range,
-            )
-        if bool((export_scale > scales).any()):
-            raise RuntimeError(
-                "Unable to persist a safe shift-aware weight scale through "
-                "the PT2E observer qparam contract"
-            )
+        weight_observer.min_val.resize_(locked_range.shape).copy_(-locked_range)
+        weight_observer.max_val.resize_(locked_range.shape).copy_(locked_range)
         weight_fq.scale.resize_(export_scale.shape).copy_(export_scale)
         weight_fq.zero_point.resize_(export_zero_point.shape).copy_(
             export_zero_point.to(
@@ -449,10 +635,11 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
     # the learned-scale forward so it cannot restore exp(log_scale) after the
     # exact synchronization above. The parameter remains in the state dict for
     # topology-compatible checkpoint loading but is no longer consulted.
-    for fake_quant, _, _ in activation_qparams:
+    for fake_quant, _, _, _, _ in activation_qparams:
         if hasattr(fake_quant, "learn_scale"):
             fake_quant.learn_scale = False
 
+    qat_model.meta["qat_activation_retargets"] = activation_retargets
     qat_model.qat_frozen.fill_(1)
     return qat_model
 
@@ -503,7 +690,7 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
             stacklevel=2,
         )
         sima_freeze_qat(qat_model)
-    print(f"Removing QAT scaffold and quantizing network ...")
+    print("Removing QAT scaffold and quantizing network ...")
     device = _get_module_device(qat_model)
     _ensure_bn_tracking_meta(qat_model)
     m = convert_pt2e(qat_model, use_reference_representation=False)

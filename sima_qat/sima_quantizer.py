@@ -417,7 +417,12 @@ def get_sima_quantization_config(
     # Weights
     # ---------------------------------------------------
     # Weights will always be captured as per-channel symmetric.
-    wt_extra_args: Dict[str, Any] = {"eps": 2**-12}
+    # Weight scales are often below the activation-scale floor.  Keeping the
+    # old 2**-12 observer epsilon silently coarsened small Linear/Conv weights
+    # and could make sx*sw/sy exceed the compiler's shift-0 range.  Float32
+    # epsilon is the shared observer/shift-solver floor; activations retain
+    # their independent 2**-12 policy above.
+    wt_extra_args: Dict[str, Any] = {"eps": torch.finfo(torch.float32).eps}
     if is_qat and shift_aware:
         # Shift-aware QAT must expose quantized weights during the forward
         # pass. A bare observer postpones weight rounding until conversion and
