@@ -32,7 +32,7 @@ import math
 import operator
 import warnings
 from collections import OrderedDict
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import torch
 from packaging import version
@@ -309,6 +309,15 @@ def sima_qat_activation_diagnostics(
         ):
             register(name, module)
     was_training = qat_model.training
+    quantizer_states = [
+        (
+            module,
+            module.fake_quant_enabled.detach().clone(),
+            module.observer_enabled.detach().clone(),
+        )
+        for module in qat_model.modules()
+        if isinstance(module, FakeQuantizeBase)
+    ]
     qat_model.eval()
     try:
         with torch.no_grad():
@@ -317,7 +326,182 @@ def sima_qat_activation_diagnostics(
         for handle in handles:
             handle.remove()
         qat_model.train(was_training)
+        # Exported PT2E GraphModule train/eval shims may toggle quantization
+        # state as a side effect. Diagnostics must be observational: restore
+        # the exact live QAT lifecycle bits the caller supplied.
+        for module, fake_quant_enabled, observer_enabled in quantizer_states:
+            module.fake_quant_enabled.copy_(fake_quant_enabled)
+            module.observer_enabled.copy_(observer_enabled)
     rows.sort(key=lambda row: row["relative_rmse"], reverse=True)
+    return rows
+
+
+def sima_qat_activation_sensitivity(
+    qat_model: GraphModule,
+    inputs: Tuple[Any, ...],
+    objective: Callable[[Any], Tensor],
+    *,
+    candidate_names: Optional[Iterable[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Rank activation grids by first-order task-loss sensitivity.
+
+    Local quantization RMSE alone is not a useful optimization priority: a
+    large error on a masked coordinate or an insensitive residual can matter
+    less than a small error on an attention probability.  For fake-quantizer
+    ``i`` this diagnostic measures the Taylor term
+
+    ``|dL/dq_i * (q_i - x_i)|``
+
+    under a caller-supplied scalar objective ``L``.  The returned
+    ``taylor_l1`` is the cancellation-free sum over tensor elements and calls;
+    ``taylor_dot_abs`` is the absolute signed first-order loss change.  The
+    method changes no qparams or model weights and is intended to select a
+    bounded set of learned activation scales before QAT.
+
+    ``candidate_names`` should be used for large graphs so only the relevant
+    model region retains quantization residuals for backward.
+    """
+
+    if not isinstance(qat_model, GraphModule):
+        raise TypeError("qat_model must be a GraphModule")
+    if not callable(objective):
+        raise TypeError("objective must be callable")
+    selected = None if candidate_names is None else set(candidate_names)
+    # SharedQuantizationSpec can expose one fake-quantizer instance under more
+    # than one FX call_module target.  Keep aliases for candidate validation,
+    # then register only one hook per physical module below.
+    known = dict(qat_model.named_modules(remove_duplicate=False))
+    if selected is not None:
+        missing = selected - set(known)
+        if missing:
+            raise KeyError(
+                "unknown candidate fake quantizer(s): "
+                + ", ".join(sorted(missing)[:8])
+            )
+
+    statistics: Dict[str, Dict[str, Any]] = {}
+    handles = []
+
+    def register(name: str, fake_quant: FakeQuantizeBase) -> None:
+        statistics[name] = {
+            "name": name,
+            "domain_kind": getattr(fake_quant, "sima_domain_kind", "activation"),
+            "source_node": getattr(fake_quant, "sima_source_node", ""),
+            "calls": 0,
+            "elements": 0,
+            "error_l2_sq": None,
+            "taylor_l1": None,
+            "taylor_dot": None,
+        }
+
+        def hook(_module, args, output):
+            if (
+                not args
+                or not isinstance(args[0], Tensor)
+                or not isinstance(output, Tensor)
+                or not output.requires_grad
+                or not args[0].is_floating_point()
+                or output.numel() == 0
+            ):
+                return
+            # FP16 storage bounds memory on large attention graphs; all score
+            # reductions below are accumulated in FP32.
+            error = (output.detach() - args[0].detach()).to(torch.float16)
+            row = statistics[name]
+            row["calls"] += 1
+            row["elements"] += int(output.numel())
+            error_l2_sq = error.float().square().sum().detach()
+            row["error_l2_sq"] = (
+                error_l2_sq
+                if row["error_l2_sq"] is None
+                else row["error_l2_sq"] + error_l2_sq
+            )
+
+            def gradient_hook(gradient: Tensor) -> Tensor:
+                contribution = gradient.float() * error.float()
+                l1 = contribution.abs().sum().detach()
+                dot = contribution.sum().detach()
+                row["taylor_l1"] = (
+                    l1 if row["taylor_l1"] is None else row["taylor_l1"] + l1
+                )
+                row["taylor_dot"] = (
+                    dot if row["taylor_dot"] is None else row["taylor_dot"] + dot
+                )
+                return gradient
+
+            output.register_hook(gradient_hook)
+
+        handles.append(fake_quant.register_forward_hook(hook))
+
+    registered_ids = set()
+    for name, module in known.items():
+        if selected is not None and name not in selected:
+            continue
+        if (
+            isinstance(module, FakeQuantizeBase)
+            and module.qscheme
+            not in (torch.per_channel_affine, torch.per_channel_symmetric)
+            and id(module) not in registered_ids
+        ):
+            register(name, module)
+            registered_ids.add(id(module))
+
+    if not statistics:
+        raise ValueError("no activation fake quantizers were selected")
+
+    was_training = qat_model.training
+    quantizer_states = [
+        (
+            module,
+            module.fake_quant_enabled.detach().clone(),
+            module.observer_enabled.detach().clone(),
+        )
+        for module in qat_model.modules()
+        if isinstance(module, FakeQuantizeBase)
+    ]
+    previous_grads = {
+        name: parameter.grad
+        for name, parameter in qat_model.named_parameters()
+    }
+    qat_model.eval()
+    qat_model.zero_grad(set_to_none=True)
+    try:
+        outputs = qat_model(*inputs)
+        loss = objective(outputs)
+        if not isinstance(loss, Tensor) or loss.numel() != 1:
+            raise TypeError("objective must return one scalar Tensor")
+        if not loss.requires_grad:
+            raise RuntimeError("objective result does not require gradients")
+        loss.backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+        qat_model.zero_grad(set_to_none=True)
+        for name, parameter in qat_model.named_parameters():
+            parameter.grad = previous_grads[name]
+        qat_model.train(was_training)
+        for module, fake_quant_enabled, observer_enabled in quantizer_states:
+            module.fake_quant_enabled.copy_(fake_quant_enabled)
+            module.observer_enabled.copy_(observer_enabled)
+
+    rows: List[Dict[str, Any]] = []
+    for row in statistics.values():
+        if row["taylor_l1"] is None:
+            continue
+        elements = max(1, int(row["elements"]))
+        error_l2_sq = float(row.pop("error_l2_sq").cpu())
+        taylor_l1 = float(row.pop("taylor_l1").cpu())
+        taylor_dot = float(row.pop("taylor_dot").cpu())
+        row.update(
+            {
+                "quantization_rmse": math.sqrt(error_l2_sq / elements),
+                "taylor_l1": taylor_l1,
+                "taylor_l1_per_element": taylor_l1 / elements,
+                "taylor_dot_abs": abs(taylor_dot),
+            }
+        )
+        rows.append(row)
+    rows.sort(key=lambda row: row["taylor_l1"], reverse=True)
     return rows
 
 
@@ -673,9 +857,14 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
         scale, zero_point = fake_quant.activation_post_process.calculate_qparams()
         lower = upper = None
         if bool(getattr(fake_quant, "learn_scale", False)) and hasattr(fake_quant, "log_scale"):
+            learned_scale = (
+                fake_quant.current_learned_scale().detach()
+                if hasattr(fake_quant, "current_learned_scale")
+                else fake_quant.log_scale.detach().exp()
+            )
             scale, zero_point, lower, upper = _stage_learned_activation_grid(
                 fake_quant,
-                fake_quant.log_scale.detach().exp(),
+                learned_scale,
                 zero_point,
             )
         activation_qparams.append([

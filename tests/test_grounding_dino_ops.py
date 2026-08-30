@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from sima_qat.qat_api import (
+    sima_qat_activation_sensitivity,
     sima_prepare_qat_model,
     sima_qat_activation_diagnostics,
 )
@@ -53,6 +54,14 @@ def test_attention_probability_domain_is_tagged_and_numerically_reported():
         if getattr(module, "sima_domain_kind", "") == "attention_probability"
     ]
     assert probability_modules
+    state_before = [
+        (
+            module.fake_quant_enabled.detach().clone(),
+            module.observer_enabled.detach().clone(),
+        )
+        for module in prepared.modules()
+        if isinstance(module, torch.ao.quantization.FakeQuantizeBase)
+    ]
 
     report = sima_qat_activation_diagnostics(
         prepared, (query, key, value)
@@ -64,6 +73,63 @@ def test_attention_probability_domain_is_tagged_and_numerically_reported():
     assert probability_rows
     assert probability_rows[0]["step_over_rms"] > 0
     assert probability_rows[0]["relative_rmse"] >= 0
+    state_after = [
+        (module.fake_quant_enabled, module.observer_enabled)
+        for module in prepared.modules()
+        if isinstance(module, torch.ao.quantization.FakeQuantizeBase)
+    ]
+    for expected, actual in zip(state_before, state_after):
+        torch.testing.assert_close(actual[0], expected[0])
+        torch.testing.assert_close(actual[1], expected[1])
+
+
+@pytest.mark.regression
+def test_task_sensitivity_ranks_activation_grids_without_changing_gradients():
+    query = torch.randn(1, 4, 8, requires_grad=True)
+    key = torch.randn(1, 16, 8, requires_grad=True)
+    value = torch.randn(1, 16, 8, requires_grad=True)
+    prepared = sima_prepare_qat_model(
+        TinyAttention(),
+        (query.detach(), key.detach(), value.detach()),
+        "cpu",
+        full_range_ste=True,
+        learn_scales=True,
+    )
+    prepared(query.detach(), key.detach(), value.detach())
+    candidates = [
+        name
+        for name, module in prepared.named_modules()
+        if getattr(module, "sima_domain_kind", "")
+        in {"attention_probability", "activation_matmul_output"}
+    ]
+    state_before = [
+        (
+            module.fake_quant_enabled.detach().clone(),
+            module.observer_enabled.detach().clone(),
+        )
+        for module in prepared.modules()
+        if isinstance(module, torch.ao.quantization.FakeQuantizeBase)
+    ]
+    rows = sima_qat_activation_sensitivity(
+        prepared,
+        (query, key, value),
+        lambda output: output.float().square().mean(),
+        candidate_names=candidates,
+    )
+
+    assert rows
+    assert all(row["taylor_l1"] >= 0 for row in rows)
+    assert all(row["quantization_rmse"] >= 0 for row in rows)
+    assert rows == sorted(rows, key=lambda row: row["taylor_l1"], reverse=True)
+    assert all(parameter.grad is None for parameter in prepared.parameters())
+    state_after = [
+        (module.fake_quant_enabled, module.observer_enabled)
+        for module in prepared.modules()
+        if isinstance(module, torch.ao.quantization.FakeQuantizeBase)
+    ]
+    for expected, actual in zip(state_before, state_after):
+        torch.testing.assert_close(actual[0], expected[0])
+        torch.testing.assert_close(actual[1], expected[1])
 
 
 @pytest.mark.regression
