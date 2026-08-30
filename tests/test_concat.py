@@ -64,6 +64,25 @@ class RepeatedInputConcatModel(torch.nn.Module):
         return torch.cat((depth,) * 16, dim=1)
 
 
+class IdentityPaddingConcatModel(torch.nn.Module):
+    """Tree-prefix identity padding must not introduce a new grid."""
+
+    def __init__(self, identity: float):
+        super().__init__()
+        self.identity = identity
+        self.conv = torch.nn.Conv2d(3, 4, kernel_size=1)
+
+    def forward(self, x):
+        x = self.conv(x)
+        prefix_source = x[:1]
+        prefix = (
+            torch.zeros_like(prefix_source)
+            if self.identity == 0.0
+            else torch.ones_like(prefix_source)
+        )
+        return torch.cat((prefix, x[:-1]), dim=0)
+
+
 @pytest.mark.regression
 @pytest.mark.parametrize("model", [Model()])
 def test_concat(model: torch.nn.Module):
@@ -133,3 +152,28 @@ def test_repeated_input_concat_is_quantized_on_shared_grid():
     assert len({node for node in dequantize_inputs}) == 1
     input_dequantize = dequantize_inputs[0]
     assert quantize.args[1:3] == input_dequantize.args[1:3]
+
+
+@pytest.mark.regression
+@pytest.mark.parametrize("identity", [0.0, 1.0])
+def test_identity_padding_concat_uses_payload_grid(identity):
+    model = IdentityPaddingConcatModel(identity).eval()
+    input_tensor = torch.randn(4, 3, 8, 8)
+    prepared = sima_prepare_qat_model(model, (input_tensor,), "cpu")
+    prepared(input_tensor)
+    converted = sima_finalize_qat_model(prepared)
+
+    cat = next(
+        node
+        for node in converted.graph.nodes
+        if node.target == torch.ops.aten.cat.default
+    )
+    input_dequantize = list(cat.args[0])
+    assert len(input_dequantize) == 2
+    output_quantize = next(
+        node
+        for node in cat.users
+        if node.target == torch.ops.quantized_decomposed.quantize_per_tensor.default
+    )
+    assert input_dequantize[0].args[1:3] == input_dequantize[1].args[1:3]
+    assert output_quantize.args[1:3] == input_dequantize[1].args[1:3]

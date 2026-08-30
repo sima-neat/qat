@@ -1418,22 +1418,54 @@ def _sima_annotate_cat(
         input_act_qspec = get_input_act_qspec(quantization_config)
         inputs = cat_node.args[0]
 
+        # An inclusive tree scan shifts a tensor with an exact identity prefix:
+        #   cat((zeros_like(x[:k]), x[:-k]))
+        #   cat((ones_like(x[:k]),  x[:-k]))
+        # This is a pure integer layout operation, not a numerical boundary.
+        # Requantizing the identity prefix, shifted payload, and Cat output on
+        # three independently observed grids adds avoidable error at every
+        # prefix level. Share the payload grid across all three instead. The
+        # rule is deliberately narrow so ordinary multi-source concatenations
+        # retain independent input grids and an explicit output requantization.
+        identity_padding_concat = False
+        identity_padding_reference = None
+        if len(inputs) == 2 and all(isinstance(value, Node) for value in inputs):
+            identity_padding_targets = {
+                torch.ops.aten.zeros_like.default,
+                torch.ops.aten.ones_like.default,
+            }
+            if inputs[0].target in identity_padding_targets:
+                identity_padding_concat = True
+                identity_padding_reference = inputs[1]
+                if not _is_annotated([identity_padding_reference]):
+                    identity_padding_reference.meta["quantization_annotation"] = (
+                        QuantizationAnnotation(
+                            output_qspec=input_act_qspec,
+                            _annotated=True,
+                        )
+                    )
+
         input_qspec_map = {}
-        
         for input_act in inputs:
             if _is_annotated([input_act]):
                 continue
-            input_qspec_map[input_act] = input_act_qspec
+            input_qspec_map[input_act] = (
+                SharedQuantizationSpec(identity_padding_reference)
+                if identity_padding_concat
+                and input_act is not identity_padding_reference
+                else input_act_qspec
+            )
 
         # When every list entry is the same tensor, concatenation is only a
         # layout/public-ABI operation.  Sharing its output grid with that
         # tensor makes QAT and export model the exact integer-code repeat,
         # rather than learning a gratuitous terminal requantization.
-        output_act_qspec = (
-            SharedQuantizationSpec(inputs[0])
-            if inputs and all(input_act is inputs[0] for input_act in inputs)
-            else get_output_act_qspec(quantization_config)
-        )
+        if identity_padding_concat:
+            output_act_qspec = SharedQuantizationSpec(identity_padding_reference)
+        elif inputs and all(input_act is inputs[0] for input_act in inputs):
+            output_act_qspec = SharedQuantizationSpec(inputs[0])
+        else:
+            output_act_qspec = get_output_act_qspec(quantization_config)
 
         cat_node.meta["quantization_annotation"] = QuantizationAnnotation(
             input_qspec_map=input_qspec_map,
