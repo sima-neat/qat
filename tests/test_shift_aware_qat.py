@@ -42,6 +42,15 @@ def _weight_fake_quantizers(model):
     ]
 
 
+def _activation_fake_quantizers(model):
+    return [
+        module
+        for module in model.modules()
+        if isinstance(module, FakeQuantizeBase)
+        and module.qscheme not in (torch.per_channel_affine, torch.per_channel_symmetric)
+    ]
+
+
 @pytest.mark.regression
 def test_shift_aware_weight_fake_quant_is_default_and_legacy_is_available():
     default_config = get_sima_quantization_config(is_qat=True)
@@ -200,6 +209,59 @@ def test_checkpoint_resume_and_legacy_compatibility():
 
     with pytest.raises(RuntimeError, match="mode does not match"):
         resumed_legacy.load_state_dict(shift_aware_state)
+
+
+@pytest.mark.regression
+def test_freeze_uses_exact_observer_qparams_for_learned_activation_scales():
+    inputs = torch.randn(2, 3, 8, 8)
+    model = sima_prepare_qat_model(
+        TinyClassifier(), (inputs,), "cpu", full_range_ste=True, learn_scales=True
+    )
+    model(inputs)
+    activation_fake_quantizers = _activation_fake_quantizers(model)
+    assert activation_fake_quantizers
+    learned_fake_quantizers = [
+        fake_quant
+        for fake_quant in activation_fake_quantizers
+        if hasattr(fake_quant, "log_scale")
+    ]
+    assert learned_fake_quantizers
+
+    # Simulate learned-scale training drifting away from observer/export
+    # qparams while keeping all scale ratios unchanged and representable.
+    with torch.no_grad():
+        for fake_quant in learned_fake_quantizers:
+            fake_quant.log_scale.add_(0.25)
+            fake_quant.sync_learned_scale()
+    assert any(
+        not torch.equal(
+            fake_quant.scale,
+            fake_quant.activation_post_process.calculate_qparams()[0],
+        )
+        for fake_quant in learned_fake_quantizers
+    )
+
+    sima_freeze_qat(model)
+    locked = []
+    for fake_quant in activation_fake_quantizers:
+        scale, zero_point = fake_quant.activation_post_process.calculate_qparams()
+        torch.testing.assert_close(fake_quant.scale, scale, rtol=0, atol=0)
+        torch.testing.assert_close(fake_quant.zero_point, zero_point, rtol=0, atol=0)
+        if hasattr(fake_quant, "learn_scale"):
+            assert not fake_quant.learn_scale
+        locked.append(fake_quant.scale.detach().clone())
+    model(inputs)
+    for fake_quant, expected in zip(activation_fake_quantizers, locked):
+        torch.testing.assert_close(fake_quant.scale, expected, rtol=0, atol=0)
+
+    resumed = sima_prepare_qat_model(
+        TinyClassifier(), (inputs,), "cpu", full_range_ste=True, learn_scales=True
+    )
+    resumed.load_state_dict(model.state_dict())
+    assert all(
+        not fake_quant.learn_scale
+        for fake_quant in _activation_fake_quantizers(resumed)
+    )
 
 
 @pytest.mark.regression

@@ -284,6 +284,33 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
         return qat_model
 
     shift_aware = bool(getattr(qat_model, "shift_aware_qat", torch.tensor([0])).item())
+    # PT2E conversion serializes qparams recalculated from observers, not a
+    # learnable fake-quantizer's live ``exp(log_scale)`` buffer.  Synchronize
+    # activation grids to those exact export qparams before deriving coupled
+    # weight scales.  Otherwise a one-ULP activation mismatch can change the
+    # compiler's power-of-two shift after ONNX import.
+    activation_qparams = []
+    for fake_quant in qat_model.modules():
+        if (
+            "FakeQuant" not in type(fake_quant).__name__
+            or getattr(fake_quant, "is_per_channel", False)
+        ):
+            continue
+        scale, zero_point = fake_quant.activation_post_process.calculate_qparams()
+        activation_qparams.append(
+            (
+                fake_quant,
+                scale.to(device=fake_quant.scale.device, dtype=fake_quant.scale.dtype),
+                zero_point.to(
+                    device=fake_quant.zero_point.device,
+                    dtype=fake_quant.zero_point.dtype,
+                ),
+            )
+        )
+    activation_qparams_by_id = {
+        id(fake_quant): (scale, zero_point)
+        for fake_quant, scale, zero_point in activation_qparams
+    }
     locked_scales = []
     skipped = []
     if shift_aware:
@@ -309,9 +336,15 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
                 continue
 
             weight = _resolve_attr(qat_model, weight_node.target)
+            input_scale = activation_qparams_by_id.get(
+                id(input_fq), (input_fq.scale, input_fq.zero_point)
+            )[0]
+            output_scale = activation_qparams_by_id.get(
+                id(output_fq), (output_fq.scale, output_fq.zero_point)
+            )[0]
             scales = _safe_power_of_two_weight_scale(
-                input_fq.scale,
-                output_fq.scale,
+                input_scale,
+                output_scale,
                 weight,
             )
             locked_scales.append((weight_fq, scales))
@@ -324,17 +357,55 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
 
     # Do not mutate observer state until every shift-aware layer has validated.
     qat_model.apply(disable_observer)
+    for fake_quant, scale, zero_point in activation_qparams:
+        fake_quant.scale.resize_(scale.shape).copy_(scale)
+        fake_quant.zero_point.resize_(zero_point.shape).copy_(zero_point)
     for weight_fq, scales in locked_scales:
-        weight_fq.scale.resize_(scales.shape).copy_(scales)
-        # Keep the symmetric zero point explicit and correctly sized.
-        weight_fq.zero_point.resize_(scales.shape).zero_()
         # Keep observer state consistent with the locked qparams as well. This
         # makes checkpoints self-describing and avoids restoring an old scale
         # if observers are explicitly re-enabled by a training framework.
         weight_observer = weight_fq.activation_post_process
         locked_range = scales * 127.0
-        weight_observer.min_val.resize_(scales.shape).copy_(-locked_range)
-        weight_observer.max_val.resize_(scales.shape).copy_(locked_range)
+        # Observer multiplication/division can move a nominal scale by one
+        # float32 ULP. Move the persisted range toward zero until the observer
+        # returns a scale no larger than the already-safe target boundary,
+        # then use that exact export scale for the live fake quantizer.
+        zero_range = torch.zeros_like(locked_range)
+        for _ in range(8):
+            weight_observer.min_val.resize_(scales.shape).copy_(-locked_range)
+            weight_observer.max_val.resize_(scales.shape).copy_(locked_range)
+            export_scale, export_zero_point = weight_observer.calculate_qparams()
+            export_scale = export_scale.to(
+                device=scales.device, dtype=scales.dtype
+            )
+            too_high = export_scale > scales
+            if not bool(too_high.any()):
+                break
+            locked_range = torch.where(
+                too_high,
+                torch.nextafter(locked_range, zero_range),
+                locked_range,
+            )
+        if bool((export_scale > scales).any()):
+            raise RuntimeError(
+                "Unable to persist a safe shift-aware weight scale through "
+                "the PT2E observer qparam contract"
+            )
+        weight_fq.scale.resize_(export_scale.shape).copy_(export_scale)
+        weight_fq.zero_point.resize_(export_zero_point.shape).copy_(
+            export_zero_point.to(
+                device=weight_fq.zero_point.device,
+                dtype=weight_fq.zero_point.dtype,
+            )
+        )
+
+    # Frozen activation scales are now the observer/export qparams. Disable
+    # the learned-scale forward so it cannot restore exp(log_scale) after the
+    # exact synchronization above. The parameter remains in the state dict for
+    # topology-compatible checkpoint loading but is no longer consulted.
+    for fake_quant, _, _ in activation_qparams:
+        if hasattr(fake_quant, "learn_scale"):
+            fake_quant.learn_scale = False
 
     qat_model.qat_frozen.fill_(1)
     return qat_model
@@ -604,7 +675,16 @@ class SimaQatWrapper(GraphModule):
         compatible_state.setdefault('shift_aware_qat', self.shift_aware_qat.detach().clone())
         compatible_state.setdefault('qat_frozen', torch.zeros_like(self.qat_frozen))
 
-        return super().load_state_dict(compatible_state, strict, assign)
+        result = super().load_state_dict(compatible_state, strict, assign)
+        if bool(self.qat_frozen.item()):
+            for fake_quant in self.modules():
+                if (
+                    "FakeQuant" in type(fake_quant).__name__
+                    and not getattr(fake_quant, "is_per_channel", False)
+                    and hasattr(fake_quant, "learn_scale")
+                ):
+                    fake_quant.learn_scale = False
+        return result
 
 
 def check_graph_nodes(prepared_mod : GraphModule, device: torch.device) -> GraphModule:
