@@ -49,7 +49,7 @@ from sima_qat.qat_api import (
 model = ...                                  # any torch.nn.Module
 example_inputs = (torch.randn(1, 3, 224, 224),)
 
-# 1. Insert fake-quant scaffolding. Shift-aware QAT is enabled by default.
+# 1. Insert shift-aware fake-quant scaffolding.
 qat_model = sima_prepare_qat_model(model, example_inputs, device='cuda')
 
 # 2. Warm up observers with your normal training loop ...
@@ -71,17 +71,9 @@ integer shift requantization without rescaling the learned INT8 weight codes. Ca
 lock them automatically if necessary, but fine-tuning after the explicit call generally gives better
 accuracy.
 
-To reproduce the observer-only weight behavior from earlier releases, opt out during preparation:
-
-```python
-qat_model = sima_prepare_qat_model(
-    model, example_inputs, device='cuda', shift_aware=False
-)
-```
-
 | function | purpose |
 |---|---|
-| `sima_prepare_qat_model(model, inputs, device, shift_aware=True)` | Capture the model and insert SiMa fake-quant annotations. Power-of-two-aware weight QAT is the default; pass `False` for the legacy behavior. |
+| `sima_prepare_qat_model(model, inputs, device)` | Capture the model and insert SiMa shift-aware fake-quant annotations. |
 | `sima_freeze_qat(qat_model)` | Freeze observers and lock AFE-compatible weight scales before final fine-tuning. |
 | `sima_finalize_qat_model(qat_model)` | Fold the trained scaffolding into an inference-only quantized graph. |
 | `sima_export_onnx(qat_model, inputs, output_file, ...)` | Export the finalized model to an ONNX QuantizeLinear/DequantizeLinear graph. |

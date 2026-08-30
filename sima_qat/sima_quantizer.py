@@ -48,7 +48,6 @@ from torch.ao.quantization.observer import (
     MinMaxObserver,
     MovingAverageMinMaxObserver,
     MovingAveragePerChannelMinMaxObserver,
-    PerChannelMinMaxObserver,
     PlaceholderObserver,
 )
 
@@ -199,7 +198,6 @@ def _get_supported_symmetric_config_and_operators() -> List[OperatorConfig]:
     for quantization_config in [
         get_sima_quantization_config(),
         get_sima_quantization_config(is_qat=True),
-        get_sima_quantization_config(is_qat=True, shift_aware=False),
     ]:
         ops = _supported_symmetric_quantized_operators()
         for pattern_list in ops.values():
@@ -212,12 +210,9 @@ def _get_supported_symmetric_config_and_operators() -> List[OperatorConfig]:
 @functools.lru_cache
 def get_sima_quantization_config(
     is_qat: bool = False,
-    shift_aware: bool = True,
 ):
-    # This configuration function selects QAT/PTQ and, for QAT, whether the
-    # weights are fake-quantized during training.  Weight fake quantization is
-    # required for shift-aware QAT; ``shift_aware=False`` preserves the legacy
-    # observer-only behavior.
+    # This configuration function selects QAT or PTQ. Weight fake quantization
+    # is always enabled for QAT so training matches SiMa shift requantization.
     # Sima has a preferred encoding for activation and weight tensors that give 
     # best possible results. Since QAT is a high-effort activity, we only use the
     # best quantization settings possible here.
@@ -251,11 +246,9 @@ def get_sima_quantization_config(
     # ---------------------------------------------------
     # Weights will always be captured as per-channel symmetric.
     wt_extra_args: Dict[str, Any] = {"eps": 2**-12}
-    if is_qat and shift_aware:
+    if is_qat:
         weight_observer_or_fake_quant_ctr = FakeQuantize
         wt_extra_args["observer"] = MovingAveragePerChannelMinMaxObserver
-    elif is_qat:
-        weight_observer_or_fake_quant_ctr = PerChannelMinMaxObserver
     else:
         weight_observer_or_fake_quant_ctr = PlaceholderObserver
 

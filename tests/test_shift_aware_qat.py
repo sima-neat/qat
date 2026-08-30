@@ -2,12 +2,13 @@
 #||                        SiMa.ai CONFIDENTIAL                          ||
 #||   Unpublished Copyright (c) 2024 SiMa.ai, All Rights Reserved.       ||
 #**************************************************************************
+import inspect
+
 import onnxruntime
 import torch
 import pytest
 
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
-from torch.ao.quantization.observer import PerChannelMinMaxObserver
 
 from sima_qat.qat_api import (
     _SHIFT_AWARE_OPS,
@@ -43,25 +44,18 @@ def _weight_fake_quantizers(model):
 
 
 @pytest.mark.regression
-def test_shift_aware_weight_fake_quant_is_default_and_legacy_is_available():
-    default_config = get_sima_quantization_config(is_qat=True)
-    default_weight_module = default_config.weight.observer_or_fake_quant_ctr()
-    assert isinstance(default_weight_module, FakeQuantizeBase)
+def test_qat_always_fake_quantizes_weights():
+    config = get_sima_quantization_config(is_qat=True)
+    weight_module = config.weight.observer_or_fake_quant_ctr()
+    assert isinstance(weight_module, FakeQuantizeBase)
+    assert "shift_aware" not in inspect.signature(sima_prepare_qat_model).parameters
 
-    legacy_config = get_sima_quantization_config(is_qat=True, shift_aware=False)
-    legacy_weight_module = legacy_config.weight.observer_or_fake_quant_ctr()
-    assert isinstance(legacy_weight_module, PerChannelMinMaxObserver)
-    assert not isinstance(legacy_weight_module, FakeQuantizeBase)
-
-    legacy_model = sima_prepare_qat_model(
+    model = sima_prepare_qat_model(
         TinyClassifier(),
         (torch.randn(2, 3, 8, 8),),
         "cpu",
-        shift_aware=False,
     )
-    assert not bool(legacy_model.shift_aware_qat.item())
-    assert _weight_fake_quantizers(legacy_model) == []
-    assert any(isinstance(module, PerChannelMinMaxObserver) for module in legacy_model.modules())
+    assert len(_weight_fake_quantizers(model)) == 2
 
 
 @pytest.mark.regression
@@ -92,7 +86,6 @@ def test_two_epoch_cpu_qat_locks_afe_compatible_scales(tmp_path):
     assert torch.isfinite(loss)
     assert model.conv1.weight.grad is not None
     assert model.conv1.weight.grad.abs().sum() > 0
-    assert bool(model.shift_aware_qat.item())
     assert bool(model.qat_frozen.item())
     for module, locked_scale in zip(_weight_fake_quantizers(model), locked_scales):
         torch.testing.assert_close(module.scale, locked_scale, rtol=0, atol=0)
@@ -137,47 +130,30 @@ def test_two_epoch_cpu_qat_locks_afe_compatible_scales(tmp_path):
 
 
 @pytest.mark.regression
-def test_checkpoint_resume_and_legacy_compatibility():
+def test_shift_aware_checkpoint_resume():
     inputs = torch.randn(2, 3, 8, 8)
 
-    shift_aware_model = sima_prepare_qat_model(TinyClassifier(), (inputs,), "cpu")
-    shift_aware_model(inputs)
-    sima_freeze_qat(shift_aware_model)
-    shift_aware_state = shift_aware_model.state_dict()
-    assert not any(key.endswith("sima_shift") for key in shift_aware_state)
+    model = sima_prepare_qat_model(TinyClassifier(), (inputs,), "cpu")
+    model(inputs)
+    sima_freeze_qat(model)
+    state = model.state_dict()
+    assert "shift_aware_qat" not in state
+    assert not any(key.endswith("sima_shift") for key in state)
 
-    resumed_shift_aware = sima_prepare_qat_model(TinyClassifier(), (inputs,), "cpu")
-    resumed_shift_aware.load_state_dict(shift_aware_state)
-    assert bool(resumed_shift_aware.shift_aware_qat.item())
-    assert bool(resumed_shift_aware.qat_frozen.item())
+    resumed = sima_prepare_qat_model(TinyClassifier(), (inputs,), "cpu")
+    resumed.load_state_dict(state)
+    assert bool(resumed.qat_frozen.item())
 
-    legacy_model = sima_prepare_qat_model(
-        TinyClassifier(),
-        (inputs,),
-        "cpu",
-        shift_aware=False,
-    )
-    legacy_model(inputs)
-    old_checkpoint = legacy_model.state_dict()
-    del old_checkpoint["shift_aware_qat"]
-    del old_checkpoint["qat_frozen"]
+    # Checkpoints from the first shift-aware release included an always-true
+    # mode marker. It is redundant now but remains load-compatible.
+    transitional_state = state.copy()
+    transitional_state["shift_aware_qat"] = torch.tensor([True])
+    resumed.load_state_dict(transitional_state)
 
-    resumed_legacy = sima_prepare_qat_model(
-        TinyClassifier(),
-        (inputs,),
-        "cpu",
-        shift_aware=False,
-    )
-    resumed_legacy.load_state_dict(old_checkpoint)
-    assert not bool(resumed_legacy.shift_aware_qat.item())
-    assert not bool(resumed_legacy.qat_frozen.item())
-
-    default_model = sima_prepare_qat_model(TinyClassifier(), (inputs,), "cpu")
-    with pytest.raises(RuntimeError, match="predates shift-aware QAT"):
-        default_model.load_state_dict(old_checkpoint)
-
-    with pytest.raises(RuntimeError, match="mode does not match"):
-        resumed_legacy.load_state_dict(shift_aware_state)
+    unsupported_state = state.copy()
+    unsupported_state["shift_aware_qat"] = torch.tensor([False])
+    with pytest.raises(RuntimeError, match="Only shift-aware"):
+        resumed.load_state_dict(unsupported_state)
 
 
 @pytest.mark.regression
