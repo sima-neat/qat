@@ -182,6 +182,38 @@ def _resolve_attr(module: nn.Module, target: str) -> Any:
     return value
 
 
+def _resolve_static_weight(module: nn.Module, node: Any) -> Tensor:
+    """Resolve a parameter and compile-time-only shape views feeding an op.
+
+    Exported PyTorch commonly keeps a checkpoint-compatible parameter shape
+    and reshapes it immediately before grouped Conv/Linear. The reshape does
+    not make the tensor dynamic and must not exclude that layer from
+    shift-aware QAT.
+    """
+    if getattr(node, "op", None) == "get_attr":
+        value = _resolve_attr(module, node.target)
+        if not isinstance(value, Tensor):
+            raise RuntimeError(f"Static weight {node.target!r} is not a Tensor")
+        return value
+    if (
+        getattr(node, "op", None) == "call_function"
+        and node.target in {
+            torch.ops.aten.reshape.default,
+            torch.ops.aten.view.default,
+            torch.ops.aten._unsafe_view.default,
+        }
+        and len(node.args) >= 2
+    ):
+        source = _resolve_static_weight(module, node.args[0])
+        shape = tuple(int(value) for value in node.args[1])
+        return source.reshape(shape)
+    raise RuntimeError(
+        "Shift-aware weights must be parameters with optional static "
+        f"reshape/view operations, found {getattr(node, 'op', None)} "
+        f"{getattr(node, 'target', None)}"
+    )
+
+
 def _fake_quant_module(module: GraphModule, node: Any) -> Optional[FakeQuantizeBase]:
     if getattr(node, "op", None) != "call_module":
         return None
@@ -325,17 +357,20 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
             weight_fq = _fake_quant_module(qat_model, node.args[1])
             output_fq = _find_output_fake_quant(qat_model, node)
             weight_node = node.args[1].args[0] if getattr(node.args[1], "args", ()) else None
+            try:
+                weight = _resolve_static_weight(qat_model, weight_node)
+            except RuntimeError:
+                weight = None
             if (
                 input_fq is None
                 or weight_fq is None
                 or output_fq is None
-                or getattr(weight_node, "op", None) != "get_attr"
+                or weight is None
                 or weight_fq.qscheme not in (torch.per_channel_affine, torch.per_channel_symmetric)
             ):
                 skipped.append(node.name)
                 continue
 
-            weight = _resolve_attr(qat_model, weight_node.target)
             input_scale = activation_qparams_by_id.get(
                 id(input_fq), (input_fq.scale, input_fq.zero_point)
             )[0]

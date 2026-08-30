@@ -33,6 +33,18 @@ class TinyClassifier(torch.nn.Module):
         return self.conv2(x).mean(dim=(-2, -1))
 
 
+class ReshapedGroupedWeightModel(torch.nn.Module):
+    """Checkpoint-compatible grouped projection with a static weight view."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(2, 4, 3))
+
+    def forward(self, x):
+        weight = self.weight.reshape(8, 3, 1, 1)
+        return torch.nn.functional.conv2d(x, weight, groups=2)
+
+
 def _weight_fake_quantizers(model):
     return [
         module
@@ -49,6 +61,18 @@ def _activation_fake_quantizers(model):
         if isinstance(module, FakeQuantizeBase)
         and module.qscheme not in (torch.per_channel_affine, torch.per_channel_symmetric)
     ]
+
+
+@pytest.mark.regression
+def test_shift_aware_freeze_resolves_static_weight_reshape():
+    inputs = torch.randn(2, 6, 8, 8)
+    model = sima_prepare_qat_model(
+        ReshapedGroupedWeightModel(), (inputs,), "cpu"
+    )
+    model(inputs)
+    sima_freeze_qat(model)
+    assert bool(model.qat_frozen.item())
+    assert len(_weight_fake_quantizers(model)) == 1
 
 
 @pytest.mark.regression
