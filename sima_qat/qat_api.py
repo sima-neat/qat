@@ -183,7 +183,7 @@ def _resolve_attr(module: nn.Module, target: str) -> Any:
 
 
 def _resolve_static_weight(module: nn.Module, node: Any) -> Tensor:
-    """Resolve a parameter and compile-time-only shape views feeding an op.
+    """Resolve a parameter and compile-time-only views feeding an op.
 
     Exported PyTorch commonly keeps a checkpoint-compatible parameter shape
     and reshapes it immediately before grouped Conv/Linear. The reshape does
@@ -207,9 +207,20 @@ def _resolve_static_weight(module: nn.Module, node: Any) -> Tensor:
         source = _resolve_static_weight(module, node.args[0])
         shape = tuple(int(value) for value in node.args[1])
         return source.reshape(shape)
+    if (
+        getattr(node, "op", None) == "call_function"
+        and node.target == torch.ops.aten.slice.Tensor
+        and len(node.args) >= 1
+    ):
+        source = _resolve_static_weight(module, node.args[0])
+        dim = int(node.args[1]) if len(node.args) > 1 else 0
+        start = node.args[2] if len(node.args) > 2 else None
+        end = node.args[3] if len(node.args) > 3 else None
+        step = int(node.args[4]) if len(node.args) > 4 else 1
+        return torch.ops.aten.slice.Tensor(source, dim, start, end, step)
     raise RuntimeError(
         "Shift-aware weights must be parameters with optional static "
-        f"reshape/view operations, found {getattr(node, 'op', None)} "
+        f"reshape/view/slice operations, found {getattr(node, 'op', None)} "
         f"{getattr(node, 'target', None)}"
     )
 

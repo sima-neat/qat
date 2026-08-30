@@ -45,6 +45,22 @@ class ReshapedGroupedWeightModel(torch.nn.Module):
         return torch.nn.functional.conv2d(x, weight, groups=2)
 
 
+class SlicedReshapedGroupedWeightModel(torch.nn.Module):
+    """Independent projection fields can be static slices of one parameter."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(2, 6, 3))
+
+    def forward(self, x):
+        left = self.weight[:, :3].reshape(6, 3, 1, 1)
+        right = self.weight[:, 3:].reshape(6, 3, 1, 1)
+        return (
+            torch.nn.functional.conv2d(x, left, groups=2)
+            + torch.nn.functional.conv2d(x, right, groups=2)
+        )
+
+
 def _weight_fake_quantizers(model):
     return [
         module
@@ -73,6 +89,18 @@ def test_shift_aware_freeze_resolves_static_weight_reshape():
     sima_freeze_qat(model)
     assert bool(model.qat_frozen.item())
     assert len(_weight_fake_quantizers(model)) == 1
+
+
+@pytest.mark.regression
+def test_shift_aware_freeze_resolves_static_weight_slice_and_reshape():
+    inputs = torch.randn(2, 6, 8, 8)
+    model = sima_prepare_qat_model(
+        SlicedReshapedGroupedWeightModel(), (inputs,), "cpu"
+    )
+    model(inputs)
+    sima_freeze_qat(model)
+    assert bool(model.qat_frozen.item())
+    assert len(_weight_fake_quantizers(model)) == 2
 
 
 @pytest.mark.regression
