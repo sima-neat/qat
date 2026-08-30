@@ -35,10 +35,76 @@ source .venv/bin/activate
 
 ## Usage
 
-The recommended workflow is **prepare → warm up → freeze → fine-tune → finalize → export**.
+The recommended customer workflow is **prepare → calibrate → ordinary PyTorch
+training → freeze → validate → export**. The returned object is a normal
+`torch.nn.Module`, so it works with standard optimizers and training loops.
 
 ```python
 import torch
+import sima_qat
+
+model = ...
+example_inputs = (torch.randn(1, 3, 224, 224),)
+
+qat = sima_qat.prepare(
+    model,
+    example_inputs,
+    target="modalix",
+    device="cuda",
+)
+
+qat.calibrate(calibration_loader, batches=64)
+
+optimizer = torch.optim.AdamW(qat.parameters(), lr=1e-5)
+for images, labels in train_loader:
+    optimizer.zero_grad()
+    prediction = qat(images)
+    task_loss = criterion(prediction, labels)
+
+    # Adds the recipe's frozen-FP32 preservation loss.
+    loss = qat.loss(task_loss)
+    loss.backward()
+    optimizer.step()
+
+qat.freeze()
+report = qat.validate(validation_loader, evaluator=evaluate_task)
+report.raise_for_failure()
+
+bundle = qat.export("build/model_int8")
+print(bundle.onnx_path, bundle.onnx_sha256)
+```
+
+`recipe="auto"` is the default. It selects `strict_int8_ssm` when Mamba,
+selective-scan, SS2D, or TinyVim modules are present and `strict_int8`
+otherwise. Model-specific qualification can pin a built-in or data-only YAML
+recipe:
+
+```python
+qat = sima_qat.prepare(
+    model,
+    example_inputs,
+    target="modalix",
+    device="cuda",
+    recipe="strict_int8_ssm",
+)
+```
+
+`qat.summary()` reports lifecycle state, detected state-space regions, fake
+quantizer counts, and weighted-operator coverage. `qat.explain()` explains the
+selected policy. Export creates `model.onnx` and `qat_manifest.json`; the
+manifest binds the ONNX checksum and clearly distinguishes host QAT/ONNX
+validation from stock Model Compiler and board evidence.
+
+The session keeps its frozen FP32 teacher out of `parameters()` and
+`state_dict()`, so it does not double optimizer or checkpoint size. Loading a
+session checkpoint restores the frozen-grid lifecycle state.
+
+### Low-level compatibility API
+
+Framework integrations can continue to use the original PT2E control-point
+functions. They remain backward compatible:
+
+```python
 from sima_qat.qat_api import (
     sima_prepare_qat_model,
     sima_freeze_qat,
@@ -46,45 +112,19 @@ from sima_qat.qat_api import (
     sima_export_onnx,
 )
 
-model = ...                                  # any torch.nn.Module
-example_inputs = (torch.randn(1, 3, 224, 224),)
-
-# 1. Insert fake-quant scaffolding. Shift-aware QAT is enabled by default.
-qat_model = sima_prepare_qat_model(model, example_inputs, device='cuda')
-
-# 2. Warm up observers with your normal training loop ...
-
-# 3. Lock Model Compiler-compatible power-of-two scales, then fine-tune.
+qat_model = sima_prepare_qat_model(model, example_inputs, device="cuda")
+# observer warm-up and training ...
 sima_freeze_qat(qat_model)
-# ... continue training qat_model ...
-
-# 4. Convert to inference-only (fake-quant / INT8) form
+# fine-tune locked grids ...
 qat_model = sima_finalize_qat_model(qat_model)
-
-# 5. Export to an INT8 Q/DQ ONNX graph
-sima_export_onnx(qat_model, example_inputs, 'model.onnx', device='cuda')
+sima_export_onnx(qat_model, example_inputs, "model.onnx", device="cuda")
 ```
 
-For recurrent or state-space vision models, select the stricter activation
-policy explicitly instead of relying on process environment variables:
-
-```python
-qat_model = sima_prepare_qat_model(
-    model,
-    example_inputs,
-    device="cuda",
-    activation_observer="minmax",
-    full_range_ste=True,
-    learn_scales=False,
-)
-```
-
-Shift-aware QAT constrains each convolution or linear weight scale so that the
+Shift-aware QAT constrains each convolution or linear weight scale so the
 Model Compiler can use its native integer shift requantization without
-rescaling the learned INT8 weight codes. Calling
-`sima_freeze_qat` explicitly leaves time to fine-tune against those locked scales. Finalization will
-lock them automatically if necessary, but fine-tuning after the explicit call generally gives better
-accuracy.
+rescaling learned INT8 weight codes. Freezing explicitly leaves time to
+fine-tune against locked scales; low-level finalization still freezes
+automatically as a compatibility fallback.
 
 To reproduce the observer-only weight behavior from earlier releases, opt out during preparation:
 
@@ -96,6 +136,10 @@ qat_model = sima_prepare_qat_model(
 
 | function | purpose |
 |---|---|
+| `sima_qat.prepare(model, inputs, target="modalix", recipe="auto")` | Return the recommended lifecycle-managed QAT `nn.Module`. |
+| `qat.calibrate(data, batches=64)` | Collect activation ranges without applying fake quantization. |
+| `qat.loss(task_loss)` | Add scale-normalized frozen-FP32 preservation. |
+| `qat.freeze()` / `qat.validate()` / `qat.export(directory)` | Lock target grids, enforce structural gates, and create a content-bound ONNX bundle. |
 | `sima_prepare_qat_model(model, inputs, device, shift_aware=True)` | Capture the model and insert SiMa fake-quant annotations. Power-of-two-aware weight QAT is the default; pass `False` for the legacy behavior. |
 | `sima_freeze_qat(qat_model)` | Freeze observers and lock AFE-compatible weight scales before final fine-tuning. |
 | `sima_finalize_qat_model(qat_model)` | Fold the trained scaffolding into an inference-only quantized graph. |
@@ -204,6 +248,7 @@ Generated API reference docs live under `docs/generated/` and are linked from th
 
 ```text
 sima_qat/                         # Python package
+  session.py                      # recommended lifecycle-managed customer API
   qat_api.py                      # public API: prepare / finalize / export
   sima_quantizer.py               # SiMa PT2E quantizer
   onnx_ops.py                     # custom ONNX symbolic functions for Q/DQ ops

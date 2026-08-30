@@ -16,6 +16,7 @@ REQUIRED_PACKAGE_MEMBERS = {
     "sima_qat/misc.py",
     "sima_qat/onnx_ops.py",
     "sima_qat/qat_api.py",
+    "sima_qat/session.py",
     "sima_qat/sima_quantizer.py",
 }
 

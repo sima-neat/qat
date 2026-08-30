@@ -23,24 +23,27 @@ sima-cli neat install qat/arm64
 ## Workflow
 
 1. Identify the target `torch.nn.Module` and a representative `example_inputs` tuple.
-2. Prepare with `sima_prepare_qat_model(model, example_inputs, device)`. For
-   recurrent/state-space models, set `activation_observer="minmax"` and
-   `full_range_ste=True` explicitly when the model recipe requires them.
-3. Warm up observers in the normal training loop.
-4. Call `sima_freeze_qat(prepared_model)` to lock Model
-   Compiler-compatible power-of-two weight scales.
-5. Fine-tune with frozen observers and fake quantization enabled.
-6. Finalize with `sima_finalize_qat_model(prepared_model)`.
-7. Export with `sima_export_onnx(finalized_model, example_inputs, output_file,
-   device=device)`. CPU export is the default; use `export_device` only when a
-   qualification recipe pins it.
-8. Audit the ONNX for Q/DQ coverage and compile it with the unmodified stock
+2. Prefer `sima_qat.prepare(model, example_inputs, target="modalix")`. The
+   default auto recipe detects recurrent/state-space modules. Use the low-level
+   `sima_prepare_qat_model` only when a framework integration needs individual
+   PT2E control points.
+3. Run `qat.calibrate(calibration_data, batches=N)` on representative data.
+4. Train normally and wrap each task loss with `qat.loss(task_loss)` to retain
+   the frozen FP32 teacher behavior.
+5. Call `qat.freeze()` to lock Model Compiler-compatible power-of-two weight
+   scales, then continue fine-tuning when the model recipe requires it.
+6. Run `qat.validate(...).raise_for_failure()`.
+7. Export with `qat.export(output_directory)`. The bundle contains `model.onnx`
+   and a checksum-bound `qat_manifest.json`. CPU export is the default; use
+   `export_device` only when a qualification recipe pins it.
+8. Audit the ONNX and compiler graph for full Q/DQ/INT8 coverage and compile with the unmodified stock
    Model Compiler. QAT success does not prove that every remaining operator is
    target-realizable.
 
 ## Repository Conventions
 
-- Import the public API from `sima_qat.qat_api`.
+- Import the recommended customer API from `sima_qat`; keep low-level imports
+  in `sima_qat.qat_api` for compatibility integrations.
 - Keep generated ONNX outputs under `exported_models/` or the pytest export directory.
 - Use CPU smoke coverage unless the behavior specifically requires CUDA.
 - Mark quick installation checks with `@pytest.mark.smoke`; mark normal graph coverage with `@pytest.mark.regression`.
