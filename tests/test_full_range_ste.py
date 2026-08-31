@@ -5,6 +5,7 @@ from sima_qat.qat_api import (
     sima_freeze_qat,
     sima_prepare_qat_model,
     sima_project_qat_to_target_grids,
+    sima_thaw_qat_scales,
 )
 from sima_qat.sima_quantizer import FullRangeSTEFakeQuantize, _LearnedScaleSTE
 
@@ -61,6 +62,64 @@ def test_target_grid_projection_makes_live_qat_equal_to_final_freeze():
     for projected_pair, frozen_pair in zip(projected_qparams, frozen_qparams):
         torch.testing.assert_close(frozen_pair[0], projected_pair[0], rtol=0, atol=0)
         torch.testing.assert_close(frozen_pair[1], projected_pair[1], rtol=0, atol=0)
+
+
+def test_frozen_checkpoint_load_and_thaw_use_export_scale_authority():
+    value = torch.randn(1, 3, 4, 4)
+    prepared = sima_prepare_qat_model(
+        TinyConv(),
+        (value,),
+        "cpu",
+        shift_aware=True,
+        full_range_ste=True,
+        learn_scales=True,
+    )
+    prepared(value)
+    sima_freeze_qat(prepared)
+    activation = next(
+        module
+        for module in prepared.modules()
+        if hasattr(module, "log_scale") and not module.is_per_channel
+    )
+
+    # Emulate a legacy frozen checkpoint whose retained learned value predates
+    # the final power-of-two coarsening.
+    state = prepared.state_dict()
+    state_key = next(
+        name for name, parameter in prepared.named_parameters()
+        if parameter is activation.log_scale
+    )
+    state[state_key] = (activation.scale / 2).log()
+
+    restored = sima_prepare_qat_model(
+        TinyConv(),
+        (value,),
+        "cpu",
+        shift_aware=True,
+        full_range_ste=True,
+        learn_scales=True,
+    )
+    restored.load_state_dict(state, strict=True)
+    restored_activation = dict(restored.named_modules())[
+        state_key.removesuffix(".log_scale")
+    ]
+    torch.testing.assert_close(
+        restored_activation.current_learned_scale(),
+        restored_activation.scale,
+        rtol=0,
+        atol=0,
+    )
+    assert not restored_activation.learn_scale
+
+    sima_thaw_qat_scales(restored, [restored_activation.log_scale])
+    torch.testing.assert_close(
+        restored_activation.current_learned_scale(),
+        restored_activation.scale,
+        rtol=0,
+        atol=0,
+    )
+    assert restored_activation.learn_scale
+    assert not bool(restored.qat_frozen.item())
 
 
 def test_prepare_options_override_process_environment(monkeypatch):

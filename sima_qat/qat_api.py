@@ -1029,16 +1029,68 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
             )
         )
 
-    # Frozen activation scales are now the observer/export qparams. Disable
-    # the learned-scale forward so it cannot restore exp(log_scale) after the
-    # exact synchronization above. The parameter remains in the state dict for
-    # topology-compatible checkpoint loading but is no longer consulted.
-    for fake_quant, _, _, _, _ in activation_qparams:
+    # Frozen activation scales are now the observer/export qparams. Persist
+    # that final (possibly coarsened) grid into log_scale as well. Otherwise a
+    # strict checkpoint load + thaw can resurrect the pre-solver learned grid.
+    for fake_quant, scale, _, _, _ in activation_qparams:
+        if hasattr(fake_quant, "log_scale"):
+            if hasattr(fake_quant, "set_projected_learned_scale"):
+                fake_quant.set_projected_learned_scale(scale)
+            else:
+                fake_quant.log_scale.copy_(
+                    scale.detach().to(
+                        device=fake_quant.log_scale.device,
+                        dtype=fake_quant.log_scale.dtype,
+                    ).clamp_min(1e-12).log()
+                )
         if hasattr(fake_quant, "learn_scale"):
             fake_quant.learn_scale = False
 
     qat_model.meta["qat_activation_retargets"] = activation_retargets
     qat_model.qat_frozen.fill_(1)
+    return qat_model
+
+
+@torch.no_grad()
+def sima_thaw_qat_scales(
+    qat_model: GraphModule,
+    scale_parameters: Optional[Iterable[Tensor]] = None,
+) -> GraphModule:
+    """Thaw learned grids from the authoritative frozen/export scale buffers."""
+
+    if not isinstance(qat_model, GraphModule):
+        raise RuntimeError(
+            "Input graph to QAT scale thaw must be a GraphModule, "
+            f"found {type(qat_model)}"
+        )
+    selected_ids = (
+        None if scale_parameters is None else {id(parameter) for parameter in scale_parameters}
+    )
+    thawed = 0
+    for fake_quant in qat_model.modules():
+        if (
+            not hasattr(fake_quant, "log_scale")
+            or getattr(fake_quant, "is_per_channel", False)
+            or (selected_ids is not None and id(fake_quant.log_scale) not in selected_ids)
+        ):
+            continue
+        if hasattr(fake_quant, "set_projected_learned_scale"):
+            fake_quant.set_projected_learned_scale(fake_quant.scale)
+        else:
+            fake_quant.log_scale.copy_(
+                fake_quant.scale.detach().to(
+                    device=fake_quant.log_scale.device,
+                    dtype=fake_quant.log_scale.dtype,
+                ).clamp_min(1e-12).log()
+            )
+        fake_quant.learn_scale = True
+        thawed += 1
+    if selected_ids is not None and thawed != len(selected_ids):
+        raise RuntimeError(
+            f"Requested {len(selected_ids)} learned activation grids but thawed {thawed}"
+        )
+    if hasattr(qat_model, "qat_frozen"):
+        qat_model.qat_frozen.fill_(0)
     return qat_model
 
 
@@ -1361,6 +1413,20 @@ class SimaQatWrapper(GraphModule):
                     and not getattr(fake_quant, "is_per_channel", False)
                     and hasattr(fake_quant, "learn_scale")
                 ):
+                    # The serialized scale buffer is the frozen/export
+                    # authority. Repair legacy checkpoints whose retained
+                    # log_scale predates final shift-aware coarsening and
+                    # rebuild the nonpersistent exact-scale anchor.
+                    if hasattr(fake_quant, "log_scale"):
+                        if hasattr(fake_quant, "set_projected_learned_scale"):
+                            fake_quant.set_projected_learned_scale(fake_quant.scale)
+                        else:
+                            fake_quant.log_scale.copy_(
+                                fake_quant.scale.detach().to(
+                                    device=fake_quant.log_scale.device,
+                                    dtype=fake_quant.log_scale.dtype,
+                                ).clamp_min(1e-12).log()
+                            )
                     fake_quant.learn_scale = False
         return result
 
