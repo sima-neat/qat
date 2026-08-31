@@ -38,7 +38,7 @@ if tuple(int(part) for part in torch.__version__.split("+", 1)[0].split(".")[:2]
     raise RuntimeError(f"Sima QAT requires torch 2.8.x, found {torch.__version__}")
 
 from torch import nn, Tensor
-from torch.export import export_for_training
+from torch.export import Dim, export_for_training
 from torch.ao.quantization.quantize_pt2e import (
   prepare_qat_pt2e,
   convert_pt2e,
@@ -51,10 +51,15 @@ from torch.ao.quantization import (
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
 from torch.fx.graph_module import GraphModule
 from torch.fx.node import Node
+from torch.utils._pytree import tree_flatten, tree_map
 
 
 from sima_qat import onnx_ops
-from sima_qat.sima_quantizer import SimaQuantizer, get_sima_quantization_config
+from sima_qat.sima_quantizer import (
+    SimaFakeQuantize,
+    SimaQuantizer,
+    get_sima_quantization_config,
+)
 
 
 device_modifier_ops = [
@@ -79,6 +84,10 @@ def sima_prepare_qat_model(
         QAT optimization will be limited to the graph given by the `input_graph` argument. This region
         must always be contained to the level of hierarchy as described by a single nn.Module.
 
+        Tensor inputs that share the first tensor's leading dimension are treated as batched inputs.
+        Their batch dimension remains dynamic during QAT, including when preparation uses a batch-one
+        example. The inputs passed separately to `sima_export_onnx` determine the deployment shape.
+
     Args:
         input_graph: an eager-mode `nn.Module` representing the model on which QAT is to be performed.
             This may be a full model, or may be a sub-section of an ML model.
@@ -100,7 +109,12 @@ def sima_prepare_qat_model(
     # We have to move things to the CPU to do the scaffolding. We will return the model to the proper
     # device when we are done.
     input_graph.to("cpu")
-    m = export_for_training(input_graph, inputs).module()
+    capture_inputs, dynamic_shapes = _automatic_batch_capture(inputs)
+    m = export_for_training(
+        input_graph,
+        capture_inputs,
+        dynamic_shapes=dynamic_shapes,
+    ).module()
     m = replace_dropout(m)
 
     cfg = get_sima_quantization_config(is_qat=True)
@@ -112,6 +126,49 @@ def sima_prepare_qat_model(
     sima_mod = check_graph_nodes(sima_mod, device)
 
     return sima_mod
+
+
+def _automatic_batch_capture(inputs: Tuple) -> Tuple[Tuple, Optional[Any]]:
+    """Keep the leading training batch dynamic without exposing Torch shape APIs.
+
+    Torch specializes dimensions whose example value is zero or one. When the
+    caller supplies a batch-one example, capture an equivalent duplicated batch
+    so ``Dim.AUTO`` can retain a symbolic leading dimension. Only tensor inputs
+    whose leading size matches the first tensor input are treated as batched.
+    Final deployment export remains controlled independently by the inputs
+    passed to :func:`sima_export_onnx`.
+    """
+    leaves, _ = tree_flatten(inputs)
+    tensor_inputs = [
+        value for value in leaves if isinstance(value, Tensor) and value.ndim > 0
+    ]
+    if not tensor_inputs:
+        return inputs, None
+
+    batch_size = tensor_inputs[0].shape[0]
+    if batch_size < 1:
+        return inputs, None
+
+    def is_batched(tensor: Tensor) -> bool:
+        return tensor.ndim > 0 and tensor.shape[0] == batch_size
+
+    capture_inputs = tree_map(
+        lambda tensor: (
+            torch.cat((tensor, tensor), dim=0)
+            if isinstance(tensor, Tensor) and batch_size == 1 and is_batched(tensor)
+            else tensor
+        ),
+        inputs,
+    )
+    dynamic_shapes = tree_map(
+        lambda tensor: (
+            {0: Dim.AUTO}
+            if isinstance(tensor, Tensor) and is_batched(tensor)
+            else None
+        ),
+        inputs,
+    )
+    return capture_inputs, dynamic_shapes
 
 
 _SHIFT_AWARE_OPS = {
@@ -398,20 +455,29 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
             f"parameters for {len(skipped)} op(s): {', '.join(skipped)}"
         )
 
+    fake_quantizers = [
+        module for module in qat_model.modules() if isinstance(module, FakeQuantizeBase)
+    ]
+    unsupported = [
+        type(module).__name__
+        for module in fake_quantizers
+        if not isinstance(module, SimaFakeQuantize)
+    ]
+    if unsupported:
+        raise RuntimeError(
+            "Sima QAT cannot freeze qparams for unsupported fake quantizer(s): "
+            + ", ".join(sorted(set(unsupported)))
+        )
+
     # Do not mutate observer state until every shift-aware layer has validated.
     qat_model.apply(disable_observer)
     _freeze_batchnorm_stats(qat_model)
     for weight_fq, scales in locked_scales:
         weight_fq.scale.resize_(scales.shape).copy_(scales)
-        # Keep the symmetric zero point explicit and correctly sized.
         weight_fq.zero_point.resize_(scales.shape).zero_()
-        # Keep observer state consistent with the locked qparams as well. This
-        # makes checkpoints self-describing and avoids restoring an old scale
-        # if observers are explicitly re-enabled by a training framework.
-        weight_observer = weight_fq.activation_post_process
-        locked_range = scales * 127.0
-        weight_observer.min_val.resize_(scales.shape).copy_(-locked_range)
-        weight_observer.max_val.resize_(scales.shape).copy_(locked_range)
+
+    for fake_quantizer in fake_quantizers:
+        fake_quantizer.freeze_qparams()
 
     qat_model.qat_frozen.fill_(1)
     return qat_model

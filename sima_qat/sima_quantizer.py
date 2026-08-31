@@ -114,9 +114,26 @@ _conv2d_bn_example_inputs = (
 
 
 __all__ = [
+    "SimaFakeQuantize",
     "SimaQuantizer",
     "get_sima_quantization_config",
 ]
+
+
+class SimaFakeQuantize(FakeQuantize):
+    """Fake quantizer whose frozen buffers are authoritative for conversion."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.register_buffer("sima_qparams_frozen", torch.tensor([False], dtype=torch.bool))
+
+    def calculate_qparams(self):
+        if bool(self.sima_qparams_frozen.item()):
+            return self.scale, self.zero_point
+        return super().calculate_qparams()
+
+    def freeze_qparams(self) -> None:
+        self.sima_qparams_frozen.fill_(True)
 
 
 class SimaMovingAverageMinMaxObserver(MovingAverageMinMaxObserver):
@@ -205,7 +222,7 @@ def get_sima_quantization_config(
     # ---------------------------------------------------
     act_extra_args: Dict[str, Any] = {"eps": 2**-12}
     if is_qat:
-        act_observer_or_fake_quant_ctr = FakeQuantize
+        act_observer_or_fake_quant_ctr = SimaFakeQuantize
         act_extra_args["observer"] = SimaMovingAverageMinMaxObserver
     else:
         # If QAT is disabled, we can add histogram observers to collect data.
@@ -230,7 +247,7 @@ def get_sima_quantization_config(
     # Weights will always be captured as per-channel symmetric.
     wt_extra_args: Dict[str, Any] = {"eps": 2**-12}
     if is_qat:
-        weight_observer_or_fake_quant_ctr = FakeQuantize
+        weight_observer_or_fake_quant_ctr = SimaFakeQuantize
         wt_extra_args["observer"] = MovingAveragePerChannelMinMaxObserver
     else:
         weight_observer_or_fake_quant_ctr = PlaceholderObserver

@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from torch.ao.quantization.fake_quantize import FakeQuantizeBase
 
 from sima_qat import sima_freeze_qat, sima_prepare_qat_model
 from sima_qat.qat_api import _SHIFT_AWARE_OPS, _fake_quant_module, _find_output_fake_quant
@@ -88,6 +89,11 @@ def test_frozen_checkpoint_resumes_without_legacy_mode_state() -> None:
     resumed = sima_prepare_qat_model(TinyClassifier(), (inputs,), "cpu")
     resumed.load_state_dict(state)
     assert bool(resumed.qat_frozen.item())
+    assert all(
+        bool(module.sima_qparams_frozen.item())
+        for module in resumed.modules()
+        if isinstance(module, FakeQuantizeBase)
+    )
 
     transitional_state = state.copy()
     transitional_state["shift_aware_qat"] = torch.tensor([True])
