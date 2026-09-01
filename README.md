@@ -71,9 +71,17 @@ integer shift requantization without rescaling the learned INT8 weight codes. Ca
 lock them automatically if necessary, but fine-tuning after the explicit call generally gives better
 accuracy.
 
+Preparation preserves the exact example shapes by default. Models that are
+truly batch-polymorphic can opt in with
+`sima_prepare_qat_model(..., dynamic_batch=True)`. The opt-in capture is
+validated on the original example and fails closed when batch participates in
+folded recurrence, scan-direction, or layout geometry.
+This deliberately replaces prior automatic batch-one duplication; existing
+three-argument calls remain valid but now capture static shapes.
+
 | function | purpose |
 |---|---|
-| `sima_prepare_qat_model(model, inputs, device)` | Capture the model and insert SiMa shift-aware fake-quant annotations. |
+| `sima_prepare_qat_model(model, inputs, device, *, dynamic_batch=False)` | Capture the model and insert SiMa shift-aware fake-quant annotations. Dynamic training batch is explicit opt-in. |
 | `sima_freeze_qat(qat_model)` | Freeze observers and lock AFE-compatible weight scales before final fine-tuning. |
 | `sima_finalize_qat_model(qat_model)` | Fold the trained scaffolding into an inference-only quantized graph. |
 | `sima_export_onnx(qat_model, inputs, output_file, ...)` | Export the finalized model to an ONNX QuantizeLinear/DequantizeLinear graph. |

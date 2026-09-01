@@ -36,6 +36,15 @@ class UnsupportedStaticWeightExpression(torch.nn.Module):
         return torch.nn.functional.conv2d(inputs, torch.sin(self.weight), padding=1)
 
 
+class SlicedStaticWeightConv(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(8, 3, 3, 3))
+
+    def forward(self, inputs):
+        return torch.nn.functional.conv2d(inputs, self.weight[:4], padding=1)
+
+
 class TinyWeightLinear(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -67,6 +76,40 @@ def test_scale_larger_than_shift_zero_grid_is_rejected() -> None:
             torch.tensor([1.0]),
             torch.tensor([2.0]),
         )
+
+
+def test_freeze_coarsens_output_grid_to_make_shift_zero_realizable() -> None:
+    inputs = torch.randn(2, 3, 8, 8)
+    model = sima_prepare_qat_model(Conv2dModel(), (inputs,), "cpu")
+    model(inputs)
+    conv = next(
+        node
+        for node in model.graph.nodes
+        if node.op == "call_function" and node.target == torch.ops.aten.conv2d.default
+    )
+    input_fq = _fake_quant_module(model, conv.args[0])
+    weight_fq = _fake_quant_module(model, conv.args[1])
+    output_fq = _find_output_fake_quant(model, conv)
+    assert input_fq is not None and weight_fq is not None and output_fq is not None
+
+    # sx=1, sy=0.001, and |w|max=1 requires sx*sw/sy > 1. The only
+    # target-realizable solution is to coarsen the Conv output grid before
+    # selecting the shift-0 weight scale.
+    input_fq.activation_post_process.min_val.fill_(-128.0)
+    input_fq.activation_post_process.max_val.fill_(127.0)
+    output_fq.activation_post_process.min_val.fill_(-0.128)
+    output_fq.activation_post_process.max_val.fill_(0.127)
+    with torch.no_grad():
+        model.conv.weight.fill_(1.0)
+    scale_before = float(output_fq.activation_post_process.calculate_qparams()[0])
+
+    sima_freeze_qat(model)
+
+    assert float(output_fq.scale) > scale_before
+    assert bool((weight_fq.scale * 127.0 >= 1.0).all())
+    normalized = float(input_fq.scale) * weight_fq.scale / float(output_fq.scale)
+    assert bool((normalized <= 1.0).all())
+    assert model.meta["qat_activation_retargets"]
 
 
 def test_all_frozen_fake_quantizers_use_stored_qparams_exactly() -> None:
@@ -214,6 +257,17 @@ def test_unknown_static_weight_operation_is_rejected() -> None:
     assert not bool(model.qat_frozen.item())
 
 
+def test_static_sliced_weight_is_locked() -> None:
+    inputs = torch.randn(2, 3, 8, 8)
+    model = sima_prepare_qat_model(SlicedStaticWeightConv(), (inputs,), "cpu")
+    model(inputs)
+
+    sima_freeze_qat(model)
+
+    assert bool(model.qat_frozen.item())
+    assert torch.isfinite(model(inputs)).all()
+
+
 def test_freeze_is_atomic_when_a_layer_has_incomplete_qparams() -> None:
     inputs = torch.randn(2, 3, 8, 8)
     model = sima_prepare_qat_model(Conv2dModel(), (inputs,), "cpu")
@@ -232,11 +286,33 @@ def test_freeze_is_atomic_when_a_layer_has_incomplete_qparams() -> None:
     input_fq = _fake_quant_module(model, conv.args[0])
     weight_fq = _fake_quant_module(model, conv.args[1])
     assert input_fq is not None and weight_fq is not None
-    original_weight_scale = weight_fq.scale.detach().clone()
+    original_states = []
+    for fake_quant in (
+        module
+        for module in model.modules()
+        if isinstance(module, FakeQuantizeBase)
+    ):
+        observer = fake_quant.activation_post_process
+        original_states.append(
+            (
+                fake_quant,
+                fake_quant.scale.detach().clone(),
+                fake_quant.zero_point.detach().clone(),
+                fake_quant.observer_enabled.detach().clone(),
+                observer.min_val.detach().clone(),
+                observer.max_val.detach().clone(),
+            )
+        )
 
     with pytest.raises(RuntimeError, match="could not determine complete"):
         sima_freeze_qat(model)
 
     assert not bool(model.qat_frozen.item())
     assert bool(input_fq.observer_enabled.item())
-    torch.testing.assert_close(weight_fq.scale, original_weight_scale, rtol=0, atol=0)
+    for fake_quant, scale, zero_point, enabled, minimum, maximum in original_states:
+        torch.testing.assert_close(fake_quant.scale, scale, rtol=0, atol=0)
+        torch.testing.assert_close(fake_quant.zero_point, zero_point, rtol=0, atol=0)
+        torch.testing.assert_close(fake_quant.observer_enabled, enabled, rtol=0, atol=0)
+        observer = fake_quant.activation_post_process
+        torch.testing.assert_close(observer.min_val, minimum, rtol=0, atol=0)
+        torch.testing.assert_close(observer.max_val, maximum, rtol=0, atol=0)
