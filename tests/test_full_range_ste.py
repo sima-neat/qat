@@ -264,6 +264,63 @@ def test_learned_scale_gradient_tracks_quantization_strength():
     torch.testing.assert_close(gradients[1], 0.25 * gradients[0])
 
 
+def test_relative_scale_learning_preserves_exact_frozen_forward():
+    fixed = FullRangeSTEFakeQuantize(
+        observer=MinMaxObserver,
+        quant_min=-128,
+        quant_max=127,
+        dtype=torch.int8,
+        qscheme=torch.per_tensor_affine,
+        learn_scale=False,
+    )
+    learned = FullRangeSTEFakeQuantize(
+        observer=MinMaxObserver,
+        quant_min=-128,
+        quant_max=127,
+        dtype=torch.int8,
+        qscheme=torch.per_tensor_affine,
+        learn_scale=True,
+    )
+    # 2/255 does not survive an absolute exp(log(scale)) round trip exactly.
+    scale = torch.tensor([2.0 / 255.0], dtype=torch.float32)
+    zero_point = torch.tensor([-128], dtype=torch.int32)
+    for fake_quant in (fixed, learned):
+        fake_quant.scale.copy_(scale)
+        fake_quant.zero_point.copy_(zero_point)
+        torch.ao.quantization.disable_observer(fake_quant)
+    learned.enable_relative_scale_learning()
+    value = torch.linspace(-0.01, 2.01, 8193)
+
+    assert torch.equal(learned.current_learned_scale(), scale)
+    assert torch.equal(learned(value), fixed(value))
+    assert "_relative_scale_anchor" not in learned.state_dict()
+
+
+def test_relative_scale_learning_receives_gradient_and_synchronizes():
+    fake_quant = FullRangeSTEFakeQuantize(
+        observer=MinMaxObserver,
+        quant_min=-128,
+        quant_max=127,
+        dtype=torch.int8,
+        qscheme=torch.per_tensor_affine,
+        learn_scale=True,
+    )
+    fake_quant.scale.fill_(2.0 / 255.0)
+    fake_quant.zero_point.fill_(-128)
+    torch.ao.quantization.disable_observer(fake_quant)
+    fake_quant.enable_relative_scale_learning()
+    value = torch.tensor([0.013, 0.127, 0.991, 1.999])
+    fake_quant(value).sum().backward()
+
+    assert fake_quant.log_scale.grad is not None
+    assert float(fake_quant.log_scale.grad.abs().max()) > 0
+    with torch.no_grad():
+        fake_quant.log_scale.add_(0.01)
+        expected = fake_quant.current_learned_scale().detach().clone()
+        fake_quant.sync_learned_scale()
+    torch.testing.assert_close(fake_quant.scale, expected, rtol=0, atol=0)
+
+
 def test_learned_scale_saturation_gradient_is_bounded_by_int8_rail():
     value = torch.tensor([-1000.0, 0.6, 1000.0])
     scale = torch.tensor([2.0], requires_grad=True)
@@ -273,9 +330,21 @@ def test_learned_scale_saturation_gradient_is_bounded_by_int8_rail():
     )
     output.sum().backward()
 
-    # LSQ: lower rail + in-range rounding error + upper rail.
-    expected = -128.0 + (round(0.6 / 2.0) - 0.6 / 2.0) + 127.0
-    torch.testing.assert_close(scale.grad, torch.tensor([expected]))
+    # LSQ: lower rail + in-range rounding error + upper rail. The custom
+    # autograd function deliberately stores the elementwise surrogate in
+    # FP16 to halve activation-tape memory, then accumulates it in FP32. Test
+    # that exact documented storage contract rather than accidentally asking
+    # a half-precision -0.3 to equal its binary32 value.
+    stored_terms = torch.tensor(
+        [-128.0, round(0.6 / 2.0) - 0.6 / 2.0, 127.0],
+        dtype=torch.float16,
+    ).float()
+    expected = stored_terms.sum().reshape(1)
+    torch.testing.assert_close(scale.grad, expected, rtol=0, atol=0)
+    # Most importantly, the two saturated outliers contribute bounded rail
+    # codes, not the unbounded q-x/s continuation (which would be about zero
+    # only through cancellation here and can have the wrong sign in practice).
+    assert float(scale.grad.abs()) < 2.0
 
 
 def test_frozen_learned_scale_uses_memory_bounded_full_range_ste(monkeypatch):

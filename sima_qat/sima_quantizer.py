@@ -165,7 +165,17 @@ class _LearnedScaleSTE(torch.autograd.Function):
         detached_zero_point = zero_point.detach().to(value.dtype)
         normalized = value.detach() / detached_scale + detached_zero_point
         code = torch.round(normalized).clamp(quant_min, quant_max)
-        dequantized = (code - detached_zero_point) * detached_scale
+        # Use the same native kernel as the fixed-scale strict-INT8 forward.
+        # Reconstructing Q/DQ as round/divide/multiply is mathematically
+        # equivalent over reals but not bit-equivalent in float32; one-ULP
+        # differences are observable in long recurrent graphs.
+        dequantized = torch.fake_quantize_per_tensor_affine(
+            value,
+            detached_scale,
+            zero_point.detach().to(torch.int32),
+            quant_min,
+            quant_max,
+        )
         # The LSQ error is the only activation-dependent value needed for the
         # scalar scale gradient.  Saving it in FP16 is substantially smaller
         # than retaining the FP32 activation (or both activation and code) at
@@ -276,6 +286,13 @@ class FullRangeSTEFakeQuantize(FakeQuantize):
             if learn_scale is None
             else bool(learn_scale)
         )
+        # Optional training-only reparameterization used when reopening a
+        # qualified frozen grid.  Keeping the exact float32 anchor avoids the
+        # one-ULP ``exp(log(scale))`` round trip at delta zero; recurrent INT8
+        # graphs can amplify that otherwise harmless-looking perturbation.
+        # This is intentionally non-persistent: callers must synchronize or
+        # freeze the selected scale before serializing a deploy checkpoint.
+        self._relative_scale_anchor = None
         if self.learn_scale:
             self.log_scale = torch.nn.Parameter(self.scale.detach().clamp_min(1e-12).log())
             # Training-only anchor for an exactly projected float32 scale.
@@ -288,6 +305,7 @@ class FullRangeSTEFakeQuantize(FakeQuantize):
     @torch.no_grad()
     def initialize_learned_scale(self):
         if self.learn_scale:
+            self._relative_scale_anchor = None
             self.log_scale.copy_(self.scale.detach().clamp_min(1e-12).log())
             self._learned_scale_anchor = self.scale.detach().clone()
             self._learned_log_scale_anchor = self.log_scale.detach().clone()
@@ -311,6 +329,36 @@ class FullRangeSTEFakeQuantize(FakeQuantize):
         self.log_scale.copy_(scale.log())
         self._learned_scale_anchor = scale.clone()
         self._learned_log_scale_anchor = self.log_scale.detach().clone()
+
+    @torch.no_grad()
+    def enable_relative_scale_learning(self):
+        """Learn a log multiplier around the exact current activation scale.
+
+        At initialization the effective scale is ``anchor * exp(0)`` and is
+        therefore bit-identical to ``anchor`` in float32.  This is preferable
+        to the absolute ``exp(log(anchor))`` parameterization when resuming a
+        frozen, accuracy-qualified recurrent graph.  The anchor is
+        training-only; call :meth:`sync_learned_scale` and freeze before
+        saving a deployment checkpoint.
+        """
+
+        if self.is_per_channel:
+            raise RuntimeError("relative scale learning supports activations only")
+        if not hasattr(self, "log_scale"):
+            raise RuntimeError("relative scale learning requires learn_scale=True")
+        self._relative_scale_anchor = self.scale.detach().clone()
+        self.log_scale.zero_()
+        self.learn_scale = True
+
+    def current_learned_scale(self):
+        """Return the differentiable scale used by the learned-scale forward."""
+
+        if self._relative_scale_anchor is not None:
+            anchor = self._relative_scale_anchor.to(
+                device=self.log_scale.device, dtype=self.log_scale.dtype
+            )
+            return anchor * self.log_scale.exp()
+        return self.log_scale.exp()
 
     @torch.no_grad()
     def sync_learned_scale(self):
@@ -654,6 +702,12 @@ class SimaQuantizer(Quantizer):
         "sima_conv_transpose2d",
         "conv_relu",
         "conv",
+        # XNNPACK's source-partition Conv annotator treats repeated calls to
+        # one module as a single partition because they share the same weight
+        # get_attr node.  It consequently annotates only the first call.  A
+        # strict W8A8 graph must cover every invocation, so finish any Conv2d
+        # nodes left behind by the source-pattern pass.
+        "sima_unannotated_conv2d",
         "adaptive_avg_pool2d",
         "max_pool2d",
         "sima_add_hardtanh",
@@ -1046,6 +1100,58 @@ def _sima_annotate_conv_transpose2d(
         )
         _mark_nodes_as_annotated(partition)
         annotated_partitions.append(partition)
+    return annotated_partitions
+
+
+@register_annotator("sima_unannotated_conv2d")
+def _sima_annotate_unannotated_conv2d(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    """Annotate Conv2d invocations missed when a module is called repeatedly.
+
+    PT2E/XNNPACK source partitions include the shared weight node when they
+    decide whether a Conv partition is already annotated.  After annotating
+    the first invocation, that shared node makes all later invocations appear
+    annotated even though the Conv nodes have no qspec.  Check the operation
+    itself instead and attach the normal SiMa activation/weight/bias specs to
+    every remaining call.  This is not a DepthART special case: weight tying
+    and recurrent/module-reuse patterns can trigger it in any PyTorch model.
+    """
+    if quantization_config is None:
+        return []
+    annotated_partitions: List[List[Node]] = []
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.conv2d.default:
+            continue
+        annotation = node.meta.get("quantization_annotation")
+        if annotation is not None and annotation._annotated:
+            continue
+        if filter_fn and not filter_fn(node):
+            continue
+        if len(node.args) < 2 or not isinstance(node.args[0], Node):
+            raise RuntimeError("Conv2d activation must be an FX node")
+        weight = node.args[1]
+        if not isinstance(weight, Node):
+            raise RuntimeError("Conv2d weight must be an FX node")
+        bias = node.args[2] if len(node.args) > 2 else None
+        input_qspec_map = {
+            node.args[0]: get_input_act_qspec(quantization_config),
+            weight: get_weight_qspec(quantization_config),
+        }
+        if isinstance(bias, Node):
+            input_qspec_map[bias] = get_bias_qspec(quantization_config)
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            output_qspec=get_output_act_qspec(quantization_config),
+            _annotated=True,
+        )
+        # Do not mark the shared weight get_attr as an operation partition:
+        # each Conv invocation owns its own annotation while reusing that
+        # weight's resulting fake-quant module is valid and intentional.
+        _mark_nodes_as_annotated([node])
+        annotated_partitions.append([node])
     return annotated_partitions
 
 

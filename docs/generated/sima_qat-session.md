@@ -50,13 +50,6 @@ teacher is intentionally kept out of module registration: it follows
 device moves but does not double checkpoints, optimizer state, or DDP
 parameter broadcasts.
 
-### Method: `QATSession.curriculum(step, total_steps, ramp_fraction=None, *, dropout_probability=None, dropout_decay_fraction=None)`
-
-Apply the recipe's activation-rounding curriculum. Optional QDrop bypasses a
-random subset of activation elements during training and decays linearly to
-zero. Evaluation is always strict Q/DQ, and validation fails while a nonzero
-training dropout remains configured.
-
 ### Function: `prepare(model, example_inputs, target, device, recipe, shadow_weight)`
 
 Prepare a model with the recommended SiMa strict-INT8 QAT workflow.

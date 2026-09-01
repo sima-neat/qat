@@ -9,10 +9,11 @@ import json
 import zipfile
 from pathlib import Path, PurePosixPath
 
-
 REQUIRED_PACKAGE_MEMBERS = {
     "sima_qat/VERSION",
     "sima_qat/__init__.py",
+    "sima_qat/depthart.py",
+    "sima_qat/dynamic_p64.py",
     "sima_qat/misc.py",
     "sima_qat/onnx_ops.py",
     "sima_qat/qat_api.py",
@@ -41,7 +42,7 @@ def verify_bundle(bundle: Path) -> dict[str, object]:
     resources = metadata.get("resources")
     checksums = metadata.get("resources-checksum")
     if not isinstance(resources, list) or not isinstance(checksums, dict):
-        raise RuntimeError("QAT metadata has no resource/checksum contract")
+        raise TypeError("QAT metadata has no resource/checksum contract")
     if set(resources) != set(checksums):
         raise RuntimeError("QAT metadata resources and checksums differ")
 

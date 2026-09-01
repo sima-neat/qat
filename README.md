@@ -161,6 +161,61 @@ rescaling learned INT8 weight codes. Freezing explicitly leaves time to
 fine-tune against locked scales; low-level finalization still freezes
 automatically as a compatibility fallback.
 
+### DepthART dynamic-INT8 recurrence extension
+
+DepthART's selective scan can use the qualified `q8 + p64` recurrence without
+exposing compiler details in the training loop. The model remains ordinary
+PyTorch; a compatible SS2D module supplies
+`enable_depthart_dynamic_p64_scan_()` and
+`freeze_depthart_dynamic_p64_()` methods.
+
+```python
+import torch
+from sima_qat import (
+    enable_depthart_dynamic_p64_fake_quant,
+    freeze_depthart_dynamic_p64,
+    prepare_depthart_dynamic_p64,
+    write_depthart_dynamic_p64_compile_profile,
+)
+
+model = load_depthart().cuda().eval()
+prepared = prepare_depthart_dynamic_p64(
+    model,
+    safety_margin=1.05,
+    observe=True,
+)
+
+# Observe real recurrence ranges without quantizing the forward pass.
+enable_depthart_dynamic_p64_fake_quant(model, False)
+with torch.no_grad():
+    for image in calibration_loader:
+        model(image.cuda())
+
+# Freeze base grids, then train/evaluate the exact integer forward with STE.
+contracts = freeze_depthart_dynamic_p64(model)
+enable_depthart_dynamic_p64_fake_quant(model, True)
+fine_tune_with_task_loss(model, train_loader)
+
+example = torch.zeros(1, 3, 448, 576, device="cuda")
+torch.onnx.export(model.eval(), (example,), "depthart.onnx", opset_version=17)
+profile = write_depthart_dynamic_p64_compile_profile(
+    model, "depthart.onnx", "depthart.depthart_p64.json"
+)
+```
+
+Preparation automatically splits DepthART's independent state into physical
+C128 blocks and removes only the first chunk's exact `a * 0 + b` identity.
+The latter is real-math equivalent and prevents size-dependent constant
+folding from invalidating source bindings. Profile creation rejects a
+provably-zero state product if a custom model bypasses this architecture rule.
+
+The ONNX remains a standard Q/DQ + Mul/Add graph. The companion profile is
+content-bound to the exact ONNX bytes and names every recurrence boundary;
+the SiMa Model Compiler fails closed if a binding, static grid, or carrier ABI
+does not match. Host recurrence accuracy is an isolation result, not silicon
+evidence—claim full strict INT8 only after the compiled precision audit and
+board evaluation pass.
+
 To reproduce the observer-only weight behavior from earlier releases, opt out during preparation:
 
 ```python

@@ -38,6 +38,34 @@ Args:
 Returns:
     GraphModule: a compiled version of the given graph with QAT annotations, ready to begin training.
 
+### Function: `sima_qat_activation_diagnostics(qat_model, inputs)`
+
+Measure strict fake-quant error at every activation boundary.
+
+The report is a one-forward diagnostic, not calibration. It records the
+quantities that determine whether an A8 domain can represent its signal:
+RMS, RMSE, SQNR, step/RMS, saturation, and zero-code fraction.
+
+### Function: `sima_qat_activation_sensitivity(qat_model, inputs, objective, *, candidate_names)`
+
+Rank activation grids by first-order task-loss sensitivity.
+
+Local quantization RMSE alone is not a useful optimization priority: a
+large error on a masked coordinate or an insensitive residual can matter
+less than a small error on an attention probability.  For fake-quantizer
+``i`` this diagnostic measures the Taylor term
+
+``|dL/dq_i * (q_i - x_i)|``
+
+under a caller-supplied scalar objective ``L``.  The returned
+``taylor_l1`` is the cancellation-free sum over tensor elements and calls;
+``taylor_dot_abs`` is the absolute signed first-order loss change.  The
+method changes no qparams or model weights and is intended to select a
+bounded set of learned activation scales before QAT.
+
+``candidate_names`` should be used for large graphs so only the relevant
+model region retains quantization residuals for backward.
+
 ### Function: `sima_freeze_qat(qat_model)`
 
 Freeze QAT observers and lock Model Compiler-compatible power-of-two weight scales.
@@ -45,6 +73,27 @@ Freeze QAT observers and lock Model Compiler-compatible power-of-two weight scal
 Call this after observer warm-up, then continue fine-tuning with fake quantization
 enabled. For a model prepared with ``shift_aware=False``, this only freezes the
 existing activation observers and therefore retains the legacy behavior.
+
+### Function: `sima_thaw_qat_scales(qat_model, scale_parameters)`
+
+Thaw learned grids from the authoritative frozen/export scale buffers.
+
+### Function: `sima_project_qat_to_target_grids(qat_model)`
+
+Project live learned grids onto the exact shift-realizable target set.
+
+Learned activation scales and power-of-two Conv/Linear weight scales are a
+coupled discrete system.  Training them independently and solving the
+coupling only in :func:`sima_freeze_qat` changes the model at freeze time.
+This operation runs the same fail-atomic solver used by freeze, then
+re-enables precisely the activation scales which were live beforehand.
+Calling it after an optimizer step therefore makes the next QAT forward
+identical to the grids that a subsequent freeze/export will retain.
+
+Observer updates remain disabled; this is constraint projection, not a new
+calibration pass.  The projected activation scale is copied back into the
+corresponding ``log_scale`` parameter so optimizer-visible state and the
+executable fake quantizer cannot drift apart.
 
 ### Function: `sima_finalize_qat_model(qat_model)`
 

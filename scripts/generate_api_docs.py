@@ -8,6 +8,8 @@ MODULES = [
     ("sima_qat.session", REPO_ROOT / "sima_qat" / "session.py"),
     ("sima_qat.qat_api", REPO_ROOT / "sima_qat" / "qat_api.py"),
     ("sima_qat.sima_quantizer", REPO_ROOT / "sima_qat" / "sima_quantizer.py"),
+    ("sima_qat.depthart", REPO_ROOT / "sima_qat" / "depthart.py"),
+    ("sima_qat.dynamic_p64", REPO_ROOT / "sima_qat" / "dynamic_p64.py"),
 ]
 
 
