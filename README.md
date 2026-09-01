@@ -78,6 +78,10 @@ validated on the original example and fails closed when batch participates in
 folded recurrence, scan-direction, or layout geometry.
 This deliberately replaces prior automatic batch-one duplication; existing
 three-argument calls remain valid but now capture static shapes.
+Preparation captures isolated CPU copies of the module and example-input
+pytree, then moves only the returned QAT graph to `device`. The caller's
+module, parameters, buffers, training modes, devices, and input tensors are
+left unchanged on both successful and failed capture.
 
 | function | purpose |
 |---|---|

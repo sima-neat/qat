@@ -106,9 +106,8 @@ def sima_prepare_qat_model(
             be located after the preparation step is complete.
         dynamic_batch: explicitly opt into a symbolic leading batch dimension
             for tensor inputs sharing the first tensor's leading size. The
-            default is deliberately static; this changes PR #4's earlier
-            automatic dynamic capture while keeping existing three-argument
-            calls source-compatible.
+            default is deliberately static. Existing three-argument calls
+            remain source-compatible and preserve the supplied example shape.
     Returns:
         GraphModule: a compiled version of the given graph with QAT annotations, ready to begin training.
     """
@@ -119,14 +118,19 @@ def sima_prepare_qat_model(
         return input_graph
 
     print(f"Making QAT annotations on model {input_graph._get_name()}...")
-    # We have to move things to the CPU to do the scaffolding. We will return the model to the proper
-    # device when we are done.
-    input_graph.to("cpu")
+    # Capture from an isolated CPU copy. Preparation is a transformation, not
+    # an in-place device/state mutation of the caller's eager model. This is
+    # especially important for fail-closed dynamic capture: a rejected opt-in
+    # must leave parameters, buffers, BatchNorm state, mode, and device intact.
+    capture_graph = copy.deepcopy(input_graph).to("cpu")
+    capture_example_inputs = _capture_inputs_to_cpu(inputs)
     if dynamic_batch:
         try:
-            capture_inputs, dynamic_shapes = _dynamic_batch_capture(inputs)
+            capture_inputs, dynamic_shapes = _dynamic_batch_capture(
+                capture_example_inputs
+            )
             m = export_for_training(
-                input_graph,
+                capture_graph,
                 capture_inputs,
                 dynamic_shapes=dynamic_shapes,
             ).module()
@@ -136,7 +140,7 @@ def sima_prepare_qat_model(
             # the exact example the caller supplied and fail before scaffolding.
             validation_model = copy.deepcopy(m)
             with torch.no_grad():
-                validation_model(*inputs)
+                validation_model(*capture_example_inputs)
         except Exception as error:
             raise RuntimeError(
                 "Dynamic-batch QAT capture does not execute the original "
@@ -144,7 +148,7 @@ def sima_prepare_qat_model(
                 "dimension participates in folded recurrence or layout math."
             ) from error
     else:
-        m = export_for_training(input_graph, inputs).module()
+        m = export_for_training(capture_graph, capture_example_inputs).module()
     m = replace_dropout(m)
 
     cfg = get_sima_quantization_config(is_qat=True)
@@ -156,6 +160,24 @@ def sima_prepare_qat_model(
     sima_mod = check_graph_nodes(sima_mod, device)
 
     return sima_mod
+
+
+def _capture_inputs_to_cpu(inputs: Tuple) -> Tuple:
+    """Return an isolated CPU example pytree without mutating caller values."""
+
+    captured_tensors: Dict[int, Tensor] = {}
+
+    def capture_leaf(value: Any) -> Any:
+        if not isinstance(value, Tensor):
+            return copy.deepcopy(value)
+        # Preserve repeated-object aliasing in multi-input call signatures
+        # while severing storage and autograd ties to the caller's tensor.
+        key = id(value)
+        if key not in captured_tensors:
+            captured_tensors[key] = value.detach().to("cpu").clone()
+        return captured_tensors[key]
+
+    return tree_map(capture_leaf, inputs)
 
 
 def _dynamic_batch_capture(inputs: Tuple) -> Tuple[Tuple, Optional[Any]]:
@@ -208,6 +230,12 @@ _SHIFT_AWARE_OPS = {
 }
 _MIN_REQUANT_SHIFT = 0
 _MAX_REQUANT_SHIFT = 31
+
+
+class _ShiftZeroOverflow(RuntimeError):
+    """Weight range cannot fit the largest target-realizable requant grid."""
+
+
 _STATIC_WEIGHT_FUNCTIONS = {
     operator.getitem,
     torch.ops.aten.add.Tensor,
@@ -413,7 +441,7 @@ def _safe_power_of_two_weight_scale(
         if not bool(too_small.any()):
             break
         if bool(((shifts == _MIN_REQUANT_SHIFT) & too_small).any()):
-            raise RuntimeError(
+            raise _ShiftZeroOverflow(
                 "Required weight scale exceeds the largest shift-realizable grid at shift 0"
             )
         shifts = torch.where(too_small, shifts - 1, shifts)
@@ -456,9 +484,11 @@ def _stage_coarser_activation_grid(
         )
 
     requested_scale = scale.detach() * multiplier
-    requested_zero_point = torch.trunc(
-        zero_point.detach().to(torch.float64) / multiplier
-    ).to(zero_point.dtype)
+    # Keep the affine grid's integer origin fixed.  For x=(q-z)*s, replacing
+    # s by m*s while retaining z produces a coarser grid nested in the old
+    # grid and continues to represent real zero exactly.  Dividing z by m
+    # would translate the grid and needlessly perturb every asymmetric value.
+    requested_zero_point = zero_point.detach().clone()
     lower = (
         (observer.quant_min - requested_zero_point.to(requested_scale.dtype))
         * requested_scale
@@ -479,6 +509,11 @@ def _stage_coarser_activation_grid(
         or bool((persisted_scale <= 0).any())
     ):
         raise RuntimeError("Retargeted activation grid is non-finite or non-positive")
+    if not torch.equal(persisted_zero_point, requested_zero_point):
+        raise RuntimeError(
+            "Activation observer could not preserve the asymmetric zero point "
+            "while persisting a coarser grid"
+        )
     return persisted_scale, persisted_zero_point, lower, upper
 
 
@@ -527,7 +562,13 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
             or getattr(fake_quant, "is_per_channel", False)
         ):
             continue
-        scale, zero_point = fake_quant.activation_post_process.calculate_qparams()
+        try:
+            scale, zero_point = fake_quant.activation_post_process.calculate_qparams()
+        except (AssertionError, RuntimeError, ValueError) as error:
+            raise RuntimeError(
+                "Shift-aware QAT could not calculate valid activation qparams "
+                f"from {type(fake_quant.activation_post_process).__name__}: {error}"
+            ) from error
         activation_qparams.append([
             fake_quant,
             scale.to(device=fake_quant.scale.device, dtype=fake_quant.scale.dtype),
@@ -585,14 +626,31 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
         for node, input_fq, _, output_fq, minimum_weight_scale in contracts:
             input_row = activation_qparams_by_id[id(input_fq)]
             output_row = activation_qparams_by_id[id(output_fq)]
+            try:
+                _safe_power_of_two_weight_scale(
+                    input_row[1],
+                    output_row[1],
+                    minimum_weight_scale,
+                )
+                continue
+            except _ShiftZeroOverflow:
+                # Output-grid coarsening is the only legal recovery from a
+                # typed shift-0 overflow.
+                pass
+            except RuntimeError as error:
+                # Structural and non-finite failures are not feasibility
+                # results. Fail atomically rather than inferring control flow
+                # from their diagnostic strings.
+                raise RuntimeError(
+                    f"Shift-aware QAT could not inspect weight grid for {node.name}: {error}"
+                ) from error
+
             sx = float(input_row[1].reshape(-1)[0].detach().cpu())
             sy = float(output_row[1].reshape(-1)[0].detach().cpu())
             required_scale = minimum_weight_scale.detach().reshape(-1).to(
                 torch.float64
             ).cpu()
             maximum_ratio = float(((sx / sy) * required_scale).max())
-            if maximum_ratio <= 1.0:
-                continue
             exponent = max(1, math.ceil(math.log2(maximum_ratio)))
             multiplier = 1 << exponent
             old_scale = float(output_row[1].reshape(-1)[0].detach().cpu())
