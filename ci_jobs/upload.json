@@ -2,7 +2,7 @@
     "files": [
       {
         "pattern": "dist/*.whl",
-        "target": "sima-pypi-group/swml-qat/"
+        "target": "sima-pypi-group/sima-qat/"
       }
     ]
   }

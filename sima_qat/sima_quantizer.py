@@ -31,25 +31,21 @@ from __future__ import annotations
 
 import copy
 import operator
-import warnings
 import functools
 import itertools
 
 from typing import Any, Callable, Dict, List, Optional, Set
 
 import torch
-import torch._dynamo as torchdynamo
 import torch.nn.functional as F
 from torch.ao.quantization.fake_quantize import (
     FakeQuantize,
-    FusedMovingAvgObsFakeQuantize,
 )
 from torch.ao.quantization.observer import (
     HistogramObserver,
     MinMaxObserver,
     MovingAverageMinMaxObserver,
     MovingAveragePerChannelMinMaxObserver,
-    PerChannelMinMaxObserver,
     PlaceholderObserver,
 )
 
@@ -81,61 +77,63 @@ from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import (
 )
 from torch.ao.quantization.quantizer.xnnpack_quantizer import (
     _get_module_type_filter,
-    _get_dynamo_graph,
     _get_linear_patterns,
     _get_module_name_filter,
-    _get_module_type_filter,
     _get_not_module_type_or_name_filter,
 )
-try:
-    from torch.ao.quantization.pt2e.utils import (
-        _conv1d_bn_example_inputs,
-        _conv2d_bn_example_inputs,
-    )
-except ImportError:
-    # torch >= 2.5 turned these conv-bn example inputs into function-local variables,
-    # so they are no longer importable. They are stable constants -- define them inline.
-    _conv1d_bn_example_inputs = (
-        torch.randn(1, 1, 3),  # x
-        torch.randn(1, 1, 1),  # conv_weight
-        torch.randn(1),        # conv_bias
-        torch.randn(1),        # bn_weight
-        torch.randn(1),        # bn_bias
-        torch.randn(1),        # bn_running_mean
-        torch.randn(1),        # bn_running_var
-    )
-    _conv2d_bn_example_inputs = (
-        torch.randn(1, 1, 3, 3),  # x
-        torch.randn(1, 1, 1, 1),  # conv_weight
-        torch.randn(1),           # conv_bias
-        torch.randn(1),           # bn_weight
-        torch.randn(1),           # bn_bias
-        torch.randn(1),           # bn_running_mean
-        torch.randn(1),           # bn_running_var
-    )
-try:
-    from torch.ao.quantization.pt2e.utils import get_aten_graph_module
-except ImportError:
-    # Renamed in torch 2.4.x
-    from torch.ao.quantization.pt2e.utils import (
-        _get_aten_graph_module_for_pattern as get_aten_graph_module,
-    )
+from torch.ao.quantization.pt2e.utils import _get_aten_graph_module_for_pattern
 from torch.fx.passes.utils.matcher_with_name_node_map_utils import (
     SubgraphMatcherWithNameNodeMap,
 )
 
 from torch.fx import Node
-from torch.fx.passes.utils.source_matcher_utils import get_source_partitions
 from torch.ao.quantization.pt2e.graph_utils import find_sequential_partitions
 
 
 # from torch.ops.quantized_decomposed import quantize_per_tensor
 
 
+_conv1d_bn_example_inputs = (
+    torch.randn(1, 1, 3),
+    torch.randn(1, 1, 1),
+    torch.randn(1),
+    torch.randn(1),
+    torch.randn(1),
+    torch.randn(1),
+    torch.randn(1),
+)
+_conv2d_bn_example_inputs = (
+    torch.randn(1, 1, 3, 3),
+    torch.randn(1, 1, 1, 1),
+    torch.randn(1),
+    torch.randn(1),
+    torch.randn(1),
+    torch.randn(1),
+    torch.randn(1),
+)
+
+
 __all__ = [
+    "SimaFakeQuantize",
     "SimaQuantizer",
     "get_sima_quantization_config",
 ]
+
+
+class SimaFakeQuantize(FakeQuantize):
+    """Fake quantizer whose frozen buffers are authoritative for conversion."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.register_buffer("sima_qparams_frozen", torch.tensor([False], dtype=torch.bool))
+
+    def calculate_qparams(self):
+        if bool(self.sima_qparams_frozen.item()):
+            return self.scale, self.zero_point
+        return super().calculate_qparams()
+
+    def freeze_qparams(self) -> None:
+        self.sima_qparams_frozen.fill_(True)
 
 
 class SimaMovingAverageMinMaxObserver(MovingAverageMinMaxObserver):
@@ -213,7 +211,8 @@ def _get_supported_symmetric_config_and_operators() -> List[OperatorConfig]:
 def get_sima_quantization_config(
     is_qat: bool = False,
 ):
-    # This configuration function only has one parameter (use QAT or not).
+    # This configuration function selects QAT or PTQ. Weight fake quantization
+    # is always enabled for QAT so training matches SiMa shift requantization.
     # Sima has a preferred encoding for activation and weight tensors that give 
     # best possible results. Since QAT is a high-effort activity, we only use the
     # best quantization settings possible here.
@@ -223,7 +222,7 @@ def get_sima_quantization_config(
     # ---------------------------------------------------
     act_extra_args: Dict[str, Any] = {"eps": 2**-12}
     if is_qat:
-        act_observer_or_fake_quant_ctr = FakeQuantize
+        act_observer_or_fake_quant_ctr = SimaFakeQuantize
         act_extra_args["observer"] = SimaMovingAverageMinMaxObserver
     else:
         # If QAT is disabled, we can add histogram observers to collect data.
@@ -248,7 +247,8 @@ def get_sima_quantization_config(
     # Weights will always be captured as per-channel symmetric.
     wt_extra_args: Dict[str, Any] = {"eps": 2**-12}
     if is_qat:
-        weight_observer_or_fake_quant_ctr = PerChannelMinMaxObserver
+        weight_observer_or_fake_quant_ctr = SimaFakeQuantize
+        wt_extra_args["observer"] = MovingAveragePerChannelMinMaxObserver
     else:
         weight_observer_or_fake_quant_ctr = PlaceholderObserver
 
@@ -302,7 +302,6 @@ class SimaQuantizer(Quantizer):
         "conv_relu",
         "conv",
         "adaptive_avg_pool2d",
-        "max_pool2d",
         "sima_add_hardtanh",
         "add_relu",
         "add",
@@ -416,14 +415,7 @@ class SimaQuantizer(Quantizer):
             ops += self.STATIC_QAT_ONLY_OPS
         ops += self.STATIC_OPS
         for op in ops:
-            annotator = OP_TO_ANNOTATOR.get(op)
-            if annotator is None:
-                # Some built-in annotators (e.g. 'max_pool2d') were dropped from the
-                # reference xnnpack quantizer in newer torch. They are shared-qspec
-                # pass-throughs, so skipping leaves the surrounding Q/DQ intact.
-                warnings.warn(f"No annotator registered for '{op}'; skipping.")
-                continue
-            annotator(model, quantization_config, filter_fn)
+            OP_TO_ANNOTATOR[op](model, quantization_config, filter_fn)
         return model
 
     def _annotate_for_static_quantization_config(
@@ -456,40 +448,30 @@ class SimaQuantizer(Quantizer):
         return cls.supported_config_and_operators
 
 
-def _annotate_single_op(
+def _annotate_single_aten_op(
+    gm: torch.fx.GraphModule,
     quantization_config: QuantizationConfig,
-    op_partitions: List[object],
-    op_check: Callable,
+    targets: tuple[object, ...],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
 ) -> List[List[Node]]:
-    """ This is a helper function which annotates a single operation in a graph with Fakequant
-        observers. This function assumes single-input operators, and is not suitable for multi-input
-        ops which may have constant inputs (e.g. Conv2D).
-    """
+    """Annotate unary ATen nodes without relying on source-partition metadata."""
     annotated_partitions = []
-    for op_partition in op_partitions:
-        op_node = op_partition.output_nodes[0]
-        if _is_annotated([op_node]):
+    for op_node in gm.graph.nodes:
+        if op_node.op != "call_function" or op_node.target not in targets:
             continue
-
-        if not op_check(op_node):
+        if _is_annotated([op_node]) or (filter_fn and not filter_fn(op_node)):
             continue
-
-        annotated_partitions.append(op_partition.nodes)
-
-        input_act_qspec = get_input_act_qspec(quantization_config)
-        input_act0 = op_node.args[0]
 
         input_qspec_map = {}
-        if isinstance(input_act0, Node):
-            input_qspec_map[input_act0] = input_act_qspec
-
-        output_act_qspec = get_output_act_qspec(quantization_config)
-
+        input_act = op_node.args[0]
+        if isinstance(input_act, Node):
+            input_qspec_map[input_act] = get_input_act_qspec(quantization_config)
         op_node.meta["quantization_annotation"] = QuantizationAnnotation(
             input_qspec_map=input_qspec_map,
-            output_qspec=output_act_qspec,
+            output_qspec=get_output_act_qspec(quantization_config),
             _annotated=True,
         )
+        annotated_partitions.append([op_node])
     return annotated_partitions
 
 
@@ -499,22 +481,11 @@ def _sima_annotate_sigmoid(
     quantization_config: Optional[QuantizationConfig],
     filter_fn: Optional[Callable[[Node], bool]] = None,
 ) -> Optional[List[List[Node]]]:
-    sig_partitions = get_source_partitions(gm.graph, [torch.sigmoid, F.sigmoid, torch.nn.Sigmoid], filter_fn)
-    sig_partitions = list(itertools.chain.from_iterable(sig_partitions.values()))
-
-    def _sig_target_check(sig_node: Node) -> bool:
-        if sig_node.target != torch.ops.aten.sigmoid.default:
-            # TODO: change this to AnnotationException
-            raise Exception(
-                f"Expected sigmoid node: torch.ops.aten.sigmoid.default, but found {sig_node.target}"
-                " please check if you are calling the correct capture API"
-            )
-        return True
-
-    return _annotate_single_op(
-        quantization_config = quantization_config,
-        op_partitions = sig_partitions,
-        op_check = _sig_target_check,
+    return _annotate_single_aten_op(
+        gm,
+        quantization_config,
+        (torch.ops.aten.sigmoid.default,),
+        filter_fn,
     )
 
 
@@ -524,22 +495,11 @@ def _sima_annotate_silu(
     quantization_config: Optional[QuantizationConfig],
     filter_fn: Optional[Callable[[Node], bool]] = None,
 ) -> Optional[List[List[Node]]]:
-    silu_partitions = get_source_partitions(gm.graph, [F.silu, torch.nn.SiLU], filter_fn)
-    silu_partitions = list(itertools.chain.from_iterable(silu_partitions.values()))
-
-    def _silu_target_check(silu_node: Node) -> bool:
-        if silu_node.target not in [torch.ops.aten.silu_.default, torch.ops.aten.silu.default]:
-            # TODO: change this to AnnotationException
-            raise Exception(
-                f"Expected SiLU node: torch.ops.aten.silu_.default, but found {silu_node.target}"
-                " please check if you are calling the correct capture API"
-            )
-        return True
-
-    return _annotate_single_op(
-        quantization_config = quantization_config,
-        op_partitions = silu_partitions,
-        op_check = _silu_target_check,
+    return _annotate_single_aten_op(
+        gm,
+        quantization_config,
+        (torch.ops.aten.silu.default, torch.ops.aten.silu_.default),
+        filter_fn,
     )
 
 
@@ -704,7 +664,7 @@ def _sima_annotate_conv_bn_hardtanh(
     # Match against all conv dimensions and cuda variants
     for (conv_fn, example_inputs), is_cuda, hardtanh_is_inplace in combinations:
         pattern = get_pattern(conv_fn, hardtanh_is_inplace)
-        pattern = get_aten_graph_module(pattern, example_inputs, is_cuda)
+        pattern = _get_aten_graph_module_for_pattern(pattern, example_inputs, is_cuda)
         pattern.graph.eliminate_dead_code()
         pattern.recompile()
         matcher = SubgraphMatcherWithNameNodeMap(pattern, ignore_literals=True)
@@ -952,6 +912,20 @@ def _annotate_batchnorm(
 ) -> Optional[List[List[Node]]]:
     annotated_partitions = []
     for n in gm.graph.nodes:
+        if n.op == "call_function" and n.target == torch.ops.aten.batch_norm.default:
+            if _is_annotated([n]) or (filter_fn and not filter_fn(n)):
+                continue
+            input_qspec_map = {}
+            input_act = n.args[0]
+            if isinstance(input_act, Node):
+                input_qspec_map[input_act] = get_input_act_qspec(quantization_config)
+            n.meta["quantization_annotation"] = QuantizationAnnotation(
+                input_qspec_map=input_qspec_map,
+                output_qspec=get_output_act_qspec(quantization_config),
+                _annotated=True,
+            )
+            annotated_partitions.append([n])
+            continue
         if n.op != "call_function" or n.target not in [
             operator.getitem
         ]:
@@ -1003,22 +977,13 @@ def _sima_annotate_cat(
     quantization_config: Optional[QuantizationConfig],
     filter_fn: Optional[Callable[[Node], bool]] = None,
 ) -> Optional[List[List[Node]]]:
-    cat_partitions = get_source_partitions(gm.graph, [torch.cat], filter_fn)
-    cat_partitions = list(itertools.chain.from_iterable(cat_partitions.values()))
     annotated_partitions = []
-    for cat_partition in cat_partitions:
-        cat_node = cat_partition.output_nodes[0]
-        if _is_annotated([cat_node]):
+    for cat_node in gm.graph.nodes:
+        if cat_node.op != "call_function" or cat_node.target != torch.ops.aten.cat.default:
             continue
-
-        if cat_node.target != torch.ops.aten.cat.default:
-            # TODO: change this to AnnotationException
-            raise Exception(
-                f"Expected cat node: torch.ops.aten.cat.default, but found {cat_node.target}"
-                " please check if you are calling the correct capture API"
-            )
-
-        annotated_partitions.append(cat_partition.nodes)
+        if _is_annotated([cat_node]) or (filter_fn and not filter_fn(cat_node)):
+            continue
+        annotated_partitions.append([cat_node])
 
         input_act_qspec = get_input_act_qspec(quantization_config)
         inputs = cat_node.args[0]

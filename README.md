@@ -6,7 +6,7 @@ It wraps PyTorch's PT2E quantization flow (`prepare_qat_pt2e` / `convert_pt2e`) 
 quantizer and ONNX exporter, so a standard `nn.Module` can be fine-tuned with fake-quantization and
 exported to an INT8 Q/DQ ONNX graph.
 
-**Supported PyTorch:** 2.3.x through 2.8.x (Python ≥ 3.10).
+**Required PyTorch:** 2.8.x (the provided environment pins 2.8.0; Python ≥ 3.10).
 
 ## Setup
 
@@ -35,12 +35,13 @@ source .venv/bin/activate
 
 ## Usage
 
-The API has three steps: **prepare → (train) → finalize → export**.
+The recommended workflow is **prepare → warm up → freeze → fine-tune → finalize → export**.
 
 ```python
 import torch
-from sima_qat.qat_api import (
+from sima_qat import (
     sima_prepare_qat_model,
+    sima_freeze_qat,
     sima_finalize_qat_model,
     sima_export_onnx,
 )
@@ -48,21 +49,44 @@ from sima_qat.qat_api import (
 model = ...                                  # any torch.nn.Module
 example_inputs = (torch.randn(1, 3, 224, 224),)
 
-# 1. Insert fake-quant scaffolding (returns an FX GraphModule ready for QAT training)
+# 1. Insert shift-aware fake-quant scaffolding.
 qat_model = sima_prepare_qat_model(model, example_inputs, device='cuda')
 
-# 2. Fine-tune `qat_model` with your normal training loop ...
+# 2. Warm up observers with your normal training loop ...
 
-# 3. Convert to inference-only (fake-quant / INT8) form
+# 3. Lock AFE-compatible power-of-two scales, then fine-tune for a few more epochs.
+sima_freeze_qat(qat_model)
+# ... continue training qat_model ...
+
+# 4. Convert to inference-only (fake-quant / INT8) form
 qat_model = sima_finalize_qat_model(qat_model)
 
-# 4. Export to an INT8 Q/DQ ONNX graph
+# 5. Export to an INT8 Q/DQ ONNX graph
 sima_export_onnx(qat_model, example_inputs, 'model.onnx', device='cuda')
 ```
 
+Shift-aware QAT constrains each convolution or linear weight scale so that AFE can use its native
+integer shift requantization without rescaling the learned INT8 weight codes. Calling
+`sima_freeze_qat` explicitly leaves time to fine-tune against those locked scales. Finalization will
+lock them automatically if necessary, but fine-tuning after the explicit call generally gives better
+accuracy.
+
+Preparation preserves the exact example shapes by default. Models that are
+truly batch-polymorphic can opt in with
+`sima_prepare_qat_model(..., dynamic_batch=True)`. The opt-in capture is
+validated on the original example and fails closed when batch participates in
+folded recurrence, scan-direction, or layout geometry.
+This deliberately replaces prior automatic batch-one duplication; existing
+three-argument calls remain valid but now capture static shapes.
+Preparation captures isolated CPU copies of the module and example-input
+pytree, then moves only the returned QAT graph to `device`. The caller's
+module, parameters, buffers, training modes, devices, and input tensors are
+left unchanged on both successful and failed capture.
+
 | function | purpose |
 |---|---|
-| `sima_prepare_qat_model(model, inputs, device)` | Capture the model to FX and insert SiMa fake-quant annotations for QAT. |
+| `sima_prepare_qat_model(model, inputs, device, *, dynamic_batch=False)` | Capture the model and insert SiMa shift-aware fake-quant annotations. Dynamic training batch is explicit opt-in. |
+| `sima_freeze_qat(qat_model)` | Freeze observers and lock AFE-compatible weight scales before final fine-tuning. |
 | `sima_finalize_qat_model(qat_model)` | Fold the trained scaffolding into an inference-only quantized graph. |
 | `sima_export_onnx(qat_model, inputs, output_file, ...)` | Export the finalized model to an ONNX QuantizeLinear/DequantizeLinear graph. |
 
@@ -70,7 +94,10 @@ sima_export_onnx(qat_model, example_inputs, 'model.onnx', device='cuda')
 
 [examples/mnist](examples/mnist) and [examples/imagenet](examples/imagenet) are runnable
 PyTorch-Lightning workflows that wire the API into the `on_train_start` (prepare) /
-`on_train_end` (finalize) / `on_fit_end` (export) hooks. Each has the same four scripts:
+`on_train_epoch_start` (freeze) / `on_train_end` (finalize) / `on_fit_end` (export) hooks.
+By default, they freeze the quantization grids at the start of the final epoch, leaving that epoch
+for recovery training. Use `--freeze-epoch N` to select another zero-based epoch, or
+`--freeze-epoch -1` to retain the old finalize-only behavior. Each has the same four scripts:
 `*_lit.py` (the Lightning module holding the QAT calls), `train.py`, `export_onnx.py`, and
 `test_onnx.py`. Run them from inside the example directory; use `--help` for all options.
 
@@ -101,9 +128,19 @@ Pass `--disable-qat` to either `train.py` to train a plain float baseline instea
 pytest
 ```
 
-- `tests/*.py` — fast, synthetic graph-structure unit tests (one QAT op pattern each; no training).
-- `tests/end_to_end/` — full-model QAT runs on CIFAR10 (DenseNet, ResNet50) gated on accuracy. The
-  ResNet50 test trains on a GPU and is **skipped when no CUDA device is available**.
+- `tests/operators/` — matrix-driven coverage for every supported annotation pattern, including
+  shift-grid locking, finalization, and representative ONNX Runtime parity.
+- `tests/qat/` — scale-locking, BatchNorm, recovery-training, checkpoint, and failure regressions.
+- `tests/integration/` — graph-transformation and device-rewrite tests.
+- `tests/end_to_end/` — nightly CIFAR10 accuracy runs for DenseNet and ResNet50. ResNet50 requires
+  CUDA.
+
+Run only the fast/default regression tiers or the nightly model tests with:
+
+```bash
+pytest -m regression tests/operators tests/qat tests/integration
+pytest -m nightly tests/end_to_end
+```
 
 Generated ONNX models are written to `exported_models/` (gitignored).
 
@@ -111,10 +148,10 @@ Generated ONNX models are written to `exported_models/` (gitignored).
 
 ```
 sima_qat/            # the package
-  qat_api.py         # public API: prepare / finalize / export
+  qat_api.py         # public API: prepare / freeze / finalize / export
   sima_quantizer.py  # SiMa PT2E quantizer (annotators, fusion patterns)
   onnx_ops.py        # custom ONNX symbolic functions for Q/DQ ops
 examples/            # MNIST and ImageNet training + export examples
-tests/               # unit tests + end_to_end model tests
+tests/               # operator matrix, QAT lifecycle, integration, and nightly model tests
 setup_env.sh         # one-shot venv + dependency bootstrap
 ```

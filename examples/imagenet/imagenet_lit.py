@@ -45,16 +45,26 @@ import torchvision.datasets as datasets
 
 import pytorch_lightning as L
 
-from sima_qat.qat_api import (sima_prepare_qat_model, 
-                              sima_finalize_qat_model, 
-                              sima_export_onnx)
+from sima_qat import (
+    sima_export_onnx,
+    sima_finalize_qat_model,
+    sima_freeze_qat,
+    sima_prepare_qat_model,
+)
 
 
 # Some parts adapted from https://github.com/MadryLab/pytorch-lightning-imagenet/blob/main/imagenet.py
 class ImageNet_Model_Trainer(L.LightningModule):
     # Some settings taken from https://github.com/MadryLab/pytorch-lightning-imagenet/blob/main/imagenet.py
-    def __init__(self, model: str, use_qat: bool = True, export_on_end: bool = False, 
-                 batch_size: int = 50, device_train: str = 'cuda'):
+    def __init__(
+        self,
+        model: str,
+        use_qat: bool = True,
+        export_on_end: bool = False,
+        batch_size: int = 50,
+        device_train: str = 'cuda',
+        freeze_epoch: int | None = None,
+    ):
         super().__init__()
         self.model_name = model
         self.imagenet_model = torchvision.models.__dict__[model](pretrained = True)
@@ -63,6 +73,7 @@ class ImageNet_Model_Trainer(L.LightningModule):
         self.val_batch_count = 0
         self.use_qat = use_qat
         self.export_on_end = export_on_end
+        self.freeze_epoch = freeze_epoch
         self.dump_fx_graphs = True
         self.dummy_inputs = (torch.randn(1, 3, 224, 224), )
         self.loss_fn = CrossEntropyLoss()
@@ -150,6 +161,12 @@ class ImageNet_Model_Trainer(L.LightningModule):
     def on_train_epoch_start(self) -> None:
         # For some reason Lightning doesn't switch to train mode hence, we ensure it switches to train mode here
         self.train(True)
+        if (
+            self.use_qat
+            and self.freeze_epoch is not None
+            and self.current_epoch == self.freeze_epoch
+        ):
+            sima_freeze_qat(self.imagenet_model)
 
     def _prepare_qat(self) -> None:
         m = sima_prepare_qat_model(input_graph=self.imagenet_model, inputs=self.dummy_inputs, device=self.device_train)
@@ -204,4 +221,3 @@ class ImageNet_Model_Trainer(L.LightningModule):
         if self.use_qat:
             self._prepare_qat()
         return super().on_load_checkpoint(checkpoint)
-

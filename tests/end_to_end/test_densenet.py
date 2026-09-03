@@ -39,6 +39,7 @@ import torch
 from torchvision.models import DenseNet
 from torch import optim, nn, utils, Tensor
 
+pytest.importorskip("pytorch_lightning")
 import pytorch_lightning as L
 from pytorch_lightning.utilities import disable_possible_user_warnings
 
@@ -50,7 +51,7 @@ from cifar_classifier import get_args, training_test
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 
 
-@pytest.mark.regression
+@pytest.mark.nightly
 def test_densenet():
     disable_possible_user_warnings()
     torch.set_num_threads(1)    # Important to tame resources during regressions
@@ -87,4 +88,3 @@ if __name__ == "__main__":
 
     # The command line invocation uses the generic args version.
     run_densenet(run_args)
-

@@ -53,7 +53,12 @@ import onnxruntime
 
 import pytorch_lightning as L
 
-from sima_qat.qat_api import sima_prepare_qat_model, sima_finalize_qat_model, sima_export_onnx
+from sima_qat import (
+    sima_export_onnx,
+    sima_finalize_qat_model,
+    sima_freeze_qat,
+    sima_prepare_qat_model,
+)
 
 
 class CIFAR10Mini(CIFAR10):
@@ -176,6 +181,12 @@ class CIFAR10_Trainer(L.LightningModule):
     def on_train_epoch_start(self) -> None:
         # For some reason Lightning doesn't switch to train mode ???
         self.train(True)
+        if (
+            self.use_qat
+            and self.trainer.max_epochs > 1
+            and self.current_epoch == self.trainer.max_epochs - 1
+        ):
+            sima_freeze_qat(self.classifier_model)
         lr = self.trainer.lr_scheduler_configs[0].scheduler.get_last_lr()[0]
         self.log('learning_rate', lr, on_step=False, on_epoch=True, prog_bar=True)
 
@@ -412,4 +423,3 @@ def get_args():
     parser.add_argument('--disable-qat', action='store_true', help='Disable QAT mode')
     all_args = parser.parse_args()
     return all_args
-
