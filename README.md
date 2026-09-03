@@ -93,8 +93,9 @@ left unchanged on both successful and failed capture.
 ## Examples
 
 [examples/mnist](examples/mnist) and [examples/imagenet](examples/imagenet) are runnable
-PyTorch-Lightning workflows that wire the API into the `on_train_start` (prepare) /
-`on_train_epoch_start` (freeze) / `on_train_end` (finalize) / `on_fit_end` (export) hooks.
+PyTorch-Lightning workflows that prepare QAT at the start of `configure_optimizers`, before the
+optimizer captures parameter references, then use `on_train_epoch_start` (freeze) /
+`on_train_end` (finalize) / `on_fit_end` (export) hooks.
 By default, they freeze the quantization grids at the start of the final epoch, leaving that epoch
 for recovery training. Use `--freeze-epoch N` to select another zero-based epoch, or
 `--freeze-epoch -1` to retain the old finalize-only behavior. Each has the same four scripts:

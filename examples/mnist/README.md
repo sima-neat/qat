@@ -30,7 +30,7 @@ The script `train.py` starts the training process, leveraging the `mnist_lit.py`
 
 * QAT User API Usage -
 The user can directly leverage the `mnist_lit.py` pyTorch lightning module which internally calls the QAT user APIs. 
-    - The `on_train_start()` hook calls the `sima_prepare_qat_model()` which any Pytorch nn.Module and prepares it for QAT training. 
+    - `configure_optimizers()` calls `sima_prepare_qat_model()` before constructing the optimizer so it tracks the captured QAT parameters.
     - The `on_train_epoch_start()` hook calls `sima_freeze_qat()` at the configured freeze epoch. By default this is the start of the final epoch, which provides one recovery epoch with fixed activation and shift-aware weight grids.
     - The `on_train_end()` hook calls the `sima_finalize_qat_model()` which takes a trained QAT model and converts it to a quantized model. It becomes inference-only after this point. 
     - The `on_fit_end()` hook calls the `sima_export_onnx()` which finalized QAT model and exports a ONNX graph for the same.

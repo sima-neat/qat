@@ -28,6 +28,12 @@ def test_recovery_epoch_keeps_grids_locked_and_updates_weights() -> None:
     targets = torch.randn(8, 2)
     model = sima_prepare_qat_model(TinyClassifier(), (inputs[:2],), "cpu")
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+    optimized_parameters = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    assert optimized_parameters == {id(parameter) for parameter in model.parameters()}
 
     for batch in range(0, len(inputs), 2):
         optimizer.zero_grad()

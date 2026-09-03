@@ -48,6 +48,35 @@ class FoldedDirection(nn.Module):
         return inputs[:, None].expand(-1, 2, -1).reshape(1, 8)
 
 
+class BatchDependentBranch(nn.Module):
+    """A shape-valid capture whose batch-two branch is wrong for batch one."""
+
+    def forward(self, inputs):
+        if inputs.shape[0] > 1:
+            return inputs + 10
+        return inputs - 10
+
+
+class DynamicDropout(nn.Module):
+    def forward(self, inputs):
+        return torch.nn.functional.dropout(
+            inputs,
+            p=0.5,
+            training=self.training,
+        )
+
+
+class NestedDynamicOutput(nn.Module):
+    def forward(self, inputs):
+        return {
+            "prediction": inputs * 2,
+            "auxiliary": (
+                inputs.mean(dim=-1),
+                inputs.argmax(dim=-1),
+            ),
+        }
+
+
 class MultiInputBatch(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -380,6 +409,47 @@ def test_dynamic_batch_failure_leaves_source_and_batchnorm_unchanged() -> None:
         sima_prepare_qat_model(source, (example,), "cpu", dynamic_batch=True)
 
     _assert_source_equal(source, snapshot)
+
+
+def test_dynamic_batch_rejects_semantically_different_batch_branch() -> None:
+    example = torch.ones(1, 4)
+    source = BatchDependentBranch()
+    expected = source(example)
+
+    with pytest.raises(RuntimeError, match="does not preserve.*semantics"):
+        sima_prepare_qat_model(
+            source,
+            (example,),
+            "cpu",
+            dynamic_batch=True,
+        )
+
+    torch.testing.assert_close(source(example), expected, rtol=0, atol=0)
+
+
+def test_dynamic_batch_parity_reuses_rng_for_stochastic_outputs() -> None:
+    prepared = sima_prepare_qat_model(
+        DynamicDropout().train(),
+        (torch.randn(1, 8),),
+        "cpu",
+        dynamic_batch=True,
+    )
+
+    assert prepared(torch.randn(3, 8)).shape == (3, 8)
+
+
+def test_dynamic_batch_parity_supports_nested_output_pytrees() -> None:
+    prepared = sima_prepare_qat_model(
+        NestedDynamicOutput(),
+        (torch.randn(1, 4),),
+        "cpu",
+        dynamic_batch=True,
+    )
+
+    output = prepared(torch.randn(3, 4))
+    assert output["prediction"].shape == (3, 4)
+    assert output["auxiliary"][0].shape == (3,)
+    assert output["auxiliary"][1].shape == (3,)
 
 
 def test_solver_propagates_coarsened_grid_through_multi_op_chain() -> None:

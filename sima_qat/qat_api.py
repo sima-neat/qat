@@ -93,8 +93,8 @@ def sima_prepare_qat_model(
         for models that fold the batch dimension into recurrence, direction, or
         channel geometry. Set ``dynamic_batch=True`` only when the model is
         genuinely batch-polymorphic. Dynamic capture validates that the
-        resulting graph still executes the caller's original example before
-        QAT annotations are inserted.
+        resulting graph preserves the caller's original-example outputs
+        before QAT annotations are inserted.
 
     Args:
         input_graph: an eager-mode `nn.Module` representing the model on which QAT is to be performed.
@@ -126,6 +126,7 @@ def sima_prepare_qat_model(
     capture_example_inputs = _capture_inputs_to_cpu(inputs)
     if dynamic_batch:
         try:
+            reference_model = copy.deepcopy(capture_graph)
             capture_inputs, dynamic_shapes = _dynamic_batch_capture(
                 capture_example_inputs
             )
@@ -134,18 +135,22 @@ def sima_prepare_qat_model(
                 capture_inputs,
                 dynamic_shapes=dynamic_shapes,
             ).module()
-            # Some networks fold batch into an internal recurrence or direction
-            # dimension. A duplicated batch-one capture can export successfully
-            # while hard-wiring the wrong internal geometry. Validate the graph on
-            # the exact example the caller supplied and fail before scaffolding.
+            # A duplicated batch-one capture can export successfully while
+            # hard-wiring a different branch or internal geometry. Re-run both
+            # isolated models with identical CPU RNG state and require semantic
+            # parity on the exact example supplied by the caller.
             validation_model = copy.deepcopy(m)
-            with torch.no_grad():
-                validation_model(*capture_example_inputs)
+            _validate_capture_output_parity(
+                reference_model,
+                validation_model,
+                capture_example_inputs,
+            )
         except Exception as error:
             raise RuntimeError(
-                "Dynamic-batch QAT capture does not execute the original "
-                "example. Keep dynamic_batch=False for models whose batch "
-                "dimension participates in folded recurrence or layout math."
+                "Dynamic-batch QAT capture does not preserve the original "
+                "example semantics. Keep dynamic_batch=False for models whose "
+                "batch dimension participates in control flow, folded "
+                "recurrence, or layout math."
             ) from error
     else:
         m = export_for_training(capture_graph, capture_example_inputs).module()
@@ -178,6 +183,48 @@ def _capture_inputs_to_cpu(inputs: Tuple) -> Tuple:
         return captured_tensors[key]
 
     return tree_map(capture_leaf, inputs)
+
+
+def _validate_capture_output_parity(
+    reference_model: nn.Module,
+    captured_model: nn.Module,
+    inputs: Tuple,
+) -> None:
+    """Require capture to preserve the original-example output pytree."""
+
+    with torch.random.fork_rng(devices=[]), torch.no_grad():
+        cpu_rng_state = torch.get_rng_state()
+        reference_output = reference_model(*inputs)
+        torch.set_rng_state(cpu_rng_state)
+        captured_output = captured_model(*inputs)
+
+    reference_leaves, reference_spec = tree_flatten(reference_output)
+    captured_leaves, captured_spec = tree_flatten(captured_output)
+    if reference_spec != captured_spec:
+        raise RuntimeError(
+            "dynamic capture changed the output pytree structure: "
+            f"expected {reference_spec}, found {captured_spec}"
+        )
+
+    for index, (reference, captured) in enumerate(
+        zip(reference_leaves, captured_leaves)
+    ):
+        if isinstance(reference, Tensor) and isinstance(captured, Tensor):
+            try:
+                torch.testing.assert_close(
+                    captured,
+                    reference,
+                    equal_nan=True,
+                )
+            except AssertionError as error:
+                raise RuntimeError(
+                    f"dynamic capture changed tensor output leaf {index}: {error}"
+                ) from error
+        elif type(reference) is not type(captured) or reference != captured:
+            raise RuntimeError(
+                "dynamic capture changed non-tensor output leaf "
+                f"{index}: expected {reference!r}, found {captured!r}"
+            )
 
 
 def _dynamic_batch_capture(inputs: Tuple) -> Tuple[Tuple, Optional[Any]]:
