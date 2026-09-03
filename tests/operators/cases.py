@@ -86,6 +86,29 @@ class LinearModel(nn.Module):
         return self.activation(self.linear(inputs))
 
 
+class MatMulModel(nn.Module):
+    def __init__(self, operation: str = "matmul") -> None:
+        super().__init__()
+        self.operation = operation
+
+    def forward(self, left: Tensor, right: Tensor) -> Tensor:
+        if self.operation == "mm":
+            return torch.mm(left, right)
+        if self.operation == "bmm":
+            return torch.bmm(left, right)
+        return torch.matmul(left, right)
+
+
+class BAddBMMModel(nn.Module):
+    def forward(self, bias: Tensor, left: Tensor, right: Tensor) -> Tensor:
+        return torch.baddbmm(bias, left, right)
+
+
+class SoftmaxModel(nn.Module):
+    def forward(self, inputs: Tensor) -> Tensor:
+        return torch.softmax(inputs, dim=-1)
+
+
 class ConvConstantPostOpModel(nn.Module):
     def __init__(self, operation: str) -> None:
         super().__init__()
@@ -171,6 +194,13 @@ IMAGE_INPUT: InputFactory = lambda: (torch.randn(2, 3, 8, 8),)
 FOUR_CHANNEL_INPUT: InputFactory = lambda: (torch.randn(2, 4, 8, 8),)
 SEQUENCE_INPUT: InputFactory = lambda: (torch.randn(2, 3, 12),)
 LINEAR_INPUT: InputFactory = lambda: (torch.randn(2, 8),)
+MM_INPUT: InputFactory = lambda: (torch.randn(4, 8), torch.randn(8, 3))
+BMM_INPUT: InputFactory = lambda: (torch.randn(2, 4, 8), torch.randn(2, 8, 3))
+BADDBMM_INPUT: InputFactory = lambda: (
+    torch.randn(2, 4, 3),
+    torch.randn(2, 4, 8),
+    torch.randn(2, 8, 3),
+)
 
 
 OPERATOR_CASES = (
@@ -248,6 +278,43 @@ OPERATOR_CASES = (
         LINEAR_INPUT,
         (torch.ops.aten.relu.default,),
         weighted=True,
+    ),
+    OperatorCase(
+        "mm",
+        "sima_matmul",
+        lambda: MatMulModel("mm"),
+        MM_INPUT,
+        (torch.ops.aten.mm.default,),
+        onnx_family="matmul",
+    ),
+    OperatorCase(
+        "matmul",
+        "sima_matmul",
+        MatMulModel,
+        BMM_INPUT,
+        (torch.ops.aten.matmul.default,),
+    ),
+    OperatorCase(
+        "bmm",
+        "sima_matmul",
+        lambda: MatMulModel("bmm"),
+        BMM_INPUT,
+        (torch.ops.aten.bmm.default,),
+    ),
+    OperatorCase(
+        "baddbmm",
+        "sima_matmul",
+        BAddBMMModel,
+        BADDBMM_INPUT,
+        (torch.ops.aten.baddbmm.default,),
+    ),
+    OperatorCase(
+        "softmax",
+        "sima_softmax",
+        SoftmaxModel,
+        LINEAR_INPUT,
+        (torch.ops.aten.softmax.int, torch.ops.aten._softmax.default),
+        onnx_family="softmax",
     ),
     OperatorCase(
         "conv_add_constant",

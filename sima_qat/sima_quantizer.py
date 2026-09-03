@@ -89,6 +89,11 @@ from torch.fx.passes.utils.matcher_with_name_node_map_utils import (
 from torch.fx import Node
 from torch.ao.quantization.pt2e.graph_utils import find_sequential_partitions
 
+from sima_qat.bf16 import (
+    _matmul_operands,
+    fuse_int8_attention_boundaries,
+)
+
 
 # from torch.ops.quantized_decomposed import quantize_per_tensor
 
@@ -297,6 +302,8 @@ class SimaQuantizer(Quantizer):
     STATIC_OPS = [
         "linear_relu",
         "linear",
+        "sima_matmul",
+        "sima_softmax",
         "sima_conv_add_or_mul_const",
         "sima_conv_hardtanh",
         "conv_relu",
@@ -396,9 +403,40 @@ class SimaQuantizer(Quantizer):
         # Dynamic is unsupported.
         if self.global_config and self.global_config.input_activation.is_dynamic:  # type: ignore[union-attr]
             assert False, "Error: dynamic quantization is unsupported on Sima models."
+        # A pre-resolved BF16 island is an explicit quantization exclusion.
+        # Mark it annotated before operator-local INT8 rules run so PT2E does
+        # not insert Q/DQ boundaries inside the island.
+        for node in model.graph.nodes:
+            if node.meta.get("sima_precision") == "bfloat16":
+                node.meta["quantization_annotation"] = QuantizationAnnotation(
+                    _annotated=True
+                )
+
         model = self._annotate_for_static_quantization_config(model)
+        self._remove_non_float_qspecs(model)
+        fuse_int8_attention_boundaries(model)
         propagate_annotation(model)
         return model
+
+    @staticmethod
+    def _remove_non_float_qspecs(model: torch.fx.GraphModule) -> None:
+        """Never insert activation Q/DQ on masks, indices, or shape tensors."""
+
+        def is_non_float(node: Node) -> bool:
+            value = node.meta.get("val")
+            return isinstance(value, torch.Tensor) and not value.is_floating_point()
+
+        for node in model.graph.nodes:
+            annotation = node.meta.get("quantization_annotation")
+            if annotation is None or not annotation._annotated:
+                continue
+            annotation.input_qspec_map = {
+                input_node: qspec
+                for input_node, qspec in annotation.input_qspec_map.items()
+                if not is_non_float(input_node)
+            }
+            if is_non_float(node):
+                annotation.output_qspec = None
 
     def _annotate_all_static_patterns(
         self,
@@ -473,6 +511,68 @@ def _annotate_single_aten_op(
         )
         annotated_partitions.append([op_node])
     return annotated_partitions
+
+
+@register_annotator("sima_matmul")
+def _sima_annotate_matmul(
+    gm: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Annotate activation-by-activation MatMul-family operations.
+
+    This covers both activation-by-activation attention products and explicit
+    static-weight MatMul projections. Linear and Conv projections retain their
+    existing per-channel weight contracts when captured as those operators.
+    """
+    annotated_partitions: List[List[Node]] = []
+    for node in gm.graph.nodes:
+        operands = _matmul_operands(node)
+        if node.op != "call_function" or not operands:
+            continue
+        if _is_annotated([node]) or (filter_fn and not filter_fn(node)):
+            continue
+
+        input_nodes = list(operands)
+        if node.target == torch.ops.aten.baddbmm.default:
+            accumulator = node.args[0]
+            if isinstance(accumulator, Node):
+                input_nodes.insert(0, accumulator)
+
+        input_qspec = get_input_act_qspec(quantization_config)
+        input_qspec_map = {
+            input_node: input_qspec
+            for input_node in input_nodes
+            if not _is_input_non_float_tensor(input_node)
+        }
+        if not all(operand in input_qspec_map for operand in operands):
+            continue
+
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            output_qspec=get_output_act_qspec(quantization_config),
+            _annotated=True,
+        )
+        annotated_partitions.append([node])
+    return annotated_partitions
+
+
+@register_annotator("sima_softmax")
+def _sima_annotate_softmax(
+    gm: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Annotate Softmax input and output activations for strict W8A8."""
+    return _annotate_single_aten_op(
+        gm,
+        quantization_config,
+        (
+            torch.ops.aten.softmax.int,
+            torch.ops.aten._softmax.default,
+        ),
+        filter_fn,
+    )
 
 
 @register_annotator("sima_sigmoid")

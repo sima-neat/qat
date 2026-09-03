@@ -40,6 +40,7 @@ The recommended workflow is **prepare → warm up → freeze → fine-tune → f
 ```python
 import torch
 from sima_qat import (
+    BF16Rule,
     sima_prepare_qat_model,
     sima_freeze_qat,
     sima_finalize_qat_model,
@@ -49,7 +50,8 @@ from sima_qat import (
 model = ...                                  # any torch.nn.Module
 example_inputs = (torch.randn(1, 3, 224, 224),)
 
-# 1. Insert shift-aware fake-quant scaffolding.
+# 1. Insert shift-aware fake-quant scaffolding. Recognized attention
+#    MatMul/Softmax regions use BF16 by default.
 qat_model = sima_prepare_qat_model(model, example_inputs, device='cuda')
 
 # 2. Warm up observers with your normal training loop ...
@@ -71,6 +73,51 @@ integer shift requantization without rescaling the learned INT8 weight codes. Ca
 lock them automatically if necessary, but fine-tuning after the explicit call generally gives better
 accuracy.
 
+### BF16 precision
+
+Recognized attention score/value MatMul and Softmax regions are promoted to BF16 by default. Linear
+and convolutional Q/K/V/output projections remain W8A8. Training applies BF16 rounding with a
+straight-through gradient, and ONNX export emits standard operators plus
+`ai.sima::AnnotatePrecision(precision="bfloat16")` markers for AFE.
+
+GridSample is always promoted to BF16 because MLA does not support an INT8
+GridSample. This mandatory target rule is independent of the attention policy.
+
+The `bf16_rules` argument has explicit three-state behavior:
+
+```python
+# Automatic attention promotion (default)
+qat_model = sima_prepare_qat_model(model, inputs, device="cuda")
+
+# Disable optional attention promotion; mandatory GridSample remains BF16
+qat_model = sima_prepare_qat_model(
+    model, inputs, device="cuda", bf16_rules=()
+)
+
+# Replace automatic selection with module-path regex rules
+qat_model = sima_prepare_qat_model(
+    model,
+    inputs,
+    device="cuda",
+    bf16_rules=(
+        BF16Rule(r"^encoder\.layers\..*\.self_attn$"),
+        BF16Rule(r"^decoder\..*\.cross_attn$", op_types=("softmax",)),
+    ),
+)
+```
+
+Rules match captured PyTorch module paths, not generated FX or ONNX node names. An empty tuple
+therefore disables optional attention promotion; a non-empty tuple replaces rather than extends the
+default attention policy. Mandatory target rules are always applied.
+Invalid regexes, unmatched module paths, and matches without eligible attention operators fail
+closed. The resolved, normalized policy is available at
+`qat_model.meta["sima_bf16_plan"]` and is persisted in QAT checkpoints so resuming with a different
+precision policy is rejected.
+
+Common explicit and non-causal Torch SDPA attention forms are supported. Unsupported attention-like
+Softmax topologies, such as deformable sampling reductions, are reported in the plan and are not
+silently promoted.
+
 Preparation preserves the exact example shapes by default. Models that are
 truly batch-polymorphic can opt in with
 `sima_prepare_qat_model(..., dynamic_batch=True)`. The opt-in capture is
@@ -85,7 +132,7 @@ left unchanged on both successful and failed capture.
 
 | function | purpose |
 |---|---|
-| `sima_prepare_qat_model(model, inputs, device, *, dynamic_batch=False)` | Capture the model and insert SiMa shift-aware fake-quant annotations. Dynamic training batch is explicit opt-in. |
+| `sima_prepare_qat_model(model, inputs, device, *, dynamic_batch=False, bf16_rules=None)` | Capture the model, insert shift-aware W8A8 QAT, and apply mandatory and requested BF16 policies. |
 | `sima_freeze_qat(qat_model)` | Freeze observers and lock AFE-compatible weight scales before final fine-tuning. |
 | `sima_finalize_qat_model(qat_model)` | Fold the trained scaffolding into an inference-only quantized graph. |
 | `sima_export_onnx(qat_model, inputs, output_file, ...)` | Export the finalized model to an ONNX QuantizeLinear/DequantizeLinear graph. |

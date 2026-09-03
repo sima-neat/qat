@@ -59,6 +59,7 @@ class DynamicBatchNorm(nn.Module):
 
 def test_public_api_exposes_only_the_single_qat_mode() -> None:
     assert sima_qat.__all__ == [
+        "BF16Rule",
         "sima_prepare_qat_model",
         "sima_freeze_qat",
         "sima_finalize_qat_model",
@@ -71,6 +72,9 @@ def test_public_api_exposes_only_the_single_qat_mode() -> None:
     ]
     assert dynamic_batch.kind is inspect.Parameter.KEYWORD_ONLY
     assert dynamic_batch.default is False
+    bf16_rules = inspect.signature(sima_prepare_qat_model).parameters["bf16_rules"]
+    assert bf16_rules.kind is inspect.Parameter.KEYWORD_ONLY
+    assert bf16_rules.default is None
 
     config = get_sima_quantization_config(is_qat=True)
     assert isinstance(config.weight.observer_or_fake_quant_ctr(), FakeQuantizeBase)

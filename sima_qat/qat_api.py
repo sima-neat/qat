@@ -28,12 +28,13 @@
 #
 #**************************************************************************
 import copy
+import json
 import math
 import operator
 import warnings
 from collections import OrderedDict
 from itertools import chain
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -58,6 +59,13 @@ from torch.utils._pytree import tree_flatten, tree_map
 
 
 from sima_qat import onnx_ops
+from sima_qat.bf16 import (
+    BF16Rule,
+    decompose_scaled_dot_product_attention,
+    insert_bf16_simulation,
+    mark_bf16_nodes,
+    resolve_bf16_plan,
+)
 from sima_qat.sima_quantizer import (
     SimaFakeQuantize,
     SimaQuantizer,
@@ -72,12 +80,22 @@ device_modifier_ops = [
 ]
 
 
+def _serialized_bf16_plan(plan: Any, device: torch.device) -> Tensor:
+    payload = json.dumps(
+        plan,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return torch.tensor(list(payload), dtype=torch.uint8, device=device)
+
+
 def sima_prepare_qat_model(
     input_graph: nn.Module,
     inputs: Tuple,
     device: torch.device,
     *,
     dynamic_batch: bool = False,
+    bf16_rules: Sequence[BF16Rule] | None = None,
 ) -> GraphModule:
     """This function is the first transformation needed to perform QAT on a Pytorch model. It takes an
     eager-mode reference to the ML model and produces an FX version of the graph with special annotations
@@ -108,6 +126,12 @@ def sima_prepare_qat_model(
             for tensor inputs sharing the first tensor's leading size. The
             default is deliberately static. Existing three-argument calls
             remain source-compatible and preserve the supplied example shape.
+        bf16_rules: controls optional attention precision. ``None`` automatically
+            promotes recognized attention MatMul/Softmax regions to BF16;
+            an empty sequence disables attention promotion; explicit rules
+            replace automatic attention selection and match PyTorch module
+            paths. Operators that MLA only supports in BF16, currently
+            GridSample, remain BF16 in every mode.
     Returns:
         GraphModule: a compiled version of the given graph with QAT annotations, ready to begin training.
     """
@@ -149,11 +173,17 @@ def sima_prepare_qat_model(
             ) from error
     else:
         m = export_for_training(capture_graph, capture_example_inputs).module()
+    m = decompose_scaled_dot_product_attention(m)
     m = replace_dropout(m)
+
+    bf16_plan = resolve_bf16_plan(m, bf16_rules)
+    mark_bf16_nodes(m, bf16_plan)
 
     cfg = get_sima_quantization_config(is_qat=True)
     quantizer = SimaQuantizer().set_global(cfg)
     gm = prepare_qat_pt2e(m, quantizer)
+    gm = insert_bf16_simulation(gm, bf16_plan)
+    gm.meta["sima_bf16_plan"] = copy.deepcopy(bf16_plan)
     sima_mod = SimaQatWrapper(source=gm, label='scaffold')
     sima_mod.to(device)
     sima_mod.train()
@@ -785,8 +815,11 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
         )
         sima_freeze_qat(qat_model)
     print(f"Removing QAT scaffold and quantizing network ...")
+    bf16_plan = copy.deepcopy(qat_model.meta.get("sima_bf16_plan"))
     _ensure_bn_tracking_meta(qat_model)
     m = convert_pt2e(qat_model, use_reference_representation=False)
+    if bf16_plan is not None:
+        m.meta["sima_bf16_plan"] = bf16_plan
     sima_mod = SimaQatWrapper(source=m, label='fq')
     # We must call eval() to invoke internal functions to put the GraphModule in eval state. Once we are
     # in FQ mode, we always remain in eval mode.
@@ -812,7 +845,7 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
     qat_model = check_graph_nodes(qat_model, device='cpu')
     torch.onnx.export(
         qat_model,
-        inputs[0],
+        inputs,
         output_file,
         export_params=True,
         opset_version=17,
@@ -882,6 +915,13 @@ class SimaQatWrapper(GraphModule):
             "qat_frozen",
             torch.tensor([label == 'fq'], dtype=torch.bool, device=state_device),
         )
+        self.register_buffer(
+            "sima_bf16_plan_json",
+            _serialized_bf16_plan(
+                self.meta.get("sima_bf16_plan"),
+                state_device,
+            ),
+        )
 
     def train(self, use_train: bool = True) -> 'SimaQatWrapper':
         """This function emulates the behavior of train() on nn.Module.
@@ -946,6 +986,17 @@ class SimaQatWrapper(GraphModule):
         if checkpoint_state_id != state_id:
             raise RuntimeError(
                 f"Error: model QAT state {state_id} doesn't match checkpoint QAT state {checkpoint_state_id}"
+            )
+
+        checkpoint_plan = state_dict.get("sima_bf16_plan_json")
+        if checkpoint_plan is None:
+            raise RuntimeError("Error: QAT checkpoint has no persisted precision policy")
+        if not torch.equal(
+            torch.as_tensor(checkpoint_plan).detach().cpu(),
+            self.sima_bf16_plan_json.detach().cpu(),
+        ):
+            raise RuntimeError(
+                "Error: model BF16 precision policy does not match checkpoint"
             )
 
         compatible_state = OrderedDict(state_dict)
