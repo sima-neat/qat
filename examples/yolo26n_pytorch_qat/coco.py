@@ -13,6 +13,32 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 
+def letterbox_image(
+    image: Image.Image,
+    image_size: int,
+) -> tuple[Tensor, float, int, int]:
+    """Resize and center-pad an RGB image, returning its inverse geometry."""
+
+    original_width, original_height = image.size
+    scale = min(image_size / original_width, image_size / original_height)
+    resized_width = max(1, round(original_width * scale))
+    resized_height = max(1, round(original_height * scale))
+    resized = image.resize((resized_width, resized_height), Image.Resampling.BILINEAR)
+    left = (image_size - resized_width) // 2
+    top = (image_size - resized_height) // 2
+    canvas = Image.new("RGB", (image_size, image_size), (114, 114, 114))
+    canvas.paste(resized, (left, top))
+    byte_image = torch.frombuffer(bytearray(canvas.tobytes()), dtype=torch.uint8)
+    tensor = (
+        byte_image.view(image_size, image_size, 3)
+        .permute(2, 0, 1)
+        .contiguous()
+        .float()
+        .div_(255)
+    )
+    return tensor, scale, left, top
+
+
 class CocoDetectionDataset(Dataset):
     """Read COCO boxes and produce normalized YOLO-style training tensors."""
 
@@ -71,14 +97,7 @@ class CocoDetectionDataset(Dataset):
         with Image.open(image_path) as loaded:
             image = loaded.convert("RGB")
         original_width, original_height = image.size
-        scale = min(self.image_size / original_width, self.image_size / original_height)
-        resized_width = max(1, round(original_width * scale))
-        resized_height = max(1, round(original_height * scale))
-        resized = image.resize((resized_width, resized_height), Image.Resampling.BILINEAR)
-        left = (self.image_size - resized_width) // 2
-        top = (self.image_size - resized_height) // 2
-        canvas = Image.new("RGB", (self.image_size, self.image_size), (114, 114, 114))
-        canvas.paste(resized, (left, top))
+        image_tensor, scale, left, top = letterbox_image(image, self.image_size)
 
         boxes = []
         classes = []
@@ -98,18 +117,9 @@ class CocoDetectionDataset(Dataset):
         box_tensor = torch.tensor(boxes, dtype=torch.float32).reshape(-1, 4)
         class_tensor = torch.tensor(classes, dtype=torch.float32)
         if self.horizontal_flip and random.random() < self.horizontal_flip:
-            canvas = canvas.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+            image_tensor = image_tensor.flip(-1)
             if box_tensor.numel():
                 box_tensor[:, 0] = 1 - box_tensor[:, 0]
-
-        byte_image = torch.frombuffer(bytearray(canvas.tobytes()), dtype=torch.uint8)
-        image_tensor = (
-            byte_image.view(self.image_size, self.image_size, 3)
-            .permute(2, 0, 1)
-            .contiguous()
-            .float()
-            .div_(255)
-        )
         target = {
             "cls": class_tensor,
             "bboxes": box_tensor,

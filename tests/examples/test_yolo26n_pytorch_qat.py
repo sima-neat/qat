@@ -15,6 +15,7 @@ EXAMPLE = Path(__file__).parents[2] / "examples" / "yolo26n_pytorch_qat"
 sys.path.insert(0, str(EXAMPLE))
 
 from coco import CocoDetectionDataset, collate_detection  # noqa: E402
+from evaluate import decode_boxdecode, decode_end2end, detections_to_coco  # noqa: E402
 from loss import YOLO26Loss  # noqa: E402
 from model import build_yolo26n  # noqa: E402
 from sima_qat import sima_freeze_qat, sima_prepare_qat_model  # noqa: E402
@@ -99,3 +100,60 @@ def test_full_model_dynamic_qat_prepare_forward_and_freeze() -> None:
     loss.backward()
     sima_freeze_qat(prepared)
     assert bool(prepared.qat_frozen.item())
+
+
+def test_one2one_decode_and_inverse_letterbox() -> None:
+    boxes = torch.tensor([[[0.25], [0.5], [0.75], [1.0]]])
+    scores = torch.full((1, 80, 1), -20.0)
+    scores[0, 3, 0] = 4.0
+    feature = torch.zeros(1, 1, 1, 1)
+    predictions = {
+        "one2one": {
+            "boxes": boxes,
+            "scores": scores,
+            "feats": [feature, feature[:, :, :0, :0], feature[:, :, :0, :0]],
+        }
+    }
+    detections = decode_end2end(predictions, max_detections=1)
+    torch.testing.assert_close(
+        detections[0][0, :4],
+        torch.tensor([2.0, 0.0, 10.0, 12.0]),
+    )
+    coco = detections_to_coco(
+        detections,
+        [
+            {
+                "image_id": 7,
+                "original_width": 8,
+                "original_height": 8,
+                "scale": 1.0,
+                "left": 2,
+                "top": 2,
+            }
+        ],
+        tuple(range(80)),
+    )
+    assert coco[0]["image_id"] == 7
+    assert coco[0]["category_id"] == 3
+    assert coco[0]["bbox"] == [0.0, 0.0, 8.0, 8.0]
+
+
+def test_boxdecode_path_uses_cell_argmax_and_class_aware_integer_nms() -> None:
+    boxes = torch.tensor(
+        [[[0.5, 1.5], [0.5, 0.5], [1.5, 0.5], [0.5, 0.5]]]
+    )
+    scores = torch.full((1, 80, 2), -20.0)
+    scores[0, 2, 0] = 4.0
+    scores[0, 3, 0] = 3.0  # BoxDecode keeps only the cell's best class.
+    scores[0, 2, 1] = 3.5  # Same-class duplicate is removed by NMS.
+    feature = torch.zeros(1, 1, 1, 2)
+    predictions = {
+        "one2one": {
+            "boxes": boxes,
+            "scores": scores,
+            "feats": [feature, feature[:, :, :0, :0], feature[:, :, :0, :0]],
+        }
+    }
+    detections = decode_boxdecode(predictions, max_detections=2, nms_iou=0.7)
+    assert detections[0].shape == (1, 6)
+    assert detections[0][0, 5].item() == 2

@@ -48,6 +48,52 @@ python examples/yolo26n_pytorch_qat/train.py \
 COCO128 only validates capture, gradients, optimizer updates, scale locking,
 checkpointing, finalization, and export. It cannot establish detector accuracy.
 
+## Measure FP32 and pre-training fake-INT8 accuracy
+
+Install the standard COCO evaluator and run both variants against all 5,000
+`val2017` images:
+
+```bash
+python examples/yolo26n_pytorch_qat/evaluate.py \
+  --weights /path/to/yolo26n_pure.pt \
+  --output runs/yolo26n_accuracy \
+  --mode both \
+  --device cuda:0
+```
+
+The fake-INT8 variant prepares the QAT graph, collects observer statistics from
+1,024 deterministically sampled `train2017` images with BatchNorm in evaluation mode,
+freezes its grids, and only then measures COCO accuracy. `comparison.json`
+contains the absolute metrics and INT8-minus-FP32 deltas. This is a
+pre-training quantization baseline, not the expected accuracy after QAT.
+
+The checked-in full-COCO result is:
+
+| Variant | mAP50-95 | mAP50 | mAP75 |
+| --- | ---: | ---: | ---: |
+| FP32 | 0.3967 | 0.5584 | 0.4257 |
+| Frozen fake-INT8 before QAT | 0.3588 | 0.5249 | 0.3861 |
+| INT8 minus FP32 | -0.0379 | -0.0335 | -0.0395 |
+
+The evaluator mirrors the current INT8 BoxDecode-v2 path: one-to-one raw heads,
+one class per cell, pre-decode top-k, integer-coordinate class-aware NMS at IoU
+0.7, and final top-k. For comparison, the standalone native NMS-free decoder
+measured `0.4025`, close to Ultralytics' `0.401`
+[official rounded e2e result](https://github.com/ultralytics/ultralytics/blob/main/README.md#detection-coco).
+
+See `results/coco_val2017_640_fp32_vs_int8_pretrain.json` for the complete
+reproducibility record.
+
+On the internal Slurm cluster, install `pycocotools` into the ignored
+`runs/coco_eval_deps` directory and submit the provided evaluation job from the
+example directory:
+
+```bash
+python -m pip install --no-deps --target ../../runs/coco_eval_deps pycocotools==2.0.10
+mkdir -p logs
+sbatch slurm_evaluate.sbatch
+```
+
 ## 3. Fine-tune on full COCO 2017
 
 The full shared dataset is already the default. No YOLO `.txt` conversion is
