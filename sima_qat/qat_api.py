@@ -455,39 +455,30 @@ def _safe_power_of_two_weight_scale(
     return scales.to(minimum_weight_scale.device)
 
 
-def _stage_coarser_activation_grid(
+def _stage_activation_grid(
     fake_quant: FakeQuantizeBase,
     scale: Tensor,
     zero_point: Tensor,
-    multiplier: int,
+    requested_scale: Tensor,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Stage an observer-stable coarser activation grid without mutation.
-
-    AFE requantization supports only non-negative right shifts. When a weight
-    needs a shift smaller than zero, coarsening the weighted operation's output
-    grid by a power of two makes the contract realizable. Work on an observer
-    copy so a later failure leaves the prepared model completely unchanged.
-    """
-    if multiplier < 2 or multiplier & (multiplier - 1):
-        raise ValueError(
-            "activation-grid multiplier must be a power of two >= 2, "
-            f"found {multiplier}"
-        )
-    if scale.numel() != 1 or zero_point.numel() != 1:
+    """Stage an observer-stable activation grid without mutating the model."""
+    if scale.numel() != 1 or zero_point.numel() != 1 or requested_scale.numel() != 1:
         raise RuntimeError(
             "Shift-aware activation retargeting requires per-tensor qparams"
         )
+    requested_scale = requested_scale.to(device=scale.device, dtype=scale.dtype)
+    if (
+        not bool(torch.isfinite(requested_scale).all())
+        or bool((requested_scale <= 0).any())
+    ):
+        raise RuntimeError("Requested activation grid is non-finite or non-positive")
     observer = copy.deepcopy(fake_quant.activation_post_process)
     if not hasattr(observer, "min_val") or not hasattr(observer, "max_val"):
         raise RuntimeError(
             f"Activation observer {type(observer).__name__} cannot persist a retargeted grid"
         )
 
-    requested_scale = scale.detach() * multiplier
-    # Keep the affine grid's integer origin fixed.  For x=(q-z)*s, replacing
-    # s by m*s while retaining z produces a coarser grid nested in the old
-    # grid and continues to represent real zero exactly.  Dividing z by m
-    # would translate the grid and needlessly perturb every asymmetric value.
+    # Keep the affine grid's integer origin fixed so real zero stays exact.
     requested_zero_point = zero_point.detach().clone()
     lower = (
         (observer.quant_min - requested_zero_point.to(requested_scale.dtype))
@@ -512,9 +503,94 @@ def _stage_coarser_activation_grid(
     if not torch.equal(persisted_zero_point, requested_zero_point):
         raise RuntimeError(
             "Activation observer could not preserve the asymmetric zero point "
-            "while persisting a coarser grid"
+            "while persisting a retargeted grid"
         )
     return persisted_scale, persisted_zero_point, lower, upper
+
+
+def _stage_coarser_activation_grid(
+    fake_quant: FakeQuantizeBase,
+    scale: Tensor,
+    zero_point: Tensor,
+    multiplier: int,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Stage a power-of-two coarser activation grid without mutation.
+
+    AFE requantization supports only non-negative right shifts. When a weight
+    needs a shift smaller than zero, coarsening the weighted operation's output
+    grid by a power of two makes the contract realizable. Work on an observer
+    copy so a later failure leaves the prepared model completely unchanged.
+    """
+    if multiplier < 2 or multiplier & (multiplier - 1):
+        raise ValueError(
+            "activation-grid multiplier must be a power of two >= 2, "
+            f"found {multiplier}"
+        )
+    requested_scale = scale.detach() * multiplier
+    return _stage_activation_grid(fake_quant, scale, zero_point, requested_scale)
+
+
+def _shared_weight_output_scale(
+    input_scale: Tensor,
+    weight_scales: Tensor,
+    minimum_output_scale: Tensor,
+) -> Tensor:
+    """Choose a non-clipping output grid for an already locked tied weight.
+
+    Scales produced by :func:`_safe_power_of_two_weight_scale` differ across
+    channels only by powers of two relative to its anchor invocation. A later
+    invocation can therefore keep that exact weight tensor and select one
+    scalar output scale that changes only the per-channel right shifts.
+    """
+    if input_scale.numel() != 1 or minimum_output_scale.numel() != 1:
+        raise RuntimeError("Shared-weight retargeting requires per-tensor activations")
+    sx = float(input_scale.reshape(-1)[0].detach().cpu())
+    old_sy = float(minimum_output_scale.reshape(-1)[0].detach().cpu())
+    products = sx * weight_scales.detach().reshape(-1).to(torch.float64).cpu()
+    if not bool(torch.isfinite(products).all()) or bool((products <= 0).any()):
+        raise RuntimeError("Shared-weight products must be finite and positive")
+
+    reference = float(products.max())
+    required_ratio = old_sy / reference
+    shift = max(0, math.ceil(math.log2(required_ratio)))
+    if shift > _MAX_REQUANT_SHIFT:
+        raise RuntimeError(
+            "A tied weight would require a requantization shift greater than "
+            f"{_MAX_REQUANT_SHIFT}"
+        )
+    requested = torch.tensor(
+        [reference * (2.0 ** shift)],
+        device=minimum_output_scale.device,
+        dtype=minimum_output_scale.dtype,
+    )
+    while float(requested.item()) < old_sy and shift < _MAX_REQUANT_SHIFT:
+        shift += 1
+        requested.mul_(2.0)
+    if float(requested.item()) < old_sy:
+        raise RuntimeError("Unable to retain the observed range for a tied weight")
+    return requested
+
+
+def _shift_ratios_are_realizable(
+    input_scale: Tensor,
+    weight_scales: Tensor,
+    output_scale: Tensor,
+) -> bool:
+    ratios = (
+        input_scale.detach().reshape(-1)[0].to(torch.float64).cpu()
+        * weight_scales.detach().reshape(-1).to(torch.float64).cpu()
+        / output_scale.detach().reshape(-1)[0].to(torch.float64).cpu()
+    )
+    if not bool(torch.isfinite(ratios).all()) or bool((ratios <= 0).any()):
+        return False
+    shifts = -torch.ceil(torch.log2(ratios))
+    normalized = ratios * torch.pow(2.0, shifts)
+    return bool(
+        (shifts >= _MIN_REQUANT_SHIFT).all()
+        and (shifts <= _MAX_REQUANT_SHIFT).all()
+        and (normalized <= 1.0).all()
+        and (normalized > 0.99999).all()
+    )
 
 
 def _freeze_batchnorm_stats(module: GraphModule) -> None:
@@ -688,19 +764,82 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
             "Shift-aware activation-grid constraint solver did not converge"
         )
 
-    locked_scales = []
+    # Lock tied weights once, in graph order. Later invocations retain that
+    # exact weight grid and coarsen their output activation grid just enough
+    # to select a legal right shift. Computing and writing one scale per call
+    # would make the last call silently invalidate every earlier call that
+    # shares the fake-quantized weight.
+    locked_scales_by_weight = {}
     for node, input_fq, weight_fq, output_fq, minimum_weight_scale in contracts:
+        input_row = activation_qparams_by_id[id(input_fq)]
+        output_row = activation_qparams_by_id[id(output_fq)]
+        weight_id = id(weight_fq)
+        if weight_id not in locked_scales_by_weight:
+            try:
+                scales = _safe_power_of_two_weight_scale(
+                    input_row[1],
+                    output_row[1],
+                    minimum_weight_scale,
+                )
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"Shift-aware QAT could not solve weight grid for {node.name}: {error}"
+                ) from error
+            locked_scales_by_weight[weight_id] = (weight_fq, scales)
+            continue
+
+        _, scales = locked_scales_by_weight[weight_id]
+        if _shift_ratios_are_realizable(input_row[1], scales, output_row[1]):
+            continue
+        old_scale = float(output_row[1].reshape(-1)[0].detach().cpu())
+        old_zero_point = int(output_row[2].reshape(-1)[0].detach().cpu())
         try:
-            scales = _safe_power_of_two_weight_scale(
-                activation_qparams_by_id[id(input_fq)][1],
-                activation_qparams_by_id[id(output_fq)][1],
-                minimum_weight_scale,
+            requested_scale = _shared_weight_output_scale(
+                input_row[1], scales, output_row[1]
+            )
+            scale, zero_point, lower, upper = _stage_activation_grid(
+                output_fq,
+                output_row[1],
+                output_row[2],
+                requested_scale,
             )
         except RuntimeError as error:
             raise RuntimeError(
-                f"Shift-aware QAT could not solve weight grid for {node.name}: {error}"
+                f"Shift-aware QAT could not align tied weight grid for {node.name}: {error}"
             ) from error
-        locked_scales.append((weight_fq, scales))
+        if not _shift_ratios_are_realizable(input_row[1], scales, scale):
+            raise RuntimeError(
+                f"Shift-aware QAT could not represent tied weight grid for {node.name}"
+            )
+        output_row[1] = scale
+        output_row[2] = zero_point
+        output_row[3] = lower
+        output_row[4] = upper
+        new_scale = float(scale.reshape(-1)[0].detach().cpu())
+        activation_retargets.append({
+            "op": node.name,
+            "scale_before": old_scale,
+            "scale_after": new_scale,
+            "zero_point_before": old_zero_point,
+            "zero_point_after": int(zero_point.reshape(-1)[0].detach().cpu()),
+            "shared_weight_alignment": True,
+        })
+
+    # A retargeted shared activation can participate in more than one graph
+    # contract. Validate the complete fixed point before mutating any module.
+    for node, input_fq, weight_fq, output_fq, _ in contracts:
+        _, scales = locked_scales_by_weight[id(weight_fq)]
+        if not _shift_ratios_are_realizable(
+            activation_qparams_by_id[id(input_fq)][1],
+            scales,
+            activation_qparams_by_id[id(output_fq)][1],
+        ):
+            raise RuntimeError(
+                "Shift-aware QAT tied-weight alignment invalidated another "
+                f"contract at {node.name}"
+            )
+
+    locked_scales = list(locked_scales_by_weight.values())
 
     fake_quantizers = [
         module for module in qat_model.modules() if isinstance(module, FakeQuantizeBase)
@@ -812,7 +951,7 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
     qat_model = check_graph_nodes(qat_model, device='cpu')
     torch.onnx.export(
         qat_model,
-        inputs[0],
+        inputs,
         output_file,
         export_params=True,
         opset_version=17,

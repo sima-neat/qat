@@ -71,6 +71,31 @@ integer shift requantization without rescaling the learned INT8 weight codes. Ca
 lock them automatically if necessary, but fine-tuning after the explicit call generally gives better
 accuracy.
 
+## Operator contract
+
+The QAT operator set follows the forms that awesome-frontend can canonicalize and place on MLA.
+Automatic layout conversion may remap a logical Softmax or LayerNorm axis to channel, and converts
+supported batched MatMul forms to MLA BatchMatmul/Einsum forms. `any_shape_on_mla` permits supported
+operators to retain non-4D ranks; it does not remove operator-specific or precision restrictions.
+
+| family | QAT contract |
+|---|---|
+| Conv1d, Conv2d, Linear | signed W8A8 with shift-aware per-channel weight locking |
+| MatMul, MM, BMM, BAddBMM | activation W8A8; deployment still requires AFE to canonicalize the concrete shape/equation |
+| Softmax | W8A8; automatic layout conversion must map its logical axis to MLA channel |
+| LayerNorm | W8A8 boundary; AFE-supported rank, axis, batch and channel limits still apply |
+| Erf and GELU | Erf and exact (`approximate="none"`) GELU only; tanh GELU is rejected |
+| Concat | W8A8; repeated-input and identity-prefix layouts share the payload grid |
+
+GridSample is deliberately not annotated as INT8 because awesome-frontend supports it only in BF16.
+Dynamic Embedding/Gather is also excluded because it currently has no general MLA runtime-index
+lowering. These require an explicit mixed-precision/offload policy outside this strict INT8 QAT API.
+
+ConvTranspose2d is deferred even though MLA has an INT8 kernel. PyTorch 2.8 rewrites its required
+output-channel weight axis from 1 to 0 during PT2E conversion, while the per-tensor fallback produces
+a scalar weight QDQ scale that current awesome-frontend constant surgery cannot import. It must not
+be advertised until one of those downstream contracts is fixed and covered end to end.
+
 Preparation preserves the exact example shapes by default. Models that are
 truly batch-polymorphic can opt in with
 `sima_prepare_qat_model(..., dynamic_batch=True)`. The opt-in capture is

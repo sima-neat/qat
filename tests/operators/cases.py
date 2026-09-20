@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import operator
 from dataclasses import dataclass
 from typing import Callable
@@ -44,6 +45,15 @@ class Conv2dModel(nn.Module):
         return self.conv(inputs)
 
 
+class ReusedConv2dModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.shared = nn.Conv2d(3, 3, 1, bias=False)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.shared(torch.relu(self.shared(inputs)))
+
+
 class ConvReluModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -84,6 +94,53 @@ class LinearModel(nn.Module):
 
     def forward(self, inputs: Tensor) -> Tensor:
         return self.activation(self.linear(inputs))
+
+
+class MatMulModel(nn.Module):
+    def __init__(self, operation: str) -> None:
+        super().__init__()
+        self.operation = operation
+
+    def forward(self, left: Tensor, right: Tensor) -> Tensor:
+        if self.operation == "mm":
+            return torch.mm(left, right)
+        if self.operation == "bmm":
+            return torch.bmm(left, right)
+        return torch.matmul(left, right)
+
+
+class BAddBMMModel(nn.Module):
+    def forward(self, bias: Tensor, left: Tensor, right: Tensor) -> Tensor:
+        return torch.baddbmm(bias, left, right)
+
+
+class SoftmaxModel(nn.Module):
+    def forward(self, inputs: Tensor) -> Tensor:
+        return torch.softmax(inputs, dim=1)
+
+
+class LayerNormModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(8)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.norm(inputs)
+
+
+class ErfModel(nn.Module):
+    def forward(self, inputs: Tensor) -> Tensor:
+        return torch.erf(inputs)
+
+
+class ExactGeluModel(nn.Module):
+    def forward(self, inputs: Tensor) -> Tensor:
+        return torch.nn.functional.gelu(inputs, approximate="none")
+
+
+class DecomposedGeluModel(nn.Module):
+    def forward(self, inputs: Tensor) -> Tensor:
+        return inputs * 0.5 * (1.0 + torch.erf(inputs / math.sqrt(2.0)))
 
 
 class ConvConstantPostOpModel(nn.Module):
@@ -171,6 +228,14 @@ IMAGE_INPUT: InputFactory = lambda: (torch.randn(2, 3, 8, 8),)
 FOUR_CHANNEL_INPUT: InputFactory = lambda: (torch.randn(2, 4, 8, 8),)
 SEQUENCE_INPUT: InputFactory = lambda: (torch.randn(2, 3, 12),)
 LINEAR_INPUT: InputFactory = lambda: (torch.randn(2, 8),)
+ATTENTION_INPUT: InputFactory = lambda: (torch.randn(1, 4, 8),)
+MM_INPUT: InputFactory = lambda: (torch.randn(4, 8), torch.randn(8, 3))
+BMM_INPUT: InputFactory = lambda: (torch.randn(2, 4, 8), torch.randn(2, 8, 3))
+BADDBMM_INPUT: InputFactory = lambda: (
+    torch.randn(2, 4, 3),
+    torch.randn(2, 4, 8),
+    torch.randn(2, 8, 3),
+)
 
 
 OPERATOR_CASES = (
@@ -190,6 +255,14 @@ OPERATOR_CASES = (
         (torch.ops.aten.conv2d.default,),
         weighted=True,
         onnx_family="conv",
+    ),
+    OperatorCase(
+        "reused_conv2d",
+        "sima_unannotated_conv2d",
+        ReusedConv2dModel,
+        IMAGE_INPUT,
+        (torch.ops.aten.conv2d.default,),
+        weighted=True,
     ),
     OperatorCase(
         "conv_relu",
@@ -248,6 +321,74 @@ OPERATOR_CASES = (
         LINEAR_INPUT,
         (torch.ops.aten.relu.default,),
         weighted=True,
+    ),
+    OperatorCase(
+        "mm",
+        "sima_matmul",
+        lambda: MatMulModel("mm"),
+        MM_INPUT,
+        (torch.ops.aten.mm.default,),
+        onnx_family="matmul",
+    ),
+    OperatorCase(
+        "matmul",
+        "sima_matmul",
+        lambda: MatMulModel("matmul"),
+        BMM_INPUT,
+        (torch.ops.aten.matmul.default,),
+    ),
+    OperatorCase(
+        "bmm",
+        "sima_matmul",
+        lambda: MatMulModel("bmm"),
+        BMM_INPUT,
+        (torch.ops.aten.bmm.default,),
+    ),
+    OperatorCase(
+        "baddbmm",
+        "sima_matmul",
+        BAddBMMModel,
+        BADDBMM_INPUT,
+        (torch.ops.aten.baddbmm.default,),
+    ),
+    OperatorCase(
+        "softmax",
+        "sima_softmax",
+        SoftmaxModel,
+        ATTENTION_INPUT,
+        (torch.ops.aten.softmax.int, torch.ops.aten._softmax.default),
+        onnx_family="softmax",
+    ),
+    OperatorCase(
+        "layer_norm",
+        "sima_layer_norm",
+        LayerNormModel,
+        ATTENTION_INPUT,
+        (torch.ops.aten.layer_norm.default,),
+        onnx_family="layer_norm",
+    ),
+    OperatorCase(
+        "erf",
+        "sima_erf",
+        ErfModel,
+        ATTENTION_INPUT,
+        (torch.ops.aten.erf.default,),
+        onnx_family="erf",
+    ),
+    OperatorCase(
+        "decomposed_gelu",
+        "sima_erf",
+        DecomposedGeluModel,
+        ATTENTION_INPUT,
+        (torch.ops.aten.erf.default,),
+    ),
+    OperatorCase(
+        "exact_gelu",
+        "sima_gelu",
+        ExactGeluModel,
+        ATTENTION_INPUT,
+        (torch.ops.aten.gelu.default,),
+        onnx_family="gelu",
     ),
     OperatorCase(
         "conv_add_constant",
