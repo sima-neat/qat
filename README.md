@@ -147,6 +147,14 @@ python export_onnx.py --model resnet18
 
 Pass `--disable-qat` to either `train.py` to train a plain float baseline instead of QAT.
 
+**YOLO26n** — [examples/yolo26n_pytorch_qat](examples/yolo26n_pytorch_qat) is a
+plain-PyTorch COCO QAT workflow. It reads COCO JSON directly, reproduces the
+YOLO26 dual-head objective, and exports six QDQ raw heads for native BoxDecode.
+Ultralytics is used only by an isolated, one-time checkpoint converter; the
+model, data path, loss, optimizer, and training process have no Ultralytics
+runtime dependency. See the example README for COCO128 smoke and full COCO 2017
+commands.
+
 ## Tests
 
 ```bash

@@ -3,3 +3,5 @@
 *.onnx
 data/
 exported_models/
+runs/
+examples/yolo26n_pytorch_qat/logs/
