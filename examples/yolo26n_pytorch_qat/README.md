@@ -131,6 +131,21 @@ After the final epoch the trainer writes:
 - `yolo26n_qat_raw_heads.onnx`: six one-to-one QDQ heads in grouped order
   `bbox_0..2, class_logit_0..2`, ready for SiMa YOLO26 BoxDecode.
 
+Evaluate any saved QAT checkpoint with the same COCO/BoxDecode path used for
+the FP32 baseline:
+
+```bash
+python examples/yolo26n_pytorch_qat/evaluate.py \
+  --weights /path/to/yolo26n_pure.pt \
+  --qat-checkpoint runs/yolo26n_coco_qat/checkpoints/epoch_001.pt \
+  --output runs/yolo26n_coco_qat/eval_epoch_001 \
+  --mode qat-trained \
+  --device cuda:0
+```
+
+`slurm_full_qat.sbatch` trains two full-COCO epochs on one A100, freezes the
+quantization grids for epoch 2, and evaluates both checkpoints.
+
 Use `--resume checkpoints/epoch_NNN.pt` to continue a run and `--no-export` for
 training-only experiments.
 

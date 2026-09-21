@@ -361,7 +361,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights", required=True)
     parser.add_argument("--output", default="runs/yolo26n_accuracy")
-    parser.add_argument("--mode", choices=("fp32", "int8-pretrain", "both"), default="both")
+    parser.add_argument(
+        "--mode",
+        choices=("fp32", "int8-pretrain", "qat-trained", "both"),
+        default="both",
+    )
+    parser.add_argument(
+        "--qat-checkpoint",
+        help="Training checkpoint written by train.py; required for qat-trained mode",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--image-size", type=int, default=640)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -395,6 +403,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("confidence and nms-iou must be in [0, 1]")
     if args.max_detections < 1:
         raise ValueError("max-detections must be positive")
+    if args.mode == "qat-trained" and not args.qat_checkpoint:
+        raise ValueError("--qat-checkpoint is required for qat-trained mode")
 
 
 def run_variant(
@@ -508,6 +518,39 @@ def main() -> None:
             {
                 "calibration_images": len(calibration),
                 "calibration_seconds": calibration_seconds,
+                "qat_frozen": bool(prepared.qat_frozen.item()),
+            },
+        )
+
+    if args.mode == "qat-trained":
+        eager = build_yolo26n()
+        eager.load_state_dict(weights, strict=True)
+        eager.train()
+        prepared = sima_prepare_qat_model(
+            eager,
+            (torch.zeros(1, 3, args.image_size, args.image_size),),
+            device,
+            dynamic_batch=True,
+        )
+        del eager
+        checkpoint = torch.load(args.qat_checkpoint, map_location=device, weights_only=True)
+        if checkpoint.get("format") != "sima-yolo26n-qat-training-v1":
+            raise RuntimeError(f"Unsupported QAT checkpoint: {args.qat_checkpoint}")
+        prepared.load_state_dict(checkpoint["model"], strict=True)
+        checkpoint_was_frozen = bool(checkpoint.get("frozen", False))
+        if not bool(prepared.qat_frozen.item()):
+            sima_freeze_qat(prepared)
+        results["int8_qat"] = run_variant(
+            "int8_qat",
+            prepared,
+            validation,
+            args,
+            device,
+            output,
+            {
+                "checkpoint": str(Path(args.qat_checkpoint).resolve()),
+                "checkpoint_epoch": int(checkpoint["epoch"]),
+                "checkpoint_was_frozen": checkpoint_was_frozen,
                 "qat_frozen": bool(prepared.qat_frozen.item()),
             },
         )
