@@ -1,0 +1,220 @@
+name: QAT Build, Test, and Publish
+
+run-name: ${{ github.event.pull_request.title || github.event.head_commit.message || github.ref_name || 'QAT CI' }} (${{ vars.VULCAN_ENV || 'production' }})
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+  id-token: write
+  packages: read
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  resolve-vulcan-config:
+    name: Resolve Vulcan Config
+    if: ${{ github.event_name != 'pull_request' }}
+    uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@main
+    with:
+      vulcan_env: ${{ vars.VULCAN_ENV || 'production' }}
+
+  build-and-test-wheel:
+    name: Build and Test Wheel
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: true
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Build wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build dist sima_qat.egg-info
+          GIT_HASH="${GITHUB_SHA:0:7}" python -m build --wheel --outdir dist
+
+          mapfile -t wheels < <(find dist -maxdepth 1 -type f -name 'sima_qat-*.whl' | sort)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one sima-qat wheel; found ${#wheels[@]}." >&2
+            printf '  %s\n' "${wheels[@]}" >&2 || true
+            exit 1
+          fi
+
+          python -m twine check "${wheels[0]}"
+          python -m zipfile --test "${wheels[0]}"
+          printf '%s\n' "${wheels[0]}" > "${RUNNER_TEMP}/qat-wheel-path.txt"
+
+      - name: Test the installed wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel="$(cat "${RUNNER_TEMP}/qat-wheel-path.txt")"
+          wheel="$(realpath "${wheel}")"
+          test_root="${RUNNER_TEMP}/qat-wheel-tests"
+          test_venv="${RUNNER_TEMP}/qat-wheel-venv"
+
+          python -m venv "${test_venv}"
+          "${test_venv}/bin/python" -m pip install --upgrade pip
+          "${test_venv}/bin/python" -m pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.8.0 \
+            torchvision==0.23.0
+          "${test_venv}/bin/python" -m pip install "${wheel}" pytest pytest-timeout
+
+          rm -rf "${test_root}"
+          mkdir -p "${test_root}"
+          cp -a tests examples pytest.ini "${test_root}/"
+          cd "${test_root}"
+
+          "${test_venv}/bin/python" - <<'PY'
+          import os
+          from pathlib import Path
+
+          import sima_qat
+
+          checkout = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          installed = Path(sima_qat.__file__).resolve()
+          if installed.is_relative_to(checkout):
+              raise SystemExit(f"sima_qat imported from checkout instead of wheel: {installed}")
+          print(f"Testing installed package: {installed}")
+          PY
+
+          "${test_venv}/bin/python" -m pytest -q -m regression tests
+
+      - name: Install sima-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/install_sima_cli_main.sh
+          echo "${HOME}/.sima-cli/.venv/bin" >> "${GITHUB_PATH}"
+          "${HOME}/.sima-cli/.venv/bin/sima-cli" --version
+          "${HOME}/.sima-cli/.venv/bin/sima-cli" packages build --help >/dev/null
+
+      - name: Prepare Vulcan package metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel="$(cat "${RUNNER_TEMP}/qat-wheel-path.txt")"
+          wheel_name="$(basename "${wheel}")"
+          wheel_version="$(python - "${wheel}" <<'PY'
+          import email
+          import sys
+          import zipfile
+
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              metadata_name = next(
+                  name for name in archive.namelist()
+                  if name.endswith(".dist-info/METADATA")
+              )
+              metadata = email.message_from_bytes(archive.read(metadata_name))
+          print(metadata["Version"])
+          PY
+          )"
+
+          (
+            cd dist
+            sha256sum "${wheel_name}" > "${wheel_name}.sha256"
+          )
+          SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli packages build dist \
+            --name "gh:sima-neat/qat" \
+            --version "${wheel_version}" \
+            --description "SiMa.ai quantization-aware training wheel" \
+            --install-script ':' \
+            --download-compatible-files-only
+
+          python - \
+            dist/metadata.json \
+            "${wheel_name}" \
+            "${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}" \
+            "${GITHUB_SHA}" <<'PY'
+          import json
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          metadata_path = Path(sys.argv[1])
+          wheel_name, ref, commit = sys.argv[2:]
+          metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+          metadata.update(
+              {
+                  "artifact": {
+                      "type": "python-wheel",
+                      "repository": "qat",
+                      "package_path": ".",
+                      "wheel": wheel_name,
+                  },
+                  "repository": "sima-neat/qat",
+                  "branch": ref,
+                  "commit": commit,
+                  "commit_folder": commit[:12],
+                  "published_at_utc": datetime.now(timezone.utc).isoformat(),
+              }
+          )
+          metadata.setdefault("installation", {})["post-message"] = (
+              "[bold]sima-qat wheel downloaded successfully.[/bold]\n"
+              f"Install it with: python3 -m pip install ./{wheel_name}\n"
+          )
+          metadata_path.write_text(
+              json.dumps(metadata, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          python -m json.tool dist/metadata.json >/dev/null
+          test -s "dist/${wheel_name}.sha256"
+          find dist -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Upload tested Vulcan payload
+        uses: actions/upload-artifact@v6
+        with:
+          name: sima-qat-dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 3
+
+  publish-vulcan-artifacts:
+    name: Publish Tested Wheel to Vulcan
+    if: ${{ github.event_name != 'pull_request' }}
+    needs:
+      - resolve-vulcan-config
+      - build-and-test-wheel
+    uses: sima-neat/.github/.github/workflows/vulcan-publish-artifacts.yml@main
+    with:
+      aws_region: ${{ needs.resolve-vulcan-config.outputs.aws_region }}
+      environment_name: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
+      bucket: ${{ needs.resolve-vulcan-config.outputs.artifact_bucket }}
+      role_to_assume: ${{ needs.resolve-vulcan-config.outputs.artifact_publisher_role_arn }}
+      sse_kms_key_id: ${{ needs.resolve-vulcan-config.outputs.artifact_kms_key_id }}
+      cloudfront_distribution_id: ${{ needs.resolve-vulcan-config.outputs.artifact_cloudfront_distribution_id }}
+      artifact_folder: "."
+      artifact_pattern: sima-qat-dist
+      artifact_glob: "*"
+      min_artifact_count: 3
+      publish_manifest: true

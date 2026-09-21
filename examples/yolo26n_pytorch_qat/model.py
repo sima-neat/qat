@@ -1,9 +1,8 @@
 """Minimal, training-only YOLO26n definition built from ordinary PyTorch modules.
 
 The module layout intentionally matches the public YOLO26n checkpoint layout so
-that a converted state dictionary can be loaded strictly.  Inference decoding,
-top-k selection, and NMS are deliberately outside this graph; SiMa BoxDecode
-consumes the six raw one-to-one head tensors after export.
+that a converted state dictionary can be loaded strictly. Inference decoding,
+top-k selection, and NMS are deliberately outside this training graph.
 """
 
 from __future__ import annotations

@@ -14,7 +14,6 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 
 from coco import CocoDetectionDataset, collate_detection
-from export_heads import extract_raw_one2one_heads
 from loss import LossGains, YOLO26Loss
 from model import build_yolo26n
 from sima_qat import (
@@ -317,10 +316,7 @@ def main() -> None:
         output_names=output_names,
         device=torch.device("cpu"),
     )
-    raw_heads = output_directory / "yolo26n_qat_raw_heads.onnx"
-    extract_raw_one2one_heads(full_onnx, raw_heads)
     print(f"Exported full QDQ graph: {full_onnx}")
-    print(f"Exported BoxDecode raw heads: {raw_heads}")
 
 
 if __name__ == "__main__":

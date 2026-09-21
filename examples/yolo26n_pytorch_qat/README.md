@@ -75,11 +75,11 @@ The checked-in full-COCO result is:
 | Frozen fake-INT8 before QAT | 0.3588 | 0.5249 | 0.3861 |
 | INT8 minus FP32 | -0.0379 | -0.0335 | -0.0395 |
 
-The checked-in table above is the historical result from the legacy BoxDecode
-path with class-aware integer NMS. The evaluator now assumes the corrected
-BoxDecode will reproduce native YOLO26 NMS-free postprocessing: global location
-top-k followed by global location/class top-k. Pass `--legacy-nms` only to
-reproduce the old behavior. The native NMS-free decoder measured `0.4025`, close
+The checked-in table above is the historical result from the legacy
+class-aware integer NMS path. The evaluator now uses native YOLO26 NMS-free
+postprocessing: global location top-k followed by global location/class top-k.
+Pass `--legacy-nms` only to reproduce the old behavior. The native NMS-free
+decoder measured `0.4025`, close
 to Ultralytics' `0.401`
 [official rounded e2e result](https://github.com/ultralytics/ultralytics/blob/main/README.md#detection-coco).
 
@@ -119,7 +119,7 @@ The default data paths are:
 /project/ml_datasets/public_datasets/coco/coco_2017/annotations/instances_train2017.json
 ```
 
-The last three epochs in the example above train against locked, compiler-valid
+The last three epochs in the example above train against locked power-of-two
 quantization grids. The recovery recipe keeps the pretrained BatchNorm statistics
 fixed, uses the terminal YOLO26 head weighting (0.1 one-to-many and 0.9 one-to-one),
 and decays the learning rate from `1e-5` to `1e-6`. Weight decay applies only to
@@ -132,11 +132,9 @@ start without it when validating a new GPU environment.
 Each epoch writes a resumable QAT state-dict checkpoint under `checkpoints/`.
 After the final epoch the trainer writes:
 
-- `yolo26n_qat_training_outputs.onnx`: complete QDQ graph with both training heads.
-- `yolo26n_qat_raw_heads.onnx`: six one-to-one QDQ heads in grouped order
-  `bbox_0..2, class_logit_0..2`, ready for SiMa YOLO26 BoxDecode.
+- `yolo26n_qat_training_outputs.onnx`: complete QDQ graph with both model heads.
 
-Evaluate any saved QAT checkpoint with the same COCO/BoxDecode path used for
+Evaluate any saved QAT checkpoint with the same COCO postprocessing used for
 the FP32 baseline:
 
 ```bash
@@ -160,7 +158,7 @@ training-only experiments.
 
 `slurm_smoke.sbatch` requests one RTX 4000 from the `heavy` partition and runs
 four real COCO128 samples through two epochs. The second epoch locks QAT grids;
-the job then finalizes and verifies the raw-head ONNX artifact. Its checkpoint
+the job then finalizes and verifies the full ONNX artifact. Its checkpoint
 input is expected at `runs/slurm_gpu_smoke/yolo26n_pure.pt`. Submit it only after
 creating that portable checkpoint:
 
@@ -184,4 +182,4 @@ shipping a checkpoint, add or run:
 - A longer augmentation study; this initial fine-tuning loader intentionally
   implements only aspect-preserving letterbox resize and horizontal flip.
 - Multi-GPU DDP if one-GPU throughput is insufficient.
-- BoxDecode execution comparison against the PyTorch raw-head decoder.
+- ONNX Runtime comparison against the finalized PyTorch model.

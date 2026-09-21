@@ -235,6 +235,15 @@ class UnaryOperatorModel(nn.Module):
         return self.operation(inputs)
 
 
+class InstanceNormModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.operation = nn.InstanceNorm2d(3, track_running_stats=False)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.operation(inputs)
+
+
 class DirectBinaryModel(nn.Module):
     def __init__(self, operation: Callable[[Tensor, Tensor], Tensor]) -> None:
         super().__init__()
@@ -616,7 +625,7 @@ OPERATOR_CASES = (
     OperatorCase(
         "instance_norm",
         "sima_unary_int8",
-        lambda: UnaryOperatorModel(torch.nn.functional.instance_norm),
+        InstanceNormModel,
         IMAGE_INPUT,
         (torch.ops.aten.instance_norm.default,),
     ),
@@ -703,13 +712,6 @@ OPERATOR_CASES = (
         lambda: UnaryOperatorModel(lambda value: torch.pow(value, 2)),
         IMAGE_INPUT,
         (torch.ops.aten.pow.Tensor_Scalar,),
-    ),
-    OperatorCase(
-        "prelu",
-        "sima_prelu",
-        PReluModel,
-        IMAGE_INPUT,
-        (torch.ops.aten.prelu.default,),
     ),
     OperatorCase(
         "reduce_mean",

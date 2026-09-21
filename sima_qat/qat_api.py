@@ -392,7 +392,7 @@ def _safe_power_of_two_weight_scale(
     computed by a PT2E QAT pattern such as Conv-BatchNorm folding.
 
     Scales are rounded one float32 ULP toward zero when necessary. This keeps
-    the normalized multiplier on the safe side of AFE's power-of-two boundary,
+    the normalized multiplier on the safe side of its power-of-two boundary,
     preventing a value infinitesimally above the boundary from selecting the
     next shift and a 0.5 correction factor.
     """
@@ -425,7 +425,7 @@ def _safe_power_of_two_weight_scale(
         )
         scales = ((sy / sx) * target_ratio).to(torch.float32)
 
-        # Work with the exact float32 values AFE will ingest. Always start one
+        # Work with the exact float32 values persisted in the QDQ graph. Start one
         # ULP below the exact boundary so alternate float32 multiplication
         # order cannot move the imported ratio to the unsafe side.
         zero = torch.zeros_like(scales)
@@ -516,10 +516,10 @@ def _stage_coarser_activation_grid(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Stage a power-of-two coarser activation grid without mutation.
 
-    AFE requantization supports only non-negative right shifts. When a weight
-    needs a shift smaller than zero, coarsening the weighted operation's output
-    grid by a power of two makes the contract realizable. Work on an observer
-    copy so a later failure leaves the prepared model completely unchanged.
+    Shift-aware QAT uses non-negative right shifts. When a weight needs a shift
+    smaller than zero, coarsening the weighted operation's output grid by a
+    power of two makes the contract realizable. Work on an observer copy so a
+    later failure leaves the prepared model completely unchanged.
     """
     if multiplier < 2 or multiplier & (multiplier - 1):
         raise ValueError(
@@ -895,25 +895,30 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
     return qat_model
 
 
-def _ensure_bn_tracking_meta(gm: GraphModule) -> None:
-    """torch >= 2.8 `convert_pt2e` QAT bn-folding reads `node.meta["source_fn_stack"]`
-    on the BatchNorm `num_batches_tracked += 1` in-place add nodes, but graphs produced
-    by `export_for_training` don't always populate it -> KeyError. Those nodes have the
-    shape `aten.add_.Tensor(get_attr, 1)`; tag them so torch's loop erases them (its
-    intent for BN tracking nodes)."""
+def _remove_batchnorm_tracking_updates(gm: GraphModule) -> None:
+    """Remove dead BatchNorm batch-counter updates before PT2E conversion.
+
+    Frozen BatchNorm statistics no longer consume ``num_batches_tracked``.
+    Removing its dead in-place increment here also prevents PT2E's Conv-BN
+    folding passes from attempting to erase the same node more than once.
+    """
     if not hasattr(gm, "graph"):
         return
-    bn_tag = [("bn_num_batches_tracked", torch.nn.modules.batchnorm.BatchNorm2d)]
-    for node in gm.graph.nodes:
+    for node in list(gm.graph.nodes):
         if (
             node.op == "call_function"
             and node.target == torch.ops.aten.add_.Tensor
             and len(node.args) >= 2
             and getattr(node.args[0], "op", None) == "get_attr"
+            and str(getattr(node.args[0], "target", "")).endswith(
+                "num_batches_tracked"
+            )
             and node.args[1] == 1
-            and "source_fn_stack" not in node.meta
+            and not node.users
         ):
-            node.meta["source_fn_stack"] = bn_tag
+            gm.graph.erase_node(node)
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
 
 
 def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
@@ -933,6 +938,8 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
     
     if not isinstance(qat_model, GraphModule):
         return qat_model
+    if qat_model.meta.get("qat_state") == "fq":
+        return qat_model
     if not bool(getattr(qat_model, "qat_frozen", torch.tensor([0])).item()):
         warnings.warn(
             "Finalizing a shift-aware model before sima_freeze_qat(); scales will be locked now. "
@@ -941,8 +948,17 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
         )
         sima_freeze_qat(qat_model)
     print(f"Removing QAT scaffold and quantizing network ...")
-    _ensure_bn_tracking_meta(qat_model)
-    m = convert_pt2e(qat_model, use_reference_representation=False)
+    _remove_batchnorm_tracking_updates(qat_model)
+    with warnings.catch_warnings():
+        # Torch 2.8 can report a second erase for an overlapping Conv-BN
+        # pattern after the node was already removed successfully. Output and
+        # graph validation below cover the resulting folded graph.
+        warnings.filterwarnings(
+            "ignore",
+            message=r"erase_node\(batch_norm_\d+\) on an already erased node",
+            category=UserWarning,
+        )
+        m = convert_pt2e(qat_model, use_reference_representation=False)
     sima_mod = SimaQatWrapper(source=m, label='fq')
     # We must call eval() to invoke internal functions to put the GraphModule in eval state. Once we are
     # in FQ mode, we always remain in eval mode.
@@ -966,16 +982,29 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
     if not isinstance(qat_model, nn.Module):
         raise RuntimeError(f"Input graph to export function must be of type nn.Module, found {type(qat_model)}")
     qat_model = check_graph_nodes(qat_model, device='cpu')
-    torch.onnx.export(
-        qat_model,
-        inputs,
-        output_file,
-        export_params=True,
-        opset_version=17,
-        do_constant_folding=True,
-        input_names = input_names,
-        output_names = output_names,
-    )
+    with warnings.catch_warnings():
+        # ONNX InstanceNormalization always uses input statistics, matching
+        # PyTorch InstanceNorm with track_running_stats=False. The legacy
+        # exporter labels that valid behavior as train=True and warns solely
+        # because the surrounding export is in evaluation mode.
+        warnings.filterwarnings(
+            "ignore",
+            message=(
+                r"ONNX export mode is set to TrainingMode\.EVAL, but operator "
+                r"'instance_norm' is set to train=True\..*"
+            ),
+            category=UserWarning,
+        )
+        torch.onnx.export(
+            qat_model,
+            inputs,
+            output_file,
+            export_params=True,
+            opset_version=17,
+            do_constant_folding=True,
+            input_names=input_names,
+            output_names=output_names,
+        )
     qat_model = check_graph_nodes(qat_model, device=device)
     return qat_model
 

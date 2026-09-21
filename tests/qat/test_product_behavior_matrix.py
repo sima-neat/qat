@@ -552,12 +552,19 @@ def test_cpu_wrapper_buffers_follow_graph_device() -> None:
     assert finalized.qat_frozen.device.type == "cpu"
 
 
-def test_corrupted_observers_preserve_prepared_finalized_and_onnx_qparams(tmp_path) -> None:
+def test_frozen_checkpoint_preserves_finalized_and_onnx_qparams(tmp_path) -> None:
     inputs = torch.randn(1, 3, 4, 4)
     model = sima_prepare_qat_model(Conv2dModel(), (inputs,), "cpu")
     model(inputs)
     sima_freeze_qat(model)
-    fake_quantizers = [module for module in model.modules() if isinstance(module, FakeQuantizeBase)]
+    state = model.state_dict()
+    resumed = sima_prepare_qat_model(Conv2dModel(), (inputs,), "cpu")
+    resumed.load_state_dict(state)
+    assert bool(resumed.qat_frozen.item())
+
+    fake_quantizers = [
+        module for module in resumed.modules() if isinstance(module, FakeQuantizeBase)
+    ]
     frozen = Counter(
         _qparam_key(
             module.scale.detach().cpu().numpy(),
@@ -572,8 +579,8 @@ def test_corrupted_observers_preserve_prepared_finalized_and_onnx_qparams(tmp_pa
         torch.testing.assert_close(scale, module.scale, rtol=0, atol=0)
         torch.testing.assert_close(zero_point, module.zero_point, rtol=0, atol=0)
     with torch.no_grad():
-        prepared_output = model(inputs).clone()
-    finalized = sima_finalize_qat_model(model)
+        prepared_output = resumed(inputs).clone()
+    finalized = sima_finalize_qat_model(resumed)
     with torch.no_grad():
         finalized_output = finalized(inputs)
     torch.testing.assert_close(finalized_output, prepared_output, rtol=0, atol=0)

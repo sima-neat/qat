@@ -319,7 +319,6 @@ class SimaQuantizer(Quantizer):
         "sima_binary_int8",
         "sima_einsum",
         "sima_pow",
-        "sima_prelu",
         "sima_reduction",
         "sima_global_max_pool2d",
         "sima_mixed_output",
@@ -473,39 +472,9 @@ class SimaQuantizer(Quantizer):
         return model
 
     def validate(self, model: torch.fx.GraphModule) -> None:
-        unsupported_w8a8 = {
-            torch.ops.aten.conv_transpose2d.input: (
-                "ConvTranspose2d needs an output-channel weight qspec; the current "
-                "per-channel axis-0 QAT contract is not correct for ONNX ConvTranspose"
-            ),
-            torch.ops.aten.embedding.default: (
-                "Embedding/Gather is not supported by the compiler's INT8 contract"
-            ),
-            torch.ops.aten.grid_sampler_2d.default: (
-                "GridSample is not supported by the compiler's INT8 contract"
-            ),
-            torch.ops.aten.grid_sampler.default: (
-                "GridSample is not supported by the compiler's INT8 contract"
-            ),
-            torch.ops.aten.amin.default: (
-                "ReduceMin is not supported by the compiler's INT8 contract"
-            ),
-            torch.ops.aten.cumsum.default: (
-                "CumSum is not supported by the compiler's INT8 contract"
-            ),
-        }
-        for node in model.graph.nodes:
-            if node.op != "call_function":
-                continue
-            if node.target in unsupported_w8a8:
-                raise ValueError(f"SiMa INT8 QAT: {unsupported_w8a8[node.target]}")
-            if node.target == torch.ops.aten.gelu.default:
-                approximate = _node_argument(node, 1, "approximate", "none")
-                if approximate != "none":
-                    raise ValueError(
-                        "SiMa INT8 QAT supports only exact GELU "
-                        "(approximate='none'); tanh GELU is not an AFE-supported contract"
-                    )
+        # Operations without a registered annotation remain floating-point.
+        # Deployment compatibility is intentionally outside QAT validation.
+        return None
 
     @classmethod
     def get_supported_operators(cls) -> List[OperatorConfig]:
@@ -563,7 +532,7 @@ def _sima_annotate_unary_int8(
     quantization_config: QuantizationConfig,
     filter_fn: Optional[Callable[[Node], bool]] = None,
 ) -> List[List[Node]]:
-    """Annotate compiler-supported unary activation and normalization kernels."""
+    """Annotate unary activation and normalization kernels covered by QAT."""
     return _annotate_single_aten_op(
         gm,
         quantization_config,
@@ -642,35 +611,6 @@ def _sima_annotate_pow(
     return _annotate_single_aten_op(
         gm, quantization_config, (torch.ops.aten.pow.Tensor_Scalar,), filter_fn
     )
-
-
-@register_annotator("sima_prelu")
-def _sima_annotate_prelu(
-    gm: torch.fx.GraphModule,
-    quantization_config: QuantizationConfig,
-    filter_fn: Optional[Callable[[Node], bool]] = None,
-) -> List[List[Node]]:
-    annotated = []
-    for node in gm.graph.nodes:
-        if node.op != "call_function" or node.target != torch.ops.aten.prelu.default:
-            continue
-        if _is_annotated([node]) or (filter_fn and not filter_fn(node)):
-            continue
-        activation, slope = node.args[:2]
-        if not isinstance(activation, Node) or not isinstance(slope, Node):
-            continue
-        node.meta["quantization_annotation"] = QuantizationAnnotation(
-            input_qspec_map={
-                activation: get_input_act_qspec(quantization_config),
-                # PReLU alpha is a 1D compiler operand rather than a Conv/Linear
-                # weight tensor. Per-channel weight observers require rank >= 2.
-                slope: get_input_act_qspec(quantization_config),
-            },
-            output_qspec=get_output_act_qspec(quantization_config),
-            _annotated=True,
-        )
-        annotated.append([node])
-    return annotated
 
 
 @register_annotator("sima_reduction")
@@ -944,8 +884,6 @@ def _sima_annotate_softmax(
     quantization_config: QuantizationConfig,
     filter_fn: Optional[Callable[[Node], bool]] = None,
 ) -> List[List[Node]]:
-    # AFE automatic layout conversion maps the selected logical axis to the
-    # MLA channel dimension, so QAT should not reject a source-level axis.
     return _annotate_single_aten_op(
         gm,
         quantization_config,
@@ -960,8 +898,7 @@ def _sima_annotate_layer_norm(
     quantization_config: QuantizationConfig,
     filter_fn: Optional[Callable[[Node], bool]] = None,
 ) -> List[List[Node]]:
-    # Scale and bias remain floating constants. AFE quantizes/folds them when
-    # the supported LayerNorm composite is selected.
+    # Scale and bias remain floating constants while activations carry QAT grids.
     return _annotate_single_aten_op(
         gm,
         quantization_config,
@@ -1560,9 +1497,8 @@ def _sima_annotate_cat(
                 else input_act_qspec
             )
 
-        # Repeated-input and identity-prefix concatenations are integer layout
-        # operations. Sharing the payload grid avoids a gratuitous requantize
-        # and matches AFE's concat grid contract.
+        # Repeated-input and identity-prefix concatenations share the payload
+        # grid to avoid an unnecessary quantization boundary.
         if identity_padding_reference is not None:
             output_act_qspec = SharedQuantizationSpec(identity_padding_reference)
         elif repeated_input_concat:

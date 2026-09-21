@@ -1,5 +1,7 @@
 """Representative ONNX QDQ and ONNX Runtime parity tests by operator family."""
 
+import warnings
+
 import numpy as np
 import onnx
 import onnxruntime
@@ -32,7 +34,13 @@ def test_operator_family_exports_standard_qdq_and_matches_onnxruntime(case, tmp_
     finalized = sima_finalize_qat_model(prepared)
 
     output_path = tmp_path / f"{case.name}.onnx"
-    sima_export_onnx(finalized, inputs, str(output_path), device="cpu")
+    if case.name == "instance_norm":
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            sima_export_onnx(finalized, inputs, str(output_path), device="cpu")
+        assert not any("instance_norm' is set to train=True" in str(item.message) for item in caught)
+    else:
+        sima_export_onnx(finalized, inputs, str(output_path), device="cpu")
 
     exported = onnx.load(output_path)
     onnx.checker.check_model(exported)

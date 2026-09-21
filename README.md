@@ -54,7 +54,7 @@ qat_model = sima_prepare_qat_model(model, example_inputs, device='cuda')
 
 # 2. Warm up observers with your normal training loop ...
 
-# 3. Lock AFE-compatible power-of-two scales, then fine-tune for a few more epochs.
+# 3. Lock shift-aware power-of-two scales, then fine-tune for a few more epochs.
 sima_freeze_qat(qat_model)
 # ... continue training qat_model ...
 
@@ -65,36 +65,31 @@ qat_model = sima_finalize_qat_model(qat_model)
 sima_export_onnx(qat_model, example_inputs, 'model.onnx', device='cuda')
 ```
 
-Shift-aware QAT constrains each convolution or linear weight scale so that AFE can use its native
-integer shift requantization without rescaling the learned INT8 weight codes. Calling
-`sima_freeze_qat` explicitly leaves time to fine-tune against those locked scales. Finalization will
-lock them automatically if necessary, but fine-tuning after the explicit call generally gives better
-accuracy.
+Shift-aware QAT constrains each convolution or linear weight scale to a power-of-two relationship
+with its input and output activation grids. Calling `sima_freeze_qat` explicitly leaves time to
+fine-tune against those locked scales. Finalization locks them automatically if necessary, but
+fine-tuning after the explicit call generally gives better accuracy.
 
 ## Operator contract
 
-The QAT operator set follows the forms that awesome-frontend can canonicalize and place on MLA.
-Automatic layout conversion may remap a logical Softmax or LayerNorm axis to channel, and converts
-supported batched MatMul forms to MLA BatchMatmul/Einsum forms. `any_shape_on_mla` permits supported
-operators to retain non-4D ranks; it does not remove operator-specific or precision restrictions.
+The operator manifest describes which captured PyTorch forms receive QAT annotations, which reuse an
+existing quantization grid, and which remain ordinary floating-point operations. It is a contract for
+training and standard opset-17 QDQ export, not for a particular execution backend.
 
 | family | QAT contract |
 |---|---|
 | Conv1d, Conv2d, Linear | signed W8A8 with shift-aware per-channel weight locking |
-| MatMul, MM, BMM, BAddBMM | activation W8A8; deployment still requires AFE to canonicalize the concrete shape/equation |
-| Softmax | W8A8; automatic layout conversion must map its logical axis to MLA channel |
-| LayerNorm | W8A8 boundary; AFE-supported rank, axis, batch and channel limits still apply |
-| Erf and GELU | Erf and exact (`approximate="none"`) GELU only; tanh GELU is rejected |
+| MatMul, MM, BMM, BAddBMM | signed activation QDQ on floating tensor operands |
+| Softmax, LayerNorm | signed activation QDQ with the original logical axes preserved |
+| InstanceNorm | input-statistics behavior (`track_running_stats=False`) with finalized PyTorch/ONNX Runtime parity |
+| Erf and GELU | Erf and exact (`approximate="none"`) GELU are annotated; tanh GELU passes through unannotated |
 | Concat | W8A8; repeated-input and identity-prefix layouts share the payload grid |
+| ArgMax, TopK | values may participate in QAT; integer index outputs are never fake-quantized |
+| PReLU, ConvTranspose, Embedding, GridSample, ReduceMin, CumSum | trainable pass-through forms with no QAT annotation |
 
-GridSample is deliberately not annotated as INT8 because awesome-frontend supports it only in BF16.
-Dynamic Embedding/Gather is also excluded because it currently has no general MLA runtime-index
-lowering. These require an explicit mixed-precision/offload policy outside this strict INT8 QAT API.
-
-ConvTranspose2d is deferred even though MLA has an INT8 kernel. PyTorch 2.8 rewrites its required
-output-channel weight axis from 1 to 0 during PT2E conversion, while the per-tensor fallback produces
-a scalar weight QDQ scale that current awesome-frontend constant surgery cannot import. It must not
-be advertised until one of those downstream contracts is fixed and covered end to end.
+Pass-through forms are not errors: preparation, training, and export continue normally around them.
+They are listed explicitly so the package does not imply that fake quantization was applied where no
+annotator exists.
 
 Preparation preserves the exact example shapes by default. Models that are
 truly batch-polymorphic can opt in with
@@ -111,7 +106,7 @@ left unchanged on both successful and failed capture.
 | function | purpose |
 |---|---|
 | `sima_prepare_qat_model(model, inputs, device, *, dynamic_batch=False)` | Capture the model and insert SiMa shift-aware fake-quant annotations. Dynamic training batch is explicit opt-in. |
-| `sima_freeze_qat(qat_model)` | Freeze observers and lock AFE-compatible weight scales before final fine-tuning. |
+| `sima_freeze_qat(qat_model)` | Freeze observers and lock shift-aware weight scales before final fine-tuning. |
 | `sima_finalize_qat_model(qat_model)` | Fold the trained scaffolding into an inference-only quantized graph. |
 | `sima_export_onnx(qat_model, inputs, output_file, ...)` | Export the finalized model to an ONNX QuantizeLinear/DequantizeLinear graph. |
 
@@ -149,7 +144,7 @@ Pass `--disable-qat` to either `train.py` to train a plain float baseline instea
 
 **YOLO26n** — [examples/yolo26n_pytorch_qat](examples/yolo26n_pytorch_qat) is a
 plain-PyTorch COCO QAT workflow. It reads COCO JSON directly, reproduces the
-YOLO26 dual-head objective, and exports six QDQ raw heads for native BoxDecode.
+YOLO26 dual-head objective, and exports the finalized QDQ model outputs.
 Ultralytics is used only by an isolated, one-time checkpoint converter; the
 model, data path, loss, optimizer, and training process have no Ultralytics
 runtime dependency. See the example README for COCO128 smoke and full COCO 2017
@@ -176,6 +171,15 @@ pytest -m nightly tests/end_to_end
 ```
 
 Generated ONNX models are written to `exported_models/` (gitignored).
+
+## CI/CD
+
+`.github/workflows/vulcan-ci.yml` builds the wheel on a public Ubuntu runner,
+installs it into a fresh CPU environment, and runs the regression suite from
+outside the checkout. Pull requests stop after validation. Branch and tag
+pushes publish that same tested wheel, its checksum, and package metadata to
+Vulcan. The `VULCAN_ENV` repository variable selects the destination and
+defaults to `production`, matching the core package workflow.
 
 ## Layout
 

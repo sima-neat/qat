@@ -1,6 +1,7 @@
 """Public API contract for the single shift-aware QAT implementation."""
 
 import inspect
+import warnings
 
 import onnx
 import pytest
@@ -12,6 +13,7 @@ import sima_qat
 from sima_qat import (
     sima_export_onnx,
     sima_finalize_qat_model,
+    sima_freeze_batchnorm_stats,
     sima_freeze_qat,
     sima_prepare_qat_model,
 )
@@ -87,6 +89,47 @@ def test_finalize_retains_auto_freeze_compatibility() -> None:
 
     assert bool(finalized.qat_frozen.item())
     assert torch.isfinite(finalized(inputs)).all()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda value: sima_prepare_qat_model(value, (), "cpu"),
+        sima_freeze_batchnorm_stats,
+        sima_freeze_qat,
+        sima_finalize_qat_model,
+        lambda value: sima_export_onnx(value, (), "unused.onnx", device="cpu"),
+    ],
+    ids=("prepare", "freeze_batchnorm", "freeze", "finalize", "export"),
+)
+def test_public_transform_apis_reject_non_modules(operation) -> None:
+    with pytest.raises(RuntimeError):
+        operation(object())
+
+
+def test_repeated_lifecycle_calls_are_idempotent() -> None:
+    inputs = torch.randn(2, 3, 8, 8)
+    prepared = sima_prepare_qat_model(Conv2dModel(), (inputs,), "cpu")
+    assert sima_prepare_qat_model(prepared, (inputs,), "cpu") is prepared
+    assert sima_freeze_batchnorm_stats(prepared) is prepared
+    assert sima_freeze_batchnorm_stats(prepared) is prepared
+    prepared(inputs)
+    assert sima_freeze_qat(prepared) is prepared
+    frozen_state = {
+        name: value.detach().clone() for name, value in prepared.state_dict().items()
+    }
+    assert sima_freeze_qat(prepared) is prepared
+    for name, expected in frozen_state.items():
+        torch.testing.assert_close(prepared.state_dict()[name], expected, rtol=0, atol=0)
+
+    finalized = sima_finalize_qat_model(prepared)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        repeated = sima_finalize_qat_model(finalized)
+
+    assert repeated is finalized
+    assert not caught
+    torch.testing.assert_close(repeated(inputs), finalized(inputs), rtol=0, atol=0)
 
 
 def test_prepare_accepts_dynamic_training_batch() -> None:

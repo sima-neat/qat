@@ -67,6 +67,7 @@ setuptools.setup(
     author_email='support@sima.ai',
     description='SiMa.ai QAT implementation',
     long_description=long_description,
+    long_description_content_type='text/markdown',
     url='https://sima.ai',
     packages=setuptools.find_packages(exclude=('tests', 'tests.*')),
     package_data={'sima_qat': ['VERSION']},

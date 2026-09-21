@@ -14,8 +14,8 @@ set -euo pipefail
 
 EXAMPLE_DIR="${SLURM_SUBMIT_DIR:?Submit this job from the example directory}"
 WORKDIR="${QAT_REPO_ROOT:-$(cd "$EXAMPLE_DIR/../.." && pwd)}"
-PYTHON_ENV="${QAT_PYTHON_ENV:-$WORKDIR/../afe_env}"
-PYTHON_BIN="${QAT_PYTHON_BIN:-$WORKDIR/../../../python312/bin/python3.12}"
+PYTHON_ENV="${QAT_PYTHON_ENV:-$WORKDIR/.venv}"
+PYTHON_BIN="${QAT_PYTHON_BIN:-$PYTHON_ENV/bin/python}"
 EVAL_DEPS="${QAT_EVAL_DEPS:-$WORKDIR/runs/coco_eval_deps}"
 SLURM_HOME="${SLURM_HOME:-/project/sima/tools/opensource/slurm/24.11.3g}"
 RUN_DIR="${QAT_FULL_RUN_DIR:-$WORKDIR/runs/yolo26n_coco_qat_4e_recovery}"
@@ -67,6 +67,6 @@ for epoch in 000 001 002 003; do
     --log-interval 50
 done
 
-test -s "$RUN_DIR/train/yolo26n_qat_raw_heads.onnx"
+test -s "$RUN_DIR/train/yolo26n_qat_training_outputs.onnx"
 test -s "$RUN_DIR/eval_epoch_003/comparison.json"
 echo "FULL_QAT_OK $RUN_DIR"

@@ -7,7 +7,6 @@ import re
 import pytest
 
 from sima_qat.operator_manifest import (
-    COMPILER_INT8_ONNX_OPS_OPSET17,
     MANIFEST_BY_FAMILY,
     ONNX_OPSET,
     ONNX_TEST_CASE_IDS,
@@ -24,28 +23,10 @@ from .cases import ALL_OPERATOR_CASES
 pytestmark = pytest.mark.regression
 
 
-EXPECTED_COMPILER_INT8_OPS_OPSET17 = {
-    "Abs", "Add", "ArgMax", "AveragePool", "Clip", "Concat", "Conv",
-    "ConvTranspose", "DepthToSpace", "Div", "Einsum", "Elu", "Erf", "Exp",
-    "Expand", "Gemm", "GlobalAveragePool", "GlobalMaxPool", "HardSigmoid",
-    "HardSwish", "InstanceNormalization", "LRN", "LayerNormalization",
-    "LeakyRelu", "Log", "LogSoftmax", "MatMul", "MaxPool", "Mean",
-    "MeanVarianceNormalization", "Mul", "Neg", "PRelu", "Pad", "Pow",
-    "Reciprocal", "ReduceL1", "ReduceLogSum", "ReduceLogSumExp", "ReduceMax",
-    "ReduceMean", "ReduceSum", "ReduceSumSquare", "Relu", "Reshape", "Resize",
-    "Sigmoid", "Slice", "Softmax", "Softplus", "SpaceToDepth", "Split", "Sqrt",
-    "Sub", "Sum", "Tanh", "Tile", "TopK", "Transpose",
-}
-
-
 def test_manifest_is_versioned_and_has_unique_families() -> None:
     assert re.fullmatch(r"\d+\.\d+\.\d+", OPERATOR_MANIFEST_VERSION)
     assert ONNX_OPSET == 17
     assert len(MANIFEST_BY_FAMILY) == len(OPERATOR_MANIFEST)
-
-
-def test_manifest_matches_pr111_opset17_int8_snapshot() -> None:
-    assert COMPILER_INT8_ONNX_OPS_OPSET17 == EXPECTED_COMPILER_INT8_OPS_OPSET17
 
 
 def test_every_operator_case_is_owned_by_a_manifest_entry() -> None:
@@ -88,9 +69,10 @@ def test_supported_entries_have_executable_positive_cases() -> None:
             assert entry.annotator, entry.family
 
 
-def test_rejected_entries_do_not_claim_positive_lifecycle_coverage() -> None:
+def test_passthrough_entries_do_not_claim_annotation_coverage() -> None:
     for entry in OPERATOR_MANIFEST:
-        if entry.status is SupportStatus.REJECTED:
-            assert entry.behavior is QuantizationBehavior.UNSUPPORTED
+        if entry.behavior is QuantizationBehavior.PASSTHROUGH:
+            assert entry.status is SupportStatus.DEFERRED
+            assert entry.annotator is None
             assert not entry.positive_test_requirements
             assert not entry.test_case_ids

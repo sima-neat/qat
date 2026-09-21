@@ -1,4 +1,4 @@
-"""Target-specific correctness and rejection contracts for added operators."""
+"""Target-specific correctness and pass-through contracts for added operators."""
 
 from __future__ import annotations
 
@@ -153,15 +153,6 @@ def test_identity_padding_concat_reuses_the_payload_grid(identity: float) -> Non
     assert _qdq_qparams(output_quantizer) == _qdq_qparams(input_dequantizers[1])
 
 
-def test_tanh_gelu_is_rejected_instead_of_silently_claiming_int8_support() -> None:
-    with pytest.raises(ValueError, match="exact GELU"):
-        sima_prepare_qat_model(
-            ApproximateGelu(),
-            (torch.randn(1, 4, 8),),
-            "cpu",
-        )
-
-
 def test_attention_core_finalizes_and_exports_all_inputs(tmp_path) -> None:
     inputs = (
         torch.randn(1, 4, 8),
@@ -229,20 +220,55 @@ def test_integer_matmul_operands_are_not_qat_annotated() -> None:
 
 
 @pytest.mark.parametrize(
-    ("model", "inputs", "message"),
+    ("model", "inputs"),
     [
-        (ConvTransposeModel(), (torch.randn(1, 3, 8, 8),), "ConvTranspose2d"),
-        (EmbeddingModel(), (torch.randint(0, 16, (2, 5)),), "Embedding/Gather"),
+        (ApproximateGelu(), (torch.randn(1, 4, 8),)),
+        (ConvTransposeModel(), (torch.randn(1, 3, 8, 8),)),
+        (EmbeddingModel(), (torch.randint(0, 16, (2, 5)),)),
         (
             GridSampleModel(),
             (torch.randn(1, 3, 8, 8), torch.randn(1, 4, 4, 2)),
-            "GridSample",
         ),
-        (ReduceMinModel(), (torch.randn(1, 3, 8, 8),), "ReduceMin"),
-        (CumSumModel(), (torch.randn(1, 3, 8, 8),), "CumSum"),
+        (ReduceMinModel(), (torch.randn(1, 3, 8, 8),)),
+        (CumSumModel(), (torch.randn(1, 3, 8, 8),)),
     ],
-    ids=("conv_transpose", "embedding", "grid_sample", "reduce_min", "cumsum"),
+    ids=(
+        "tanh_gelu",
+        "conv_transpose",
+        "embedding",
+        "grid_sample",
+        "reduce_min",
+        "cumsum",
+    ),
 )
-def test_outside_w8a8_contract_is_rejected(model, inputs, message: str) -> None:
-    with pytest.raises(ValueError, match=message):
-        sima_prepare_qat_model(model, inputs, "cpu")
+def test_deferred_operators_remain_trainable_and_unannotated(model, inputs) -> None:
+    inputs = tuple(
+        value.detach().requires_grad_(True) if value.is_floating_point() else value
+        for value in inputs
+    )
+    prepared = sima_prepare_qat_model(model, inputs, "cpu")
+
+    assert not any(
+        getattr(node.meta.get("quantization_annotation"), "_annotated", False)
+        for node in prepared.graph.nodes
+    )
+    assert not any(isinstance(module, FakeQuantizeBase) for module in prepared.modules())
+
+    output = prepared(*inputs)
+    output.sum().backward()
+
+
+def test_prelu_remains_trainable_and_unannotated() -> None:
+    from .cases import IMAGE_INPUT, PReluModel
+
+    model = PReluModel()
+    inputs = IMAGE_INPUT()
+    prepared = sima_prepare_qat_model(model, inputs, "cpu")
+
+    assert not any(
+        getattr(node.meta.get("quantization_annotation"), "_annotated", False)
+        for node in prepared.graph.nodes
+    )
+    assert not any(isinstance(module, FakeQuantizeBase) for module in prepared.modules())
+
+    prepared(*inputs).sum().backward()
