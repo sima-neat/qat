@@ -345,13 +345,20 @@ def collect_predictions(
     started = time.monotonic()
     for step, (images, metadata) in enumerate(loader):
         outputs = model(images.to(device, non_blocking=True))
-        decoded = decode_boxdecode(
-            outputs,
-            confidence=confidence,
-            max_detections=max_detections,
-            nms_iou=nms_iou,
-            legacy_nms=legacy_nms,
-        )
+        if legacy_nms:
+            decoded = decode_boxdecode(
+                outputs,
+                confidence=confidence,
+                max_detections=max_detections,
+                nms_iou=nms_iou,
+                legacy_nms=True,
+            )
+        else:
+            decoded = decode_end2end(
+                outputs,
+                confidence=confidence,
+                max_detections=max_detections,
+            )
         results.extend(detections_to_coco(decoded, metadata, dataset.category_ids))
         if step % log_interval == 0 or step + 1 == len(loader):
             image_count = min((step + 1) * batch_size, len(dataset))
@@ -597,7 +604,7 @@ def main() -> None:
         "image_size": args.image_size,
         "confidence": args.confidence,
         "nms_iou": args.nms_iou,
-        "postprocess": "legacy_nms" if args.legacy_nms else "nms_free",
+        "postprocess": "legacy_nms" if args.legacy_nms else "native_nms_free",
         "max_detections": args.max_detections,
         "results": results,
     }

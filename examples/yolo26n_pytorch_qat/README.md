@@ -76,11 +76,11 @@ The checked-in full-COCO result is:
 | INT8 minus FP32 | -0.0379 | -0.0335 | -0.0395 |
 
 The checked-in table above is the historical result from the legacy BoxDecode
-path with class-aware integer NMS. The evaluator now defaults to the corrected
-NMS-free deployment contract: one-to-one raw heads, one class per cell,
-per-head pre-decode top-k, and final top-k. Pass `--legacy-nms` only to reproduce
-the old behavior. For comparison, the standalone native NMS-free decoder
-measured `0.4025`, close to Ultralytics' `0.401`
+path with class-aware integer NMS. The evaluator now assumes the corrected
+BoxDecode will reproduce native YOLO26 NMS-free postprocessing: global location
+top-k followed by global location/class top-k. Pass `--legacy-nms` only to
+reproduce the old behavior. The native NMS-free decoder measured `0.4025`, close
+to Ultralytics' `0.401`
 [official rounded e2e result](https://github.com/ultralytics/ultralytics/blob/main/README.md#detection-coco).
 
 See `results/coco_val2017_640_fp32_vs_int8_pretrain.json` for the complete
