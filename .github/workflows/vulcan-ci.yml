@@ -178,8 +178,10 @@ jobs:
               }
           )
           metadata.setdefault("installation", {})["post-message"] = (
-              "[bold]sima-qat wheel downloaded successfully.[/bold]\n"
-              f"Install it with: python3 -m pip install ./{wheel_name}\n"
+              "[bold]sima-qat was downloaded but was not installed.[/bold]\n\n"
+              "Activate your PyTorch training environment, change to the "
+              "download directory, then run:\n\n"
+              f"  python -m pip install {wheel_name}\n"
           )
           metadata_path.write_text(
               json.dumps(metadata, indent=2) + "\n",
