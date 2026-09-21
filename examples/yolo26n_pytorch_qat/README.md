@@ -75,9 +75,11 @@ The checked-in full-COCO result is:
 | Frozen fake-INT8 before QAT | 0.3588 | 0.5249 | 0.3861 |
 | INT8 minus FP32 | -0.0379 | -0.0335 | -0.0395 |
 
-The evaluator mirrors the current INT8 BoxDecode-v2 path: one-to-one raw heads,
-one class per cell, pre-decode top-k, integer-coordinate class-aware NMS at IoU
-0.7, and final top-k. For comparison, the standalone native NMS-free decoder
+The checked-in table above is the historical result from the legacy BoxDecode
+path with class-aware integer NMS. The evaluator now defaults to the corrected
+NMS-free deployment contract: one-to-one raw heads, one class per cell,
+per-head pre-decode top-k, and final top-k. Pass `--legacy-nms` only to reproduce
+the old behavior. For comparison, the standalone native NMS-free decoder
 measured `0.4025`, close to Ultralytics' `0.401`
 [official rounded e2e result](https://github.com/ultralytics/ultralytics/blob/main/README.md#detection-coco).
 

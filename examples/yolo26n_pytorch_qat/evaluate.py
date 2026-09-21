@@ -192,33 +192,63 @@ def decode_boxdecode(
     max_detections: int = 300,
     confidence: float = 0.001,
     nms_iou: float = 0.7,
+    legacy_nms: bool = False,
 ) -> list[Tensor]:
-    """Emulate the current YOLO26 path in genericboxdecode-v2."""
+    """Emulate YOLO26 BoxDecode with the corrected NMS-free contract.
+
+    ``legacy_nms`` retains the old class-aware integer NMS path for regression
+    comparisons. Candidate production still follows BoxDecode: best class per
+    cell, confidence filtering, a per-head ``top_k`` cap, then final ``top_k``.
+    """
 
     boxes, scores = _decode_raw_boxes(predictions, strides)
     best_scores, best_classes = scores.max(dim=-1)
+    features = predictions["one2one"]["feats"]
+    if not isinstance(features, list):
+        features = list(features)
+    level_sizes = [int(feature.shape[-2] * feature.shape[-1]) for feature in features]
+    if sum(level_sizes) != scores.shape[1]:
+        raise RuntimeError(
+            f"Feature levels contain {sum(level_sizes)} cells, scores contain {scores.shape[1]}"
+        )
     output = []
     for image_boxes, image_scores, image_classes in zip(
         boxes, best_scores, best_classes
     ):
-        valid = image_scores >= confidence
-        image_boxes = image_boxes[valid]
-        image_scores = image_scores[valid]
-        image_classes = image_classes[valid]
-        count = min(max_detections, image_scores.numel())
-        if count:
-            image_scores, indices = image_scores.topk(count)
-            image_boxes = image_boxes[indices]
-            image_classes = image_classes[indices]
-        candidates = torch.cat(
-            (
-                image_boxes,
-                image_scores[:, None],
-                image_classes[:, None].to(image_boxes.dtype),
-            ),
-            dim=-1,
-        ).cpu()
-        output.append(_boxdecode_class_nms(candidates, nms_iou))
+        level_candidates = []
+        offset = 0
+        for level_size in level_sizes:
+            level_boxes = image_boxes[offset : offset + level_size]
+            level_scores = image_scores[offset : offset + level_size]
+            level_classes = image_classes[offset : offset + level_size]
+            offset += level_size
+            valid = level_scores >= confidence
+            level_boxes = level_boxes[valid]
+            level_scores = level_scores[valid]
+            level_classes = level_classes[valid]
+            count = min(max_detections, level_scores.numel())
+            if count:
+                level_scores, indices = level_scores.topk(count)
+                level_candidates.append(
+                    torch.cat(
+                        (
+                            level_boxes[indices],
+                            level_scores[:, None],
+                            level_classes[indices, None].to(level_boxes.dtype),
+                        ),
+                        dim=-1,
+                    )
+                )
+        if level_candidates:
+            candidates = torch.cat(level_candidates).cpu()
+        else:
+            candidates = torch.empty((0, 6), dtype=image_boxes.dtype)
+        if legacy_nms:
+            candidates = _boxdecode_class_nms(candidates, nms_iou)
+        if candidates.shape[0] > max_detections:
+            indices = candidates[:, 4].topk(max_detections).indices
+            candidates = candidates[indices]
+        output.append(candidates)
     return output
 
 
@@ -298,6 +328,7 @@ def collect_predictions(
     confidence: float,
     max_detections: int,
     nms_iou: float,
+    legacy_nms: bool,
     log_interval: int,
 ) -> tuple[list[dict[str, Any]], float]:
     loader = DataLoader(
@@ -319,6 +350,7 @@ def collect_predictions(
             confidence=confidence,
             max_detections=max_detections,
             nms_iou=nms_iou,
+            legacy_nms=legacy_nms,
         )
         results.extend(detections_to_coco(decoded, metadata, dataset.category_ids))
         if step % log_interval == 0 or step + 1 == len(loader):
@@ -377,6 +409,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence", type=float, default=0.001)
     parser.add_argument("--max-detections", type=int, default=300)
     parser.add_argument("--nms-iou", type=float, default=0.7)
+    parser.add_argument(
+        "--legacy-nms",
+        action="store_true",
+        help="Re-enable the old BoxDecode class-aware NMS path for comparison",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--calibration-limit", type=int, default=1024)
     parser.add_argument("--calibration-seed", type=int, default=42)
@@ -426,6 +463,7 @@ def run_variant(
         args.confidence,
         args.max_detections,
         args.nms_iou,
+        args.legacy_nms,
         args.log_interval,
     )
     prediction_path = output / f"{name}_predictions.json"
@@ -559,6 +597,7 @@ def main() -> None:
         "image_size": args.image_size,
         "confidence": args.confidence,
         "nms_iou": args.nms_iou,
+        "postprocess": "legacy_nms" if args.legacy_nms else "nms_free",
         "max_detections": args.max_detections,
         "results": results,
     }

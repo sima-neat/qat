@@ -138,7 +138,7 @@ def test_one2one_decode_and_inverse_letterbox() -> None:
     assert coco[0]["bbox"] == [0.0, 0.0, 8.0, 8.0]
 
 
-def test_boxdecode_path_uses_cell_argmax_and_class_aware_integer_nms() -> None:
+def test_boxdecode_path_is_nms_free_with_opt_in_legacy_nms() -> None:
     boxes = torch.tensor(
         [[[0.5, 1.5], [0.5, 0.5], [1.5, 0.5], [0.5, 0.5]]]
     )
@@ -155,5 +155,14 @@ def test_boxdecode_path_uses_cell_argmax_and_class_aware_integer_nms() -> None:
         }
     }
     detections = decode_boxdecode(predictions, max_detections=2, nms_iou=0.7)
-    assert detections[0].shape == (1, 6)
-    assert detections[0][0, 5].item() == 2
+    assert detections[0].shape == (2, 6)
+    assert detections[0][:, 5].tolist() == [2.0, 2.0]
+
+    legacy = decode_boxdecode(
+        predictions,
+        max_detections=2,
+        nms_iou=0.7,
+        legacy_nms=True,
+    )
+    assert legacy[0].shape == (1, 6)
+    assert legacy[0][0, 5].item() == 2
