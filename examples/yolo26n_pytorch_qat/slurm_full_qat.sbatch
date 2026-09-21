@@ -18,8 +18,9 @@ PYTHON_ENV="${QAT_PYTHON_ENV:-$WORKDIR/../afe_env}"
 PYTHON_BIN="${QAT_PYTHON_BIN:-$WORKDIR/../../../python312/bin/python3.12}"
 EVAL_DEPS="${QAT_EVAL_DEPS:-$WORKDIR/runs/coco_eval_deps}"
 SLURM_HOME="${SLURM_HOME:-/project/sima/tools/opensource/slurm/24.11.3g}"
-RUN_DIR="${QAT_FULL_RUN_DIR:-$WORKDIR/runs/yolo26n_coco_qat_2e}"
+RUN_DIR="${QAT_FULL_RUN_DIR:-$WORKDIR/runs/yolo26n_coco_qat_2e_lr1e5}"
 WEIGHTS="${QAT_YOLO26N_WEIGHTS:-$WORKDIR/runs/slurm_gpu_smoke/yolo26n_pure.pt}"
+LEARNING_RATE="${QAT_LEARNING_RATE:-1e-5}"
 
 cd "$WORKDIR"
 export PYTHONNOUSERSITE=1
@@ -49,7 +50,7 @@ PY
   --batch-size 64 \
   --epochs 2 \
   --freeze-epoch 1 \
-  --learning-rate 8e-5 \
+  --learning-rate "$LEARNING_RATE" \
   --workers 16 \
   --log-interval 200
 

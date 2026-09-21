@@ -146,7 +146,9 @@ python examples/yolo26n_pytorch_qat/evaluate.py \
 ```
 
 `slurm_full_qat.sbatch` trains two full-COCO epochs on one A100, freezes the
-quantization grids for epoch 2, and evaluates both checkpoints.
+quantization grids for epoch 2, and evaluates both checkpoints. Its conservative
+QAT recovery learning rate is `1e-5`; set `QAT_LEARNING_RATE` and
+`QAT_FULL_RUN_DIR` to run a separately named experiment.
 
 Use `--resume checkpoints/epoch_NNN.pt` to continue a run and `--no-export` for
 training-only experiments.
