@@ -33,7 +33,7 @@ Keep this list scoped to the PyTorch training and standard ONNX QDQ workflow.
 - [ ] Build the package reproducibly without depending on a Git checkout.
 - [x] Install the built wheel in a clean CPU environment and run the regression
   suite against the installed package.
-- [ ] Run the new workflow in GitHub and verify the first OIDC-authenticated
+- [x] Run the new workflow in GitHub and verify the first OIDC-authenticated
   Vulcan publication and package metadata.
 - [ ] Add lightweight formatting, lint, import, ONNX checker, and documentation
   link checks to CI.

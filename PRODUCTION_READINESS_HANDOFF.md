@@ -39,7 +39,11 @@ does not gain fake-quant boundaries.
   installed artifact outside the checkout, and publishes that exact payload to
   Vulcan after successful branch and tag builds. Pull requests never publish.
 - The complete suite passes with `326 passed, 2 skipped`.
-- The installed-wheel regression suite passes with `326 passed`.
+- GitHub Actions run `35627974808` passed the installed-wheel regression suite
+  with `325 passed, 1 skipped, 2 deselected` on Python 3.12 and published the
+  tested wheel, checksum, metadata, manifest, and branch index to production
+  Vulcan. The published wheel checksum was verified independently through
+  CloudFront.
 
 ## Validation commands
 
@@ -57,12 +61,10 @@ case.
 
 ## Remaining release gates
 
-1. Run the GitHub workflow and verify its first OIDC-authenticated Vulcan
-   publication and generated package metadata.
-2. Make wheel construction reproducible without relying on repository Git
+1. Make wheel construction reproducible without relying on repository Git
    metadata.
-3. Publish the public lifecycle contract.
-4. Record the supported Python, PyTorch, ONNX, and ONNX Runtime versions in the
+2. Publish the public lifecycle contract.
+3. Record the supported Python, PyTorch, ONNX, and ONNX Runtime versions in the
    release notes.
 
 The release gate is that QAT behavior is correct, deterministic, documented,
