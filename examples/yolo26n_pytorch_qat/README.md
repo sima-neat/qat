@@ -107,8 +107,8 @@ python examples/yolo26n_pytorch_qat/train.py \
   --output runs/yolo26n_coco_qat \
   --device cuda \
   --batch-size 8 \
-  --epochs 10 \
-  --freeze-epoch 8 \
+  --epochs 4 \
+  --freeze-epoch 1 \
   --learning-rate 1e-5
 ```
 
@@ -119,10 +119,13 @@ The default data paths are:
 /project/ml_datasets/public_datasets/coco/coco_2017/annotations/instances_train2017.json
 ```
 
-The last two epochs in the example above train against locked, compiler-valid
-quantization grids. `--freeze-epoch -1` defers locking until finalization, which
-is useful only for diagnosis. AMP is opt-in with `--amp`; start without it when
-validating a new GPU environment.
+The last three epochs in the example above train against locked, compiler-valid
+quantization grids. The recovery recipe keeps the pretrained BatchNorm statistics
+fixed, uses the terminal YOLO26 head weighting (0.1 one-to-many and 0.9 one-to-one),
+and decays the learning rate from `1e-5` to `1e-6`. Weight decay applies only to
+matrix and convolution kernels. `--freeze-epoch -1` defers locking until
+finalization, which is useful only for diagnosis. AMP is opt-in with `--amp`;
+start without it when validating a new GPU environment.
 
 ## Outputs
 
@@ -145,10 +148,10 @@ python examples/yolo26n_pytorch_qat/evaluate.py \
   --device cuda:0
 ```
 
-`slurm_full_qat.sbatch` trains two full-COCO epochs on one A100, freezes the
-quantization grids for epoch 2, and evaluates both checkpoints. Its conservative
-QAT recovery learning rate is `1e-5`; set `QAT_LEARNING_RATE` and
-`QAT_FULL_RUN_DIR` to run a separately named experiment.
+`slurm_full_qat.sbatch` trains four full-COCO epochs on one A100, freezes the
+quantization grids after the first epoch, and evaluates all four checkpoints.
+Its conservative QAT recovery learning rate is `1e-5`; set `QAT_LEARNING_RATE`
+and `QAT_FULL_RUN_DIR` to run a separately named experiment.
 
 Use `--resume checkpoints/epoch_NNN.pt` to continue a run and `--no-export` for
 training-only experiments.

@@ -18,7 +18,12 @@ from coco import CocoDetectionDataset, collate_detection  # noqa: E402
 from evaluate import decode_boxdecode, decode_end2end, detections_to_coco  # noqa: E402
 from loss import YOLO26Loss  # noqa: E402
 from model import build_yolo26n  # noqa: E402
-from sima_qat import sima_freeze_qat, sima_prepare_qat_model  # noqa: E402
+from sima_qat import (  # noqa: E402
+    sima_freeze_batchnorm_stats,
+    sima_freeze_qat,
+    sima_prepare_qat_model,
+)
+from train import optimizer_parameter_groups  # noqa: E402
 
 
 pytestmark = pytest.mark.regression
@@ -80,7 +85,7 @@ def test_pure_model_shape_and_loss_backward() -> None:
     assert outputs["one2many"]["boxes"].shape == (1, 4, 84)
     assert outputs["one2many"]["scores"].shape == (1, 80, 84)
     assert outputs["one2one"]["boxes"].shape == (1, 4, 84)
-    loss, metrics = YOLO26Loss()(outputs, _target(), epoch=0, epochs=2)
+    loss, metrics = YOLO26Loss()(outputs, _target())
     loss.backward()
     assert torch.isfinite(loss)
     assert all(torch.isfinite(value) for value in metrics.values())
@@ -96,10 +101,49 @@ def test_full_model_dynamic_qat_prepare_forward_and_freeze() -> None:
         dynamic_batch=True,
     )
     outputs = prepared(torch.randn(2, 3, 64, 64))
-    loss, _ = YOLO26Loss()(outputs, _target(2), epoch=0, epochs=2)
+    loss, _ = YOLO26Loss()(outputs, _target(2))
     loss.backward()
     sima_freeze_qat(prepared)
     assert bool(prepared.qat_frozen.item())
+
+
+def test_batchnorm_can_freeze_before_quantization_grids() -> None:
+    inputs = torch.randn(2, 3, 64, 64)
+    prepared = sima_prepare_qat_model(
+        build_yolo26n().train(),
+        (inputs,),
+        "cpu",
+        dynamic_batch=True,
+    )
+    sima_freeze_batchnorm_stats(prepared)
+    running_means = {
+        name: buffer.detach().clone()
+        for name, buffer in prepared.named_buffers()
+        if name.endswith("running_mean")
+    }
+
+    prepared.train()
+    prepared(inputs)
+
+    assert not bool(prepared.qat_frozen.item())
+    for name, expected in running_means.items():
+        torch.testing.assert_close(
+            dict(prepared.named_buffers())[name], expected, rtol=0, atol=0
+        )
+
+
+def test_optimizer_excludes_vector_parameters_from_weight_decay() -> None:
+    model = build_yolo26n()
+    groups = optimizer_parameter_groups(model, 5e-4)
+    decayed = {id(parameter) for parameter in groups[0]["params"]}
+    not_decayed = {id(parameter) for parameter in groups[1]["params"]}
+
+    assert groups[0]["weight_decay"] == 5e-4
+    assert groups[1]["weight_decay"] == 0
+    assert decayed.isdisjoint(not_decayed)
+    assert decayed | not_decayed == {id(parameter) for parameter in model.parameters()}
+    assert all(parameter.ndim > 1 for parameter in groups[0]["params"])
+    assert all(parameter.ndim <= 1 for parameter in groups[1]["params"])
 
 
 def test_one2one_decode_and_inverse_letterbox() -> None:

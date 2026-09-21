@@ -18,7 +18,7 @@ PYTHON_ENV="${QAT_PYTHON_ENV:-$WORKDIR/../afe_env}"
 PYTHON_BIN="${QAT_PYTHON_BIN:-$WORKDIR/../../../python312/bin/python3.12}"
 EVAL_DEPS="${QAT_EVAL_DEPS:-$WORKDIR/runs/coco_eval_deps}"
 SLURM_HOME="${SLURM_HOME:-/project/sima/tools/opensource/slurm/24.11.3g}"
-RUN_DIR="${QAT_FULL_RUN_DIR:-$WORKDIR/runs/yolo26n_coco_qat_2e_lr1e5}"
+RUN_DIR="${QAT_FULL_RUN_DIR:-$WORKDIR/runs/yolo26n_coco_qat_4e_recovery}"
 WEIGHTS="${QAT_YOLO26N_WEIGHTS:-$WORKDIR/runs/slurm_gpu_smoke/yolo26n_pure.pt}"
 LEARNING_RATE="${QAT_LEARNING_RATE:-1e-5}"
 
@@ -48,13 +48,13 @@ PY
   --device cuda:0 \
   --image-size 640 \
   --batch-size 64 \
-  --epochs 2 \
+  --epochs 4 \
   --freeze-epoch 1 \
   --learning-rate "$LEARNING_RATE" \
   --workers 16 \
   --log-interval 200
 
-for epoch in 000 001; do
+for epoch in 000 001 002 003; do
   "$SLURM_HOME/bin/srun" "$PYTHON_BIN" examples/yolo26n_pytorch_qat/evaluate.py \
     --weights "$WEIGHTS" \
     --qat-checkpoint "$RUN_DIR/train/checkpoints/epoch_${epoch}.pt" \
@@ -68,5 +68,5 @@ for epoch in 000 001; do
 done
 
 test -s "$RUN_DIR/train/yolo26n_qat_raw_heads.onnx"
-test -s "$RUN_DIR/eval_epoch_001/comparison.json"
+test -s "$RUN_DIR/eval_epoch_003/comparison.json"
 echo "FULL_QAT_OK $RUN_DIR"

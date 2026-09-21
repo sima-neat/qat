@@ -209,9 +209,9 @@ class TaskAlignedAssigner(nn.Module):
 
 @dataclass(frozen=True)
 class LossGains:
-    box: float = 7.5
-    classification: float = 0.5
-    l1: float = 1.5
+    box: float = 5.62767
+    classification: float = 0.56099
+    l1: float = 9.03871
 
 
 class DetectionHeadLoss(nn.Module):
@@ -335,32 +335,29 @@ class DetectionHeadLoss(nn.Module):
 
 
 class YOLO26Loss(nn.Module):
-    """YOLO26 dual-head objective with its progressive head-weight schedule."""
+    """YOLO26 dual-head objective for recovery from a trained checkpoint."""
 
     def __init__(
         self,
         classes: int = 80,
         strides: tuple[int, ...] = (8, 16, 32),
         gains: LossGains = LossGains(),
+        one2many_weight: float = 0.1,
     ) -> None:
         super().__init__()
+        if not 0 <= one2many_weight <= 1:
+            raise ValueError("one2many_weight must be between zero and one")
         self.one2many = DetectionHeadLoss(classes, strides, 10, None, gains)
         self.one2one = DetectionHeadLoss(classes, strides, 7, 1, gains)
-
-    @staticmethod
-    def head_weights(epoch: int, epochs: int) -> tuple[float, float]:
-        progress = min(max(epoch, 0), max(epochs - 1, 0)) / max(epochs - 1, 1)
-        one2many = 0.8 + (0.1 - 0.8) * progress
-        return one2many, 1.0 - one2many
+        self.one2many_weight = one2many_weight
 
     def forward(
         self,
         predictions: dict[str, dict[str, Tensor | list[Tensor]]],
         batch: dict[str, Tensor],
-        epoch: int,
-        epochs: int,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        one2many_weight, one2one_weight = self.head_weights(epoch, epochs)
+        one2many_weight = self.one2many_weight
+        one2one_weight = 1.0 - one2many_weight
         one2many = self.one2many(predictions["one2many"], batch)
         one2one = self.one2one(predictions["one2one"], batch)
         components = one2many * one2many_weight + one2one * one2one_weight

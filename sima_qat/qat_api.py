@@ -617,6 +617,23 @@ def _freeze_batchnorm_stats(module: GraphModule) -> None:
     module.recompile()
 
 
+def sima_freeze_batchnorm_stats(qat_model: GraphModule) -> GraphModule:
+    """Keep pretrained BatchNorm statistics fixed while QAT weights update.
+
+    This is independent of :func:`sima_freeze_qat`: observers continue collecting
+    activation ranges until the caller explicitly locks the quantization grids.
+    The setting is retained across subsequent ``train()`` calls.
+    """
+    if not isinstance(qat_model, GraphModule):
+        raise RuntimeError(
+            "Input graph to BatchNorm freeze function must be a GraphModule, "
+            f"found {type(qat_model)}"
+        )
+    _freeze_batchnorm_stats(qat_model)
+    qat_model.meta["qat_batchnorm_frozen"] = True
+    return qat_model
+
+
 def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
     """Freeze QAT observers and lock SiMa-compatible power-of-two weight scales.
 
@@ -1043,7 +1060,10 @@ class SimaQatWrapper(GraphModule):
 
         if use_train:
             move_exported_model_to_train(self)
-            if bool(getattr(self, "qat_frozen", torch.tensor([0])).item()):
+            if (
+                bool(getattr(self, "qat_frozen", torch.tensor([0])).item())
+                or self.meta.get("qat_batchnorm_frozen", False)
+            ):
                 _freeze_batchnorm_stats(self)
             self.training = True
         else:

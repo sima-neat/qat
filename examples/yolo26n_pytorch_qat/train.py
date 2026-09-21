@@ -20,6 +20,7 @@ from model import build_yolo26n
 from sima_qat import (
     sima_export_onnx,
     sima_finalize_qat_model,
+    sima_freeze_batchnorm_stats,
     sima_freeze_qat,
     sima_prepare_qat_model,
 )
@@ -44,12 +45,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--min-learning-rate", type=float, default=1e-6)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--gradient-clip", type=float, default=10.0)
     parser.add_argument("--horizontal-flip", type=float, default=0.5)
-    parser.add_argument("--box-gain", type=float, default=7.5)
-    parser.add_argument("--classification-gain", type=float, default=0.5)
-    parser.add_argument("--l1-gain", type=float, default=1.5)
+    parser.add_argument("--box-gain", type=float, default=5.62767)
+    parser.add_argument("--classification-gain", type=float, default=0.56099)
+    parser.add_argument("--l1-gain", type=float, default=9.03871)
+    parser.add_argument(
+        "--one2many-weight",
+        type=float,
+        default=0.1,
+        help="Fixed one-to-many loss weight; 0.1 is YOLO26's terminal training value",
+    )
     parser.add_argument(
         "--freeze-epoch",
         type=int,
@@ -71,6 +79,10 @@ def validate_args(args: argparse.Namespace) -> int | None:
         raise ValueError("image-size must be a positive multiple of 32")
     if not 0 <= args.horizontal_flip <= 1:
         raise ValueError("horizontal-flip must be between zero and one")
+    if not 0 <= args.one2many_weight <= 1:
+        raise ValueError("one2many-weight must be between zero and one")
+    if not 0 <= args.min_learning_rate <= args.learning_rate:
+        raise ValueError("min-learning-rate must be between zero and learning-rate")
     freeze_epoch = args.freeze_epoch
     if freeze_epoch is None:
         freeze_epoch = args.epochs - 1 if args.epochs > 1 else None
@@ -104,10 +116,28 @@ def load_portable_weights(path: str | Path) -> dict[str, Tensor]:
     return checkpoint["state_dict"]
 
 
+def optimizer_parameter_groups(
+    model: torch.nn.Module,
+    weight_decay: float,
+) -> list[dict[str, object]]:
+    """Apply decay to matrix/kernel weights, never biases or normalization."""
+    decay = []
+    no_decay = []
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+        (decay if parameter.ndim > 1 else no_decay).append(parameter)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     epoch: int,
     frozen: bool,
     args: argparse.Namespace,
@@ -118,6 +148,7 @@ def save_checkpoint(
             "format": "sima-yolo26n-qat-training-v1",
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
             "epoch": epoch,
             "frozen": frozen,
             "args": vars(args),
@@ -175,17 +206,23 @@ def main() -> None:
         dynamic_batch=True,
     )
     del eager
+    sima_freeze_batchnorm_stats(qat_model)
     criterion = YOLO26Loss(
         gains=LossGains(
             box=args.box_gain,
             classification=args.classification_gain,
             l1=args.l1_gain,
-        )
+        ),
+        one2many_weight=args.one2many_weight,
     ).to(device)
     optimizer = torch.optim.AdamW(
-        qat_model.parameters(),
+        optimizer_parameter_groups(qat_model, args.weight_decay),
         lr=args.learning_rate,
-        weight_decay=args.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+        eta_min=args.min_learning_rate,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
     start_epoch = 0
@@ -196,6 +233,8 @@ def main() -> None:
             raise RuntimeError(f"Unsupported resume checkpoint: {args.resume}")
         qat_model.load_state_dict(resumed["model"], strict=True)
         optimizer.load_state_dict(resumed["optimizer"])
+        if "scheduler" in resumed:
+            scheduler.load_state_dict(resumed["scheduler"])
         start_epoch = int(resumed["epoch"]) + 1
         frozen = bool(resumed["frozen"])
 
@@ -217,7 +256,7 @@ def main() -> None:
                 enabled=args.amp and device.type == "cuda",
             ):
                 predictions = qat_model(images)
-                loss, metrics = criterion(predictions, batch, epoch, args.epochs)
+                loss, metrics = criterion(predictions, batch)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(qat_model.parameters(), args.gradient_clip)
@@ -239,11 +278,14 @@ def main() -> None:
         steps = max(len(loader), 1)
         elapsed = time.monotonic() - epoch_started
         summary = " ".join(f"{name}={value / steps:.5f}" for name, value in totals.items())
-        print(f"epoch={epoch} seconds={elapsed:.1f} {summary}")
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"epoch={epoch} seconds={elapsed:.1f} lr={current_lr:.8g} {summary}")
+        scheduler.step()
         save_checkpoint(
             output_directory / "checkpoints" / f"epoch_{epoch:03d}.pt",
             qat_model,
             optimizer,
+            scheduler,
             epoch,
             frozen,
             args,
