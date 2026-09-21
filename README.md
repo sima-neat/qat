@@ -178,8 +178,9 @@ Generated ONNX models are written to `exported_models/` (gitignored).
 installs it into a fresh CPU environment, and runs the regression suite from
 outside the checkout. Pull requests stop after validation. Branch and tag
 pushes publish that same tested wheel, its checksum, and package metadata to
-Vulcan. The `VULCAN_ENV` repository variable selects the destination and
-defaults to `production`, matching the core package workflow.
+Vulcan, then advance only that branch or tag's `latest.tag` pointer. The
+`VULCAN_ENV` repository variable selects the destination and defaults to
+`production`, matching the core package workflow.
 
 ## Layout
 

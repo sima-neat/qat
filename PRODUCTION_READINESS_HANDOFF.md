@@ -37,7 +37,8 @@ does not gain fake-quant boundaries.
   are preserved through finalization and ONNX export.
 - The public-runner GitHub workflow builds an isolated wheel, tests the
   installed artifact outside the checkout, and publishes that exact payload to
-  Vulcan after successful branch and tag builds. Pull requests never publish.
+  Vulcan after successful branch and tag builds. Each successful publication
+  advances that branch or tag's own `latest.tag`; pull requests never publish.
 - The complete suite passes with `326 passed, 2 skipped`.
 - GitHub Actions run `35627974808` passed the installed-wheel regression suite
   with `325 passed, 1 skipped, 2 deselected` on Python 3.12 and published the
