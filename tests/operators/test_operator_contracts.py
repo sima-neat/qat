@@ -57,6 +57,39 @@ class IntegerMatMul(nn.Module):
         return torch.mm(left, right)
 
 
+class ConvTransposeModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.operation = nn.ConvTranspose2d(3, 4, 3)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.operation(inputs)
+
+
+class EmbeddingModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(16, 4)
+
+    def forward(self, indices: Tensor) -> Tensor:
+        return self.embedding(indices)
+
+
+class GridSampleModel(nn.Module):
+    def forward(self, inputs: Tensor, grid: Tensor) -> Tensor:
+        return torch.nn.functional.grid_sample(inputs, grid, align_corners=False)
+
+
+class ReduceMinModel(nn.Module):
+    def forward(self, inputs: Tensor) -> Tensor:
+        return torch.amin(inputs, dim=(2, 3))
+
+
+class CumSumModel(nn.Module):
+    def forward(self, inputs: Tensor) -> Tensor:
+        return torch.cumsum(inputs, dim=1)
+
+
 def _converted_cat(model: nn.Module, inputs: Tensor) -> torch.fx.Node:
     prepared = sima_prepare_qat_model(model, (inputs,), "cpu")
     prepared(inputs)
@@ -193,3 +226,23 @@ def test_integer_matmul_operands_are_not_qat_annotated() -> None:
 
     assert not getattr(mm.meta.get("quantization_annotation"), "_annotated", False)
     assert not any(isinstance(module, FakeQuantizeBase) for module in prepared.modules())
+
+
+@pytest.mark.parametrize(
+    ("model", "inputs", "message"),
+    [
+        (ConvTransposeModel(), (torch.randn(1, 3, 8, 8),), "ConvTranspose2d"),
+        (EmbeddingModel(), (torch.randint(0, 16, (2, 5)),), "Embedding/Gather"),
+        (
+            GridSampleModel(),
+            (torch.randn(1, 3, 8, 8), torch.randn(1, 4, 4, 2)),
+            "GridSample",
+        ),
+        (ReduceMinModel(), (torch.randn(1, 3, 8, 8),), "ReduceMin"),
+        (CumSumModel(), (torch.randn(1, 3, 8, 8),), "CumSum"),
+    ],
+    ids=("conv_transpose", "embedding", "grid_sample", "reduce_min", "cumsum"),
+)
+def test_outside_w8a8_contract_is_rejected(model, inputs, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        sima_prepare_qat_model(model, inputs, "cpu")

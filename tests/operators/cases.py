@@ -10,6 +10,8 @@ from typing import Callable
 import torch
 from torch import Tensor, nn
 
+from sima_qat.operator_manifest import ONNX_TEST_CASE_IDS
+
 
 InputFactory = Callable[[], tuple[Tensor, ...]]
 ModelFactory = Callable[[], nn.Module]
@@ -224,6 +226,71 @@ class BatchNormModel(nn.Module):
         return self.bn(inputs)
 
 
+class UnaryOperatorModel(nn.Module):
+    def __init__(self, operation: Callable[[Tensor], Tensor]) -> None:
+        super().__init__()
+        self.operation = operation
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.operation(inputs)
+
+
+class DirectBinaryModel(nn.Module):
+    def __init__(self, operation: Callable[[Tensor, Tensor], Tensor]) -> None:
+        super().__init__()
+        self.operation = operation
+
+    def forward(self, left: Tensor, right: Tensor) -> Tensor:
+        return self.operation(left, right)
+
+
+class EinsumModel(nn.Module):
+    def forward(self, left: Tensor, right: Tensor) -> Tensor:
+        return torch.einsum("bik,bkj->bij", left, right)
+
+
+class PReluModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.activation = nn.PReLU(3)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.activation(inputs)
+
+
+class LayoutAfterConvModel(nn.Module):
+    def __init__(self, operation: Callable[[Tensor], Tensor]) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(3, 4, 1)
+        self.operation = operation
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.operation(self.conv(inputs))
+
+
+class ExpandAfterConvModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(3, 4, 1)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.conv(inputs).expand(-1, -1, 4, -1)
+
+
+class SplitAfterConvModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(3, 4, 1)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return torch.split(self.conv(inputs), 2, dim=1)[0]
+
+
+class TopKValuesModel(nn.Module):
+    def forward(self, inputs: Tensor) -> Tensor:
+        return torch.topk(inputs, 3, dim=1).values
+
+
 IMAGE_INPUT: InputFactory = lambda: (torch.randn(2, 3, 8, 8),)
 FOUR_CHANNEL_INPUT: InputFactory = lambda: (torch.randn(2, 4, 8, 8),)
 SEQUENCE_INPUT: InputFactory = lambda: (torch.randn(2, 3, 12),)
@@ -236,6 +303,16 @@ BADDBMM_INPUT: InputFactory = lambda: (
     torch.randn(2, 4, 8),
     torch.randn(2, 8, 3),
 )
+POSITIVE_IMAGE_INPUT: InputFactory = lambda: (torch.rand(2, 3, 8, 8) + 0.25,)
+PAIR_IMAGE_INPUT: InputFactory = lambda: (
+    torch.randn(2, 3, 8, 8),
+    torch.rand(2, 3, 8, 8) + 0.5,
+)
+EINSUM_INPUT: InputFactory = lambda: (
+    torch.randn(2, 3, 4),
+    torch.randn(2, 4, 5),
+)
+EXPAND_INPUT: InputFactory = lambda: (torch.randn(2, 3, 1, 8),)
 
 
 OPERATOR_CASES = (
@@ -501,6 +578,305 @@ OPERATOR_CASES = (
             torch.ops.aten._native_batch_norm_legit.default,
         ),
     ),
+    OperatorCase(
+        "abs",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.abs),
+        IMAGE_INPUT,
+        (torch.ops.aten.abs.default,),
+    ),
+    OperatorCase(
+        "elu",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.nn.functional.elu),
+        IMAGE_INPUT,
+        (torch.ops.aten.elu.default,),
+    ),
+    OperatorCase(
+        "exp",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.exp),
+        IMAGE_INPUT,
+        (torch.ops.aten.exp.default,),
+    ),
+    OperatorCase(
+        "hardsigmoid",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.nn.functional.hardsigmoid),
+        IMAGE_INPUT,
+        (torch.ops.aten.hardsigmoid.default,),
+    ),
+    OperatorCase(
+        "hardswish",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.nn.functional.hardswish),
+        IMAGE_INPUT,
+        (torch.ops.aten.hardswish.default,),
+    ),
+    OperatorCase(
+        "instance_norm",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.nn.functional.instance_norm),
+        IMAGE_INPUT,
+        (torch.ops.aten.instance_norm.default,),
+    ),
+    OperatorCase(
+        "leaky_relu",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.nn.functional.leaky_relu),
+        IMAGE_INPUT,
+        (torch.ops.aten.leaky_relu.default,),
+    ),
+    OperatorCase(
+        "log",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.log),
+        POSITIVE_IMAGE_INPUT,
+        (torch.ops.aten.log.default,),
+    ),
+    OperatorCase(
+        "log_softmax",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(lambda value: torch.log_softmax(value, dim=1)),
+        IMAGE_INPUT,
+        (torch.ops.aten.log_softmax.int,),
+    ),
+    OperatorCase(
+        "neg",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.neg),
+        IMAGE_INPUT,
+        (torch.ops.aten.neg.default,),
+    ),
+    OperatorCase(
+        "reciprocal",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.reciprocal),
+        POSITIVE_IMAGE_INPUT,
+        (torch.ops.aten.reciprocal.default,),
+    ),
+    OperatorCase(
+        "softplus",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.nn.functional.softplus),
+        IMAGE_INPUT,
+        (torch.ops.aten.softplus.default,),
+    ),
+    OperatorCase(
+        "sqrt",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.sqrt),
+        POSITIVE_IMAGE_INPUT,
+        (torch.ops.aten.sqrt.default,),
+    ),
+    OperatorCase(
+        "tanh",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(torch.tanh),
+        IMAGE_INPUT,
+        (torch.ops.aten.tanh.default,),
+    ),
+    OperatorCase(
+        "div",
+        "sima_binary_int8",
+        lambda: DirectBinaryModel(torch.div),
+        PAIR_IMAGE_INPUT,
+        (torch.ops.aten.div.Tensor,),
+    ),
+    OperatorCase(
+        "sub",
+        "sima_binary_int8",
+        lambda: DirectBinaryModel(torch.sub),
+        PAIR_IMAGE_INPUT,
+        (torch.ops.aten.sub.Tensor,),
+    ),
+    OperatorCase(
+        "einsum",
+        "sima_einsum",
+        EinsumModel,
+        EINSUM_INPUT,
+        (torch.ops.aten.einsum.default,),
+    ),
+    OperatorCase(
+        "pow",
+        "sima_pow",
+        lambda: UnaryOperatorModel(lambda value: torch.pow(value, 2)),
+        IMAGE_INPUT,
+        (torch.ops.aten.pow.Tensor_Scalar,),
+    ),
+    OperatorCase(
+        "prelu",
+        "sima_prelu",
+        PReluModel,
+        IMAGE_INPUT,
+        (torch.ops.aten.prelu.default,),
+    ),
+    OperatorCase(
+        "reduce_mean",
+        "sima_reduction",
+        lambda: UnaryOperatorModel(lambda value: torch.mean(value, dim=(2, 3))),
+        IMAGE_INPUT,
+        (torch.ops.aten.mean.dim,),
+    ),
+    OperatorCase(
+        "reduce_sum",
+        "sima_reduction",
+        lambda: UnaryOperatorModel(lambda value: torch.sum(value, dim=(2, 3))),
+        IMAGE_INPUT,
+        (torch.ops.aten.sum.dim_IntList,),
+    ),
+    OperatorCase(
+        "reduce_max",
+        "sima_reduction",
+        lambda: UnaryOperatorModel(lambda value: torch.amax(value, dim=(2, 3))),
+        IMAGE_INPUT,
+        (torch.ops.aten.amax.default,),
+    ),
+    OperatorCase(
+        "reduce_l1",
+        "sima_reduction",
+        lambda: UnaryOperatorModel(
+            lambda value: torch.linalg.vector_norm(value, ord=1, dim=(2, 3))
+        ),
+        IMAGE_INPUT,
+        (torch.ops.aten.linalg_vector_norm.default,),
+    ),
+    OperatorCase(
+        "reduce_logsumexp",
+        "sima_reduction",
+        lambda: UnaryOperatorModel(lambda value: torch.logsumexp(value, dim=(2, 3))),
+        IMAGE_INPUT,
+        (torch.ops.aten.logsumexp.default,),
+    ),
+    OperatorCase(
+        "global_average_pool",
+        "adaptive_avg_pool2d",
+        lambda: PoolModel(nn.AdaptiveAvgPool2d((1, 1))),
+        IMAGE_INPUT,
+        (torch.ops.aten.adaptive_avg_pool2d.default,),
+        weighted=True,
+    ),
+    OperatorCase(
+        "global_max_pool",
+        "sima_global_max_pool2d",
+        lambda: UnaryOperatorModel(
+            lambda value: torch.nn.functional.adaptive_max_pool2d(value, (1, 1))[0]
+        ),
+        IMAGE_INPUT,
+        (torch.ops.aten.adaptive_max_pool2d.default,),
+    ),
+    OperatorCase(
+        "argmax",
+        "sima_mixed_output",
+        lambda: UnaryOperatorModel(lambda value: torch.argmax(value, dim=1)),
+        IMAGE_INPUT,
+        (torch.ops.aten.argmax.default,),
+    ),
+    OperatorCase(
+        "topk_values",
+        "sima_mixed_output",
+        TopKValuesModel,
+        IMAGE_INPUT,
+        (torch.ops.aten.topk.default,),
+    ),
+    OperatorCase(
+        "resize_nearest",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(
+            lambda value: torch.nn.functional.interpolate(
+                value, scale_factor=2, mode="nearest"
+            )
+        ),
+        IMAGE_INPUT,
+        (torch.ops.aten.upsample_nearest2d.vec,),
+    ),
+    OperatorCase(
+        "resize_bilinear",
+        "sima_unary_int8",
+        lambda: UnaryOperatorModel(
+            lambda value: torch.nn.functional.interpolate(
+                value, scale_factor=2, mode="bilinear", align_corners=False
+            )
+        ),
+        IMAGE_INPUT,
+        (torch.ops.aten.upsample_bilinear2d.vec,),
+    ),
+    OperatorCase(
+        "expand",
+        "sima_grid_preserving",
+        ExpandAfterConvModel,
+        EXPAND_INPUT,
+        (torch.ops.aten.expand.default,),
+        weighted=True,
+    ),
+    OperatorCase(
+        "flatten",
+        "sima_grid_preserving",
+        lambda: LayoutAfterConvModel(lambda value: torch.flatten(value, 1)),
+        IMAGE_INPUT,
+        (torch.ops.aten.flatten.using_ints,),
+        weighted=True,
+    ),
+    OperatorCase(
+        "pad",
+        "sima_grid_preserving",
+        lambda: LayoutAfterConvModel(
+            lambda value: torch.nn.functional.pad(value, (1, 1, 1, 1))
+        ),
+        IMAGE_INPUT,
+        (torch.ops.aten.pad.default,),
+        weighted=True,
+    ),
+    OperatorCase(
+        "reshape",
+        "sima_grid_preserving",
+        lambda: LayoutAfterConvModel(
+            lambda value: torch.reshape(value, (value.shape[0], 4, 64))
+        ),
+        IMAGE_INPUT,
+        (torch.ops.aten.reshape.default,),
+        weighted=True,
+    ),
+    OperatorCase(
+        "split",
+        "sima_split",
+        SplitAfterConvModel,
+        IMAGE_INPUT,
+        (torch.ops.aten.split.Tensor,),
+        weighted=True,
+    ),
+    OperatorCase(
+        "depth_to_space",
+        "sima_grid_preserving",
+        lambda: LayoutAfterConvModel(lambda value: torch.pixel_shuffle(value, 2)),
+        IMAGE_INPUT,
+        (torch.ops.aten.pixel_shuffle.default,),
+        weighted=True,
+    ),
+    OperatorCase(
+        "space_to_depth",
+        "sima_grid_preserving",
+        lambda: LayoutAfterConvModel(lambda value: torch.pixel_unshuffle(value, 2)),
+        IMAGE_INPUT,
+        (torch.ops.aten.pixel_unshuffle.default,),
+        weighted=True,
+    ),
+    OperatorCase(
+        "transpose",
+        "sima_grid_preserving",
+        lambda: LayoutAfterConvModel(lambda value: value.transpose(2, 3)),
+        IMAGE_INPUT,
+        (torch.ops.aten.transpose.int,),
+        weighted=True,
+    ),
+    OperatorCase(
+        "tile",
+        "sima_grid_preserving",
+        lambda: LayoutAfterConvModel(lambda value: torch.tile(value, (1, 1, 2, 1))),
+        IMAGE_INPUT,
+        (torch.ops.aten.tile.default,),
+        weighted=True,
+    ),
 )
 
 
@@ -519,7 +895,7 @@ PROPAGATED_CASES = (
 
 ALL_OPERATOR_CASES = OPERATOR_CASES + PROPAGATED_CASES
 WEIGHTED_CASES = tuple(case for case in ALL_OPERATOR_CASES if case.weighted)
-ONNX_CASES = tuple(case for case in ALL_OPERATOR_CASES if case.onnx_family is not None)
+ONNX_CASES = tuple(case for case in ALL_OPERATOR_CASES if case.name in ONNX_TEST_CASE_IDS)
 
 
 def case_ids(case: OperatorCase) -> str:

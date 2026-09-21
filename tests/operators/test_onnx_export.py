@@ -57,5 +57,8 @@ def test_operator_family_exports_standard_qdq_and_matches_onnxruntime(case, tmp_
         onnx_output,
         torch_output,
         rtol=1e-5,
-        atol=output_quantum + 1e-6,
+        # PyTorch and ONNX Runtime may round an intermediate QDQ edge in
+        # opposite directions. Two output quanta bounds that legitimate
+        # difference while remaining tied to the exported quantization grid.
+        atol=2 * output_quantum + 1e-6,
     )

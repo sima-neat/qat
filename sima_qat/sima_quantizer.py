@@ -315,6 +315,14 @@ class SimaQuantizer(Quantizer):
         "sima_layer_norm",
         "sima_erf",
         "sima_gelu",
+        "sima_unary_int8",
+        "sima_binary_int8",
+        "sima_einsum",
+        "sima_pow",
+        "sima_prelu",
+        "sima_reduction",
+        "sima_global_max_pool2d",
+        "sima_mixed_output",
         "sima_conv_add_or_mul_const",
         "sima_conv_hardtanh",
         "conv_relu",
@@ -323,6 +331,8 @@ class SimaQuantizer(Quantizer):
         # Conv2d module/weight is reused. Finish those invocations after the
         # normal Conv and fusion annotators have run.
         "sima_unannotated_conv2d",
+        "sima_grid_preserving",
+        "sima_split",
         "adaptive_avg_pool2d",
         "sima_add_hardtanh",
         "add_relu",
@@ -463,9 +473,32 @@ class SimaQuantizer(Quantizer):
         return model
 
     def validate(self, model: torch.fx.GraphModule) -> None:
+        unsupported_w8a8 = {
+            torch.ops.aten.conv_transpose2d.input: (
+                "ConvTranspose2d needs an output-channel weight qspec; the current "
+                "per-channel axis-0 QAT contract is not correct for ONNX ConvTranspose"
+            ),
+            torch.ops.aten.embedding.default: (
+                "Embedding/Gather is not supported by the compiler's INT8 contract"
+            ),
+            torch.ops.aten.grid_sampler_2d.default: (
+                "GridSample is not supported by the compiler's INT8 contract"
+            ),
+            torch.ops.aten.grid_sampler.default: (
+                "GridSample is not supported by the compiler's INT8 contract"
+            ),
+            torch.ops.aten.amin.default: (
+                "ReduceMin is not supported by the compiler's INT8 contract"
+            ),
+            torch.ops.aten.cumsum.default: (
+                "CumSum is not supported by the compiler's INT8 contract"
+            ),
+        }
         for node in model.graph.nodes:
             if node.op != "call_function":
                 continue
+            if node.target in unsupported_w8a8:
+                raise ValueError(f"SiMa INT8 QAT: {unsupported_w8a8[node.target]}")
             if node.target == torch.ops.aten.gelu.default:
                 approximate = _node_argument(node, 1, "approximate", "none")
                 if approximate != "none":
@@ -504,6 +537,319 @@ def _annotate_single_aten_op(
         )
         annotated_partitions.append([op_node])
     return annotated_partitions
+
+
+def _annotate_tensor_inputs(
+    node: Node,
+    inputs: List[Node],
+    quantization_config: QuantizationConfig,
+    *,
+    output_qspec: bool = True,
+) -> None:
+    """Annotate explicit floating tensor operands and an optional float output."""
+    input_qspec = get_input_act_qspec(quantization_config)
+    node.meta["quantization_annotation"] = QuantizationAnnotation(
+        input_qspec_map={value: input_qspec for value in inputs},
+        output_qspec=(
+            get_output_act_qspec(quantization_config) if output_qspec else None
+        ),
+        _annotated=True,
+    )
+
+
+@register_annotator("sima_unary_int8")
+def _sima_annotate_unary_int8(
+    gm: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Annotate compiler-supported unary activation and normalization kernels."""
+    return _annotate_single_aten_op(
+        gm,
+        quantization_config,
+        (
+            torch.ops.aten.abs.default,
+            torch.ops.aten.elu.default,
+            torch.ops.aten.exp.default,
+            torch.ops.aten.hardsigmoid.default,
+            torch.ops.aten.hardswish.default,
+            torch.ops.aten.instance_norm.default,
+            torch.ops.aten.leaky_relu.default,
+            torch.ops.aten.log.default,
+            torch.ops.aten.log_softmax.int,
+            torch.ops.aten.neg.default,
+            torch.ops.aten.reciprocal.default,
+            torch.ops.aten.softplus.default,
+            torch.ops.aten.sqrt.default,
+            torch.ops.aten.tanh.default,
+            torch.ops.aten.upsample_nearest2d.vec,
+            torch.ops.aten.upsample_bilinear2d.vec,
+        ),
+        filter_fn,
+    )
+
+
+@register_annotator("sima_binary_int8")
+def _sima_annotate_binary_int8(
+    gm: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Annotate supported two-tensor arithmetic without quantizing scalar metadata."""
+    targets = {torch.ops.aten.div.Tensor, torch.ops.aten.sub.Tensor}
+    annotated = []
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target not in targets:
+            continue
+        if _is_annotated([node]) or (filter_fn and not filter_fn(node)):
+            continue
+        inputs = [value for value in node.args[:2] if isinstance(value, Node)]
+        if not inputs or any(_is_input_non_float_tensor(value) for value in inputs):
+            continue
+        _annotate_tensor_inputs(node, inputs, quantization_config)
+        annotated.append([node])
+    return annotated
+
+
+@register_annotator("sima_einsum")
+def _sima_annotate_einsum(
+    gm: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    annotated = []
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.einsum.default:
+            continue
+        if _is_annotated([node]) or (filter_fn and not filter_fn(node)):
+            continue
+        operands = node.args[1] if len(node.args) > 1 else ()
+        inputs = [value for value in operands if isinstance(value, Node)]
+        if len(inputs) != 2 or any(_is_input_non_float_tensor(value) for value in inputs):
+            continue
+        _annotate_tensor_inputs(node, inputs, quantization_config)
+        annotated.append([node])
+    return annotated
+
+
+@register_annotator("sima_pow")
+def _sima_annotate_pow(
+    gm: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Quantize the Pow base while preserving its required scalar exponent."""
+    return _annotate_single_aten_op(
+        gm, quantization_config, (torch.ops.aten.pow.Tensor_Scalar,), filter_fn
+    )
+
+
+@register_annotator("sima_prelu")
+def _sima_annotate_prelu(
+    gm: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    annotated = []
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.prelu.default:
+            continue
+        if _is_annotated([node]) or (filter_fn and not filter_fn(node)):
+            continue
+        activation, slope = node.args[:2]
+        if not isinstance(activation, Node) or not isinstance(slope, Node):
+            continue
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map={
+                activation: get_input_act_qspec(quantization_config),
+                # PReLU alpha is a 1D compiler operand rather than a Conv/Linear
+                # weight tensor. Per-channel weight observers require rank >= 2.
+                slope: get_input_act_qspec(quantization_config),
+            },
+            output_qspec=get_output_act_qspec(quantization_config),
+            _annotated=True,
+        )
+        annotated.append([node])
+    return annotated
+
+
+@register_annotator("sima_reduction")
+def _sima_annotate_reduction(
+    gm: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Use independent output grids for reductions that change value ranges."""
+    return _annotate_single_aten_op(
+        gm,
+        quantization_config,
+        (
+            torch.ops.aten.amax.default,
+            torch.ops.aten.linalg_vector_norm.default,
+            torch.ops.aten.logsumexp.default,
+            torch.ops.aten.mean.dim,
+            torch.ops.aten.sum.dim_IntList,
+        ),
+        filter_fn,
+    )
+
+
+@register_annotator("sima_global_max_pool2d")
+def _sima_annotate_global_max_pool2d(
+    gm: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Annotate only the value output of adaptive/global max pooling."""
+    annotated = []
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.adaptive_max_pool2d.default:
+            continue
+        if _is_annotated([node]) or (filter_fn and not filter_fn(node)):
+            continue
+        input_node = node.args[0]
+        if not isinstance(input_node, Node):
+            continue
+        _annotate_tensor_inputs(node, [input_node], quantization_config, output_qspec=False)
+        value_users = [
+            user
+            for user in node.users
+            if user.op == "call_function"
+            and user.target is operator.getitem
+            and len(user.args) > 1
+            and user.args[1] == 0
+        ]
+        for value_node in value_users:
+            value_node.meta["quantization_annotation"] = QuantizationAnnotation(
+                output_qspec=get_output_act_qspec(quantization_config),
+                _annotated=True,
+            )
+        annotated.append([node, *value_users])
+    return annotated
+
+
+@register_annotator("sima_mixed_output")
+def _sima_annotate_mixed_output(
+    gm: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Quantize float inputs/values while preserving integer result tensors."""
+    annotated = []
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target not in {
+            torch.ops.aten.argmax.default,
+            torch.ops.aten.topk.default,
+        }:
+            continue
+        if _is_annotated([node]) or (filter_fn and not filter_fn(node)):
+            continue
+        input_node = node.args[0]
+        if not isinstance(input_node, Node):
+            continue
+        _annotate_tensor_inputs(node, [input_node], quantization_config, output_qspec=False)
+        partition = [node]
+        if node.target == torch.ops.aten.topk.default:
+            value_users = [
+                user
+                for user in node.users
+                if user.op == "call_function"
+                and user.target is operator.getitem
+                and len(user.args) > 1
+                and user.args[1] == 0
+            ]
+            for value_node in value_users:
+                value_node.meta["quantization_annotation"] = QuantizationAnnotation(
+                    output_qspec=get_output_act_qspec(quantization_config),
+                    _annotated=True,
+                )
+            partition.extend(value_users)
+        annotated.append(partition)
+    return annotated
+
+
+@register_annotator("sima_grid_preserving")
+def _sima_annotate_grid_preserving(
+    gm: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Share an existing activation grid across value-preserving layout operators."""
+    targets = {
+        torch.ops.aten.expand.default,
+        torch.ops.aten.flatten.using_ints,
+        torch.ops.aten.pad.default,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.pixel_shuffle.default,
+        torch.ops.aten.pixel_unshuffle.default,
+        torch.ops.aten.repeat.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.tile.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.view.default,
+    }
+    annotated = []
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target not in targets:
+            continue
+        if _is_annotated([node]) or (filter_fn and not filter_fn(node)):
+            continue
+        input_node = node.args[0]
+        if not isinstance(input_node, Node):
+            continue
+        source_annotation = input_node.meta.get("quantization_annotation")
+        if source_annotation is None or source_annotation.output_qspec is None:
+            continue
+        shared_qspec = SharedQuantizationSpec(input_node)
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map={input_node: shared_qspec},
+            output_qspec=shared_qspec,
+            _annotated=True,
+        )
+        annotated.append([node])
+    return annotated
+
+
+@register_annotator("sima_split")
+def _sima_annotate_split(
+    gm: torch.fx.GraphModule,
+    quantization_config: QuantizationConfig,
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> List[List[Node]]:
+    """Propagate the input grid independently to every tensor-valued split output."""
+    annotated = []
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target not in {
+            torch.ops.aten.split.Tensor,
+            torch.ops.aten.split_with_sizes.default,
+        }:
+            continue
+        if _is_annotated([node]) or (filter_fn and not filter_fn(node)):
+            continue
+        input_node = node.args[0]
+        if not isinstance(input_node, Node):
+            continue
+        source_annotation = input_node.meta.get("quantization_annotation")
+        if source_annotation is None or source_annotation.output_qspec is None:
+            continue
+        shared_qspec = SharedQuantizationSpec(input_node)
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map={input_node: shared_qspec},
+            _annotated=True,
+        )
+        outputs = [
+            user
+            for user in node.users
+            if user.op == "call_function" and user.target is operator.getitem
+        ]
+        for output in outputs:
+            output.meta["quantization_annotation"] = QuantizationAnnotation(
+                output_qspec=shared_qspec,
+                _annotated=True,
+            )
+        annotated.append([node, *outputs])
+    return annotated
 
 
 def _node_argument(node: Node, position: int, name: str, default: Any) -> Any:
