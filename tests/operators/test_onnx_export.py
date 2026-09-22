@@ -99,15 +99,15 @@ def test_operator_family_exports_standard_qdq_and_matches_onnxruntime(case, tmp_
     onnx_output = session.run(None, feed)[0]
 
     assert np.isfinite(onnx_output).all()
-    # The global_average_pool fixture pools to -3.5 input-grid codes. Reduction order can
-    # cross that rounding tie; its following convolution amplifies the one-code
-    # operand difference to two output codes. Do not extend this budget to
-    # unrelated operators or derive it from a larger intermediate scale.
+    # Both average-pool fixtures contain input-grid rounding ties. Float
+    # reduction order can cross those ties; the following convolution amplifies
+    # a one-code operand difference to two output codes. Keep this budget local
+    # to these fixtures, using their output scale, not an intermediate scale.
     _assert_runtime_parity(
         onnx_output,
         torch_output,
         output_quantum,
-        output_quanta=2 if case.name == "global_average_pool" else 1,
+        output_quanta=2 if case.name in {"adaptive_avg_pool2d", "global_average_pool"} else 1,
     )
 
 
@@ -124,3 +124,15 @@ def test_parity_rejects_inverted_probabilities_despite_large_input_scale() -> No
                 np.array([[1.0, 0.0]]), np.array([[0.0, 1.0]]), quantum,
                 output_quanta=quanta,
             )
+
+
+def test_parity_bounds_pooling_roundoff_to_two_output_codes() -> None:
+    quantum = 0.005
+    expected = np.zeros(4, dtype=np.float32)
+    _assert_runtime_parity(
+        expected + 2 * quantum, expected, quantum, output_quanta=2,
+    )
+    with pytest.raises(AssertionError):
+        _assert_runtime_parity(
+            expected + 3 * quantum, expected, quantum, output_quanta=2,
+        )
