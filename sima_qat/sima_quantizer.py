@@ -468,8 +468,13 @@ def _annotate_single_aten_op(
 
         input_qspec_map = {}
         input_act = op_node.args[0]
-        if isinstance(input_act, Node):
-            input_qspec_map[input_act] = get_input_act_qspec(quantization_config)
+        if (
+            not isinstance(input_act, Node)
+            or _is_input_non_float_tensor(input_act)
+            or _is_input_non_float_tensor(op_node)
+        ):
+            continue
+        input_qspec_map[input_act] = get_input_act_qspec(quantization_config)
         op_node.meta["quantization_annotation"] = QuantizationAnnotation(
             input_qspec_map=input_qspec_map,
             output_qspec=get_output_act_qspec(quantization_config),

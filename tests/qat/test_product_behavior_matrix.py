@@ -414,8 +414,9 @@ def test_dynamic_batch_failure_leaves_source_and_batchnorm_unchanged() -> None:
     _assert_source_equal(source, snapshot)
 
 
-def test_dynamic_batch_rejects_semantically_different_batch_branch() -> None:
-    example = torch.ones(1, 4)
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+def test_dynamic_batch_rejects_semantically_different_batch_branch(batch_size) -> None:
+    example = torch.ones(batch_size, 4)
     source = BatchDependentBranch()
     expected = source(example)
 
@@ -423,6 +424,16 @@ def test_dynamic_batch_rejects_semantically_different_batch_branch() -> None:
         sima_prepare_qat_model(source, (example,), "cpu")
 
     torch.testing.assert_close(source(example), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_dynamic_batch_rejects_narrowed_batch_range(batch_size) -> None:
+    class BatchThreshold(nn.Module):
+        def forward(self, inputs):
+            return inputs + 10 if inputs.shape[0] >= 4 else inputs - 10
+
+    with pytest.raises(RuntimeError, match="dynamic_batch=False"):
+        sima_prepare_qat_model(BatchThreshold(), (torch.ones(batch_size, 4),), "cpu")
 
 
 def test_dynamic_batch_parity_reuses_rng_for_stochastic_outputs() -> None:

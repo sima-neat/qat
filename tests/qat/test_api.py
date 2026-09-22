@@ -7,6 +7,7 @@ import onnx
 import pytest
 import torch
 from torch import nn
+from torch.ao.quantization import disable_fake_quant, disable_observer
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
 
 import sima_qat
@@ -127,10 +128,12 @@ def test_repeated_lifecycle_calls_are_idempotent() -> None:
     torch.testing.assert_close(repeated(inputs), finalized(inputs), rtol=0, atol=0)
 
 
-def test_prepare_accepts_dynamic_training_batch_by_default() -> None:
-    example = torch.randn(1, 2, 4)
+@pytest.mark.parametrize("capture_batch", [1, 2, 4])
+def test_prepare_accepts_dynamic_training_batch_by_default(capture_batch) -> None:
+    example = torch.randn(capture_batch, 2, 4)
+    source = BatchTokenLinear()
     prepared = sima_prepare_qat_model(
-        BatchTokenLinear(),
+        source,
         (example,),
         "cpu",
     )
@@ -138,6 +141,12 @@ def test_prepare_accepts_dynamic_training_batch_by_default() -> None:
     for batch_size in (1, 2, 4):
         output = prepared(torch.randn(batch_size, 2, 4))
         assert output.shape == (batch_size, 3, 4)
+
+    prepared.apply(disable_fake_quant)
+    prepared.apply(disable_observer)
+    for batch_size in (1, 2, 4):
+        inputs = torch.randn(batch_size, 2, 4)
+        torch.testing.assert_close(prepared(inputs), source(inputs))
 
 
 def test_dynamic_training_model_exports_static_batch_one(tmp_path) -> None:

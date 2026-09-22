@@ -90,8 +90,8 @@ class CumSumModel(nn.Module):
         return torch.cumsum(inputs, dim=1)
 
 
-def _converted_cat(model: nn.Module, inputs: Tensor) -> torch.fx.Node:
-    prepared = sima_prepare_qat_model(model, (inputs,), "cpu")
+def _converted_cat(model: nn.Module, inputs: Tensor, *, dynamic_batch=True) -> torch.fx.Node:
+    prepared = sima_prepare_qat_model(model, (inputs,), "cpu", dynamic_batch=dynamic_batch)
     prepared(inputs)
     converted = sima_finalize_qat_model(prepared)
     return next(
@@ -140,7 +140,11 @@ def test_repeated_input_concat_reuses_the_payload_grid() -> None:
 
 @pytest.mark.parametrize("identity", [0.0, 1.0])
 def test_identity_padding_concat_reuses_the_payload_grid(identity: float) -> None:
-    cat = _converted_cat(IdentityPaddingConcat(identity), torch.randn(4, 3, 8, 8))
+    # Batch slicing generates a narrowed Torch shape guard; this test checks
+    # concat quantization, not dynamic capture, so use the fixed-batch fallback.
+    cat = _converted_cat(
+        IdentityPaddingConcat(identity), torch.randn(4, 3, 8, 8), dynamic_batch=False
+    )
     input_dequantizers = list(cat.args[0])
     output_quantizer = next(
         user
@@ -217,6 +221,73 @@ def test_integer_matmul_operands_are_not_qat_annotated() -> None:
 
     assert not getattr(mm.meta.get("quantization_annotation"), "_annotated", False)
     assert not any(isinstance(module, FakeQuantizeBase) for module in prepared.modules())
+
+
+@pytest.mark.parametrize("operation", [torch.abs, torch.neg])
+def test_integer_unary_index_path_is_not_quantized(operation) -> None:
+    class Indexed(nn.Module):
+        def forward(self, inputs, indices):
+            return inputs[:, operation(indices)]
+
+    inputs = (
+        torch.arange(20, dtype=torch.float32).reshape(4, 5),
+        torch.tensor([-1, -2, -3], dtype=torch.int64),
+    )
+    prepared = sima_prepare_qat_model(Indexed(), inputs, "cpu")
+    torch.testing.assert_close(prepared(*inputs), Indexed()(*inputs), rtol=0, atol=0)
+    assert not any(isinstance(module, FakeQuantizeBase) for module in prepared.modules())
+    finalized = sima_finalize_qat_model(prepared)
+    assert not any("quantize_per" in str(node.target) for node in finalized.graph.nodes)
+    torch.testing.assert_close(finalized(*inputs), Indexed()(*inputs), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("operation", [torch.abs, torch.neg])
+def test_float_unary_path_remains_quantized(operation) -> None:
+    class Unary(nn.Module):
+        def forward(self, inputs):
+            return operation(inputs)
+
+    prepared = sima_prepare_qat_model(Unary(), (torch.randn(2, 4),), "cpu")
+    assert any(isinstance(module, FakeQuantizeBase) for module in prepared.modules())
+    assert torch.isfinite(prepared(torch.randn(2, 4))).all()
+
+
+@pytest.mark.parametrize("operation", [torch.log, torch.reciprocal])
+def test_freeze_rejects_domains_invalidated_by_input_quantization(operation) -> None:
+    class Unary(nn.Module):
+        def forward(self, inputs):
+            return operation(inputs)
+
+    inputs = torch.tensor([[1e-6, 0.25, 0.5, 1.0]])
+    assert torch.isfinite(Unary()(inputs)).all()
+    prepared = sima_prepare_qat_model(Unary(), (inputs,), "cpu")
+    prepared(inputs)
+    with pytest.raises(RuntimeError, match="Invalid activation qparams.*operator domains"):
+        sima_freeze_qat(prepared)
+    assert not bool(prepared.qat_frozen.item())
+    assert all(
+        bool(module.observer_enabled.item())
+        for module in prepared.modules()
+        if isinstance(module, FakeQuantizeBase)
+    )
+
+
+@pytest.mark.parametrize("invalid_scale", [float("nan"), float("inf"), 0.0, -1.0])
+def test_freeze_validates_activation_scales_without_weighted_ops(invalid_scale, monkeypatch) -> None:
+    inputs = torch.randn(2, 4)
+    prepared = sima_prepare_qat_model(nn.Sigmoid(), (inputs,), "cpu")
+    prepared(inputs)
+    quantizer = next(
+        module for module in prepared.modules() if isinstance(module, FakeQuantizeBase)
+    )
+    monkeypatch.setattr(
+        quantizer.activation_post_process, "calculate_qparams",
+        lambda: (torch.tensor([invalid_scale]), torch.tensor([0])),
+    )
+    with pytest.raises(RuntimeError, match="scales must be finite and positive"):
+        sima_freeze_qat(prepared)
+    assert not bool(prepared.qat_frozen.item())
+    assert bool(quantizer.observer_enabled.item())
 
 
 @pytest.mark.parametrize(

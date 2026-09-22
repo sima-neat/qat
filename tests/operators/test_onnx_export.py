@@ -1,6 +1,5 @@
 """Representative ONNX QDQ and ONNX Runtime parity tests by operator family."""
 
-import math
 import warnings
 
 import numpy as np
@@ -8,26 +7,38 @@ import onnx
 import onnxruntime
 import pytest
 import torch
+from torch.ao.quantization.fake_quantize import FakeQuantizeBase
+from torch.utils._pytree import tree_leaves
 
-from sima_qat import sima_export_onnx, sima_finalize_qat_model, sima_freeze_qat
+from sima_qat import (
+    sima_export_onnx,
+    sima_finalize_qat_model,
+    sima_freeze_qat,
+    sima_prepare_qat_model,
+)
 
 from .cases import ONNX_CASES, case_ids
-from .helpers import fake_quantizers, prepare_case
+from .helpers import prepare_case
 
 
 pytestmark = pytest.mark.regression
 
-_ACCUMULATION_OUTLIER_FRACTION = 0.001
-_ACCUMULATION_OUTLIER_QUANTA = 16
 
-
-def _largest_activation_quantum(model) -> float:
-    scales = [
-        float(module.scale.detach().abs().max())
-        for module in fake_quantizers(model)
-        if module.qscheme in (torch.per_tensor_affine, torch.per_tensor_symmetric)
-    ]
-    return max(scales, default=0.0)
+def _output_quantum(model) -> float:
+    output = next(node for node in model.graph.nodes if node.op == "output")
+    leaves = tree_leaves(output.args[0])
+    assert len(leaves) == 1, "Each output needs its own parity budget"
+    node = leaves[0]
+    # Selection preserves the grid, unlike arbitrary arithmetic upstream.
+    while node.op == "call_function" and node.target == torch.ops.aten.select.int:
+        node = node.args[0]
+    if node.op == "call_module":
+        module = model.get_submodule(node.target)
+        assert isinstance(module, FakeQuantizeBase)
+        assert module.scale.numel() == 1
+        return float(module.scale.detach().item())
+    assert not node.meta["val"].is_floating_point(), "Output has no known quantization grid"
+    return 0.0
 
 
 def _assert_runtime_parity(
@@ -35,38 +46,16 @@ def _assert_runtime_parity(
     expected: np.ndarray,
     output_quantum: float,
     *,
-    weighted: bool,
+    output_quanta: int = 1,
 ) -> None:
-    base_atol = 2 * output_quantum + 1e-6
-    if not weighted:
-        np.testing.assert_allclose(
-            actual,
-            expected,
-            rtol=1e-5,
-            atol=base_atol,
-        )
+    if np.issubdtype(expected.dtype, np.integer):
+        np.testing.assert_array_equal(actual, expected)
         return
-
-    # A value exactly on a QDQ boundary can round by one code in PyTorch and
-    # the other direction in ONNX Runtime. Weighted accumulation can amplify
-    # that isolated operand difference into several output code points. Keep
-    # the ordinary two-quantum bound for virtually the whole tensor, then cap
-    # both the count and magnitude of those isolated accumulation outliers.
-    close = np.isclose(actual, expected, rtol=1e-5, atol=base_atol)
-    outlier_count = int(np.count_nonzero(~close))
-    max_outliers = max(
-        1,
-        math.ceil(actual.size * _ACCUMULATION_OUTLIER_FRACTION),
-    )
-    assert outlier_count <= max_outliers, (
-        f"{outlier_count}/{actual.size} weighted outputs exceed the "
-        f"two-quantum tolerance; allowed {max_outliers}"
-    )
     np.testing.assert_allclose(
         actual,
         expected,
         rtol=1e-5,
-        atol=_ACCUMULATION_OUTLIER_QUANTA * output_quantum + 1e-6,
+        atol=output_quanta * output_quantum + 1e-6,
     )
 
 
@@ -74,7 +63,7 @@ def _assert_runtime_parity(
 def test_operator_family_exports_standard_qdq_and_matches_onnxruntime(case, tmp_path) -> None:
     prepared, inputs = prepare_case(case)
     sima_freeze_qat(prepared)
-    output_quantum = _largest_activation_quantum(prepared)
+    output_quantum = _output_quantum(prepared)
     finalized = sima_finalize_qat_model(prepared)
 
     output_path = tmp_path / f"{case.name}.onnx"
@@ -94,8 +83,13 @@ def test_operator_family_exports_standard_qdq_and_matches_onnxruntime(case, tmp_
 
     with torch.no_grad():
         torch_output = finalized(*inputs).detach().cpu().numpy()
+    # Test exported QDQ semantics, not ORT's fused integer kernels, whose
+    # operand rounding can accumulate differently from the explicit graph.
+    options = onnxruntime.SessionOptions()
+    options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
     session = onnxruntime.InferenceSession(
         str(output_path),
+        sess_options=options,
         providers=["CPUExecutionProvider"],
     )
     feed = {
@@ -105,9 +99,28 @@ def test_operator_family_exports_standard_qdq_and_matches_onnxruntime(case, tmp_
     onnx_output = session.run(None, feed)[0]
 
     assert np.isfinite(onnx_output).all()
+    # The global_average_pool fixture pools to -3.5 input-grid codes. Reduction order can
+    # cross that rounding tie; its following convolution amplifies the one-code
+    # operand difference to two output codes. Do not extend this budget to
+    # unrelated operators or derive it from a larger intermediate scale.
     _assert_runtime_parity(
         onnx_output,
         torch_output,
         output_quantum,
-        weighted=case.weighted,
+        output_quanta=2 if case.name == "global_average_pool" else 1,
     )
+
+
+def test_parity_rejects_inverted_probabilities_despite_large_input_scale() -> None:
+    inputs = (torch.tensor([[-100.0, 100.0]]),)
+    prepared = sima_prepare_qat_model(torch.nn.Softmax(dim=-1), inputs, "cpu")
+    prepared(*inputs)
+    sima_freeze_qat(prepared)
+    quantum = _output_quantum(prepared)
+    assert quantum == pytest.approx(1 / 255)
+    for quanta in (1, 2):
+        with pytest.raises(AssertionError):
+            _assert_runtime_parity(
+                np.array([[1.0, 0.0]]), np.array([[0.0, 1.0]]), quantum,
+                output_quanta=quanta,
+            )

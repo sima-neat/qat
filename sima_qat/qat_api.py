@@ -107,16 +107,20 @@ def sima_prepare_qat_model(
                 capture_inputs,
                 dynamic_shapes=dynamic_shapes,
             ).module()
-            # A duplicated batch-one capture can export successfully while
-            # hard-wiring a different branch or internal geometry. Re-run both
-            # isolated models with identical CPU RNG state and require semantic
-            # parity on the exact example supplied by the caller.
-            validation_model = copy.deepcopy(m)
-            _validate_capture_output_parity(
-                reference_model,
-                validation_model,
-                capture_example_inputs,
-            )
+            # Torch treats batch one specially even with an explicit Dim.
+            # Check that boundary as well as the original example, using fresh
+            # copies so validation cannot change training buffers or inputs.
+            validation_inputs = [capture_example_inputs]
+            if dynamic_shapes is not None:
+                validation_inputs.append(tree_map(
+                    lambda value, shape: value[:1] if shape else value,
+                    capture_example_inputs,
+                    dynamic_shapes,
+                ))
+            for example in validation_inputs:
+                _validate_capture_output_parity(
+                    copy.deepcopy(reference_model), copy.deepcopy(m), example
+                )
         except Exception as error:
             raise RuntimeError(
                 "Dynamic-batch QAT capture does not preserve the original "
@@ -162,13 +166,13 @@ def _validate_capture_output_parity(
     captured_model: nn.Module,
     inputs: Tuple,
 ) -> None:
-    """Require dynamic capture to preserve the original-example output pytree."""
+    """Require dynamic capture to preserve the given example's output pytree."""
 
     with torch.random.fork_rng(devices=[]), torch.no_grad():
         cpu_rng_state = torch.get_rng_state()
-        reference_output = reference_model(*inputs)
+        reference_output = reference_model(*copy.deepcopy(inputs))
         torch.set_rng_state(cpu_rng_state)
-        captured_output = captured_model(*inputs)
+        captured_output = captured_model(*copy.deepcopy(inputs))
 
     reference_leaves, reference_spec = tree_flatten(reference_output)
     captured_leaves, captured_spec = tree_flatten(captured_output)
@@ -203,7 +207,9 @@ def _dynamic_batch_capture(inputs: Tuple) -> Tuple[Tuple, Optional[Any]]:
     example because Torch specializes dimensions whose example value is one.
     The caller can disable this behavior through :func:`sima_prepare_qat_model`
     when the model intentionally requires a fixed batch. The exported graph is
-    validated on the original inputs before being returned.
+    validated on the original inputs and the batch-one boundary before being
+    returned. Explicit shape hints reject narrowed batch ranges; parity probes
+    supplement those constraints rather than proving arbitrary-batch parity.
     """
     leaves, _ = tree_flatten(inputs)
     tensor_inputs = [
@@ -227,9 +233,10 @@ def _dynamic_batch_capture(inputs: Tuple) -> Tuple[Tuple, Optional[Any]]:
         ),
         inputs,
     )
+    batch_dim = Dim("batch", min=1)
     dynamic_shapes = tree_map(
         lambda tensor: (
-            {0: Dim.AUTO}
+            {0: batch_dim}
             if isinstance(tensor, Tensor) and is_batched(tensor)
             else None
         ),
@@ -647,7 +654,7 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
     # staged rows until every graph constraint validates so freeze remains
     # atomic even when output-grid coarsening is required.
     activation_qparams = []
-    for fake_quant in qat_model.modules():
+    for name, fake_quant in qat_model.named_modules():
         if (
             not isinstance(fake_quant, FakeQuantizeBase)
             or getattr(fake_quant, "is_per_channel", False)
@@ -660,9 +667,20 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
                 "Shift-aware QAT could not calculate valid activation qparams "
                 f"from {type(fake_quant.activation_post_process).__name__}: {error}"
             ) from error
+        scale = scale.to(device=fake_quant.scale.device, dtype=fake_quant.scale.dtype)
+        if (
+            not bool(torch.isfinite(scale).all() and (scale > 0).all())
+            or not bool(torch.isfinite(zero_point).all())
+        ):
+            raise RuntimeError(
+                f"Invalid activation qparams for {name}: scales must be finite "
+                "and positive and zero points finite. Check observed values and "
+                "operator domains after input quantization (for example, log "
+                "requires positive inputs and reciprocal requires nonzero inputs)."
+            )
         activation_qparams.append([
             fake_quant,
-            scale.to(device=fake_quant.scale.device, dtype=fake_quant.scale.dtype),
+            scale,
             zero_point.to(
                 device=fake_quant.zero_point.device,
                 dtype=fake_quant.zero_point.dtype,
