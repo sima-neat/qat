@@ -57,6 +57,10 @@ class ImageNet_Model_Trainer(L.LightningModule):
         self.save_hyperparameters()
 
     def configure_optimizers(self):
+        if self.use_qat:
+            # Preparation replaces the eager parameters with captured QAT
+            # parameters, so it must happen before the optimizer is built.
+            self._prepare_qat()
         optimizer = optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         return [optimizer]
     
@@ -117,13 +121,10 @@ class ImageNet_Model_Trainer(L.LightningModule):
     
     def on_train_start(self) -> None:
         super().on_train_start()
-        if self.use_qat:
-            self._prepare_qat()
-        else:
+        if not self.use_qat:
             # Do a compile so we can see an FX graph
             print(f"Compiling model to FX graph ...")
             self._dump_fx_graph('compiled_graph.txt')
-        pass
     
     def on_train_end(self) -> None:
         super().on_train_end()
