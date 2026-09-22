@@ -8,9 +8,8 @@ exported to an INT8 Q/DQ ONNX graph.
 
 **Required PyTorch:** 2.8.x (the provided environment pins 2.8.0; Python ≥ 3.10).
 
-See the [QAT documentation](docs/index.md) for installation, the complete
-training lifecycle, checkpoint/resume guidance, and the operator annotation
-contract.
+See the [QAT user guide](docs/index.md) for installation and the complete
+training-to-export workflow.
 
 ## Setup
 
