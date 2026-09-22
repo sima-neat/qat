@@ -50,19 +50,13 @@ Download the QAT package with `sima-cli`:
 sima-cli neat install qat
 ```
 
-The command downloads the wheel without changing the active Python
-environment. Activate the training environment and install the downloaded
-wheel:
+The command downloads the wheel and installs or refreshes the QAT coding-agent
+skill for Codex and Claude. It does not change the active Python environment.
+Activate the training environment and install the downloaded wheel:
 
 ```bash
 python -m pip install ./sima_qat-*.whl
 python -c "import torch, sima_qat; print(torch.__version__, sima_qat.__file__)"
-```
-
-Optionally install the QAT coding-agent skill for Codex and Claude:
-
-```bash
-sima-cli playbooks install gh:sima-neat/qat/skills/sima-qat
 ```
 
 ## Add QAT to a training project

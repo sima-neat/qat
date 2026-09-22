@@ -155,6 +155,7 @@ jobs:
             "${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}" \
             "${GITHUB_SHA}" <<'PY'
           import json
+          import shlex
           import sys
           from datetime import datetime, timezone
           from pathlib import Path
@@ -177,8 +178,15 @@ jobs:
                   "published_at_utc": datetime.now(timezone.utc).isoformat(),
               }
           )
-          metadata.setdefault("installation", {})["post-message"] = (
-              "[bold]sima-qat was downloaded but was not installed.[/bold]\n\n"
+          installation = metadata.setdefault("installation", {})
+          skill_source = f"gh:sima-neat/qat/skills/sima-qat@{ref}"
+          installation["script"] = (
+              "SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli playbooks install --force "
+              f"{shlex.quote(skill_source)}"
+          )
+          installation["post-message"] = (
+              "[bold]sima-qat was downloaded and its coding-agent skill was "
+              "installed.[/bold]\n\n"
               "Activate your PyTorch training environment, change to the "
               "download directory, then run:\n\n"
               f"  python -m pip install {wheel_name}\n"
