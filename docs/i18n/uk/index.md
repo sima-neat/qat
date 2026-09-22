@@ -107,7 +107,12 @@ criterion = torch.nn.CrossEntropyLoss()
 квантування, а потім продовжте навчання, щоб модель відновила точність із
 зафіксованими сітками квантування.
 
+Під час перевірки залишайте псевдоквантування ввімкненим, але тимчасово вимикайте спостерігачі, щоб валідаційні дані не змінювали їхні діапазони. Самі лише `eval()` та `inference_mode()` не зупиняють спостерігачі. У `finally` відновлюйте їхні попередні стани, зокрема вимкнений стан після фіксації.
+
 ```python
+from torch.ao.quantization import disable_observer
+from torch.ao.quantization.fake_quantize import FakeQuantizeBase
+
 freeze_epoch = 2
 num_epochs = 4
 
@@ -128,7 +133,17 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
-    validate(qat_model, validation_loader, device)
+    observer_states = [
+        (module, module.observer_enabled.clone())
+        for module in qat_model.modules()
+        if isinstance(module, FakeQuantizeBase)
+    ]
+    try:
+        qat_model.apply(disable_observer)
+        validate(qat_model, validation_loader, device)
+    finally:
+        for module, enabled in observer_states:
+            module.observer_enabled.copy_(enabled)
 ```
 
 Епоха фіксації залежить від моделі. Корисною відправною точкою є прогрівання

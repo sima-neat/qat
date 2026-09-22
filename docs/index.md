@@ -107,7 +107,15 @@ Train normally at first so the observers can measure representative activation
 ranges. Freeze the quantization parameters after this warm-up, then continue
 training so the model can recover accuracy with locked quantization grids.
 
+During validation, keep fake quantization enabled but temporarily disable
+observers so held-out data cannot change their ranges. `eval()` and
+`inference_mode()` alone do not stop observers. Restore their previous states
+in `finally`, including observers already disabled by freezing.
+
 ```python
+from torch.ao.quantization import disable_observer
+from torch.ao.quantization.fake_quantize import FakeQuantizeBase
+
 freeze_epoch = 2
 num_epochs = 4
 
@@ -128,7 +136,17 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
-    validate(qat_model, validation_loader, device)
+    observer_states = [
+        (module, module.observer_enabled.clone())
+        for module in qat_model.modules()
+        if isinstance(module, FakeQuantizeBase)
+    ]
+    try:
+        qat_model.apply(disable_observer)
+        validate(qat_model, validation_loader, device)
+    finally:
+        for module, enabled in observer_states:
+            module.observer_enabled.copy_(enabled)
 ```
 
 The freeze epoch is model-dependent. A useful starting point is to warm up

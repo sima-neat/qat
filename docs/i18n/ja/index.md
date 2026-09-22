@@ -102,7 +102,12 @@ criterion = torch.nn.CrossEntropyLoss()
 このウォームアップ後に量子化パラメータを固定し、固定された量子化グリッドでモデルが
 精度を回復できるように学習を続けます。
 
+検証中は偽量子化を有効に保ち、検証データが観測範囲を変更しないようにオブザーバを一時的に無効にしてください。`eval()` と `inference_mode()` だけではオブザーバは停止しません。固定処理ですでに無効になっているものも含め、`finally` で元の状態に戻してください。
+
 ```python
+from torch.ao.quantization import disable_observer
+from torch.ao.quantization.fake_quantize import FakeQuantizeBase
+
 freeze_epoch = 2
 num_epochs = 4
 
@@ -123,7 +128,17 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
-    validate(qat_model, validation_loader, device)
+    observer_states = [
+        (module, module.observer_enabled.clone())
+        for module in qat_model.modules()
+        if isinstance(module, FakeQuantizeBase)
+    ]
+    try:
+        qat_model.apply(disable_observer)
+        validate(qat_model, validation_loader, device)
+    finally:
+        for module, enabled in observer_states:
+            module.observer_enabled.copy_(enabled)
 ```
 
 固定するエポックはモデルによって異なります。短い微調整の大部分でオブザーバを

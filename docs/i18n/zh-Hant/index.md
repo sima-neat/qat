@@ -96,7 +96,12 @@ criterion = torch.nn.CrossEntropyLoss()
 一開始請照常訓練，讓觀察器測量具代表性的啟用值範圍。完成預熱後凍結量化參數，
 再繼續訓練，讓模型在鎖定的量化網格下恢復準確度。
 
+驗證時請保持偽量化啟用，但暫時停用觀察器，避免驗證資料改變觀測範圍。僅使用 `eval()` 和 `inference_mode()` 不會停止觀察器。請在 `finally` 中還原先前狀態，包括凍結時已停用的觀察器。
+
 ```python
+from torch.ao.quantization import disable_observer
+from torch.ao.quantization.fake_quantize import FakeQuantizeBase
+
 freeze_epoch = 2
 num_epochs = 4
 
@@ -117,7 +122,17 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
-    validate(qat_model, validation_loader, device)
+    observer_states = [
+        (module, module.observer_enabled.clone())
+        for module in qat_model.modules()
+        if isinstance(module, FakeQuantizeBase)
+    ]
+    try:
+        qat_model.apply(disable_observer)
+        validate(qat_model, validation_loader, device)
+    finally:
+        for module, enabled in observer_states:
+            module.observer_enabled.copy_(enabled)
 ```
 
 凍結 epoch 取決於模型。實用的起點是在短期微調的大部分時間預熱觀察器，並保留

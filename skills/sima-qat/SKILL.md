@@ -96,6 +96,12 @@ training checkpoints.
 
 ## Validate each boundary
 
+During validation, leave fake quantization enabled but disable observers;
+`eval()` and `inference_mode()` do not stop them. Snapshot each fake-quantizer's
+`observer_enabled` buffer, apply `disable_observer`, then restore the saved
+buffers in `finally`, as shown in the user guide. Do not blindly re-enable
+observers: frozen or selectively disabled observers must stay disabled.
+
 Use representative validation data and record the task metric for:
 
 - the original floating-point model;

@@ -102,7 +102,12 @@ criterion = torch.nn.CrossEntropyLoss()
 워밍업 후 양자화 매개변수를 고정한 다음, 고정된 양자화 그리드에서 모델이 정확도를
 회복할 수 있도록 학습을 계속합니다.
 
+검증 중에는 가짜 양자화를 활성화한 채 옵저버를 일시적으로 비활성화하여 검증 데이터가 관측 범위를 바꾸지 않도록 하세요. `eval()`과 `inference_mode()`만으로는 옵저버가 멈추지 않습니다. 고정 단계에서 이미 비활성화된 옵저버도 포함하여 `finally`에서 이전 상태로 복원하세요.
+
 ```python
+from torch.ao.quantization import disable_observer
+from torch.ao.quantization.fake_quantize import FakeQuantizeBase
+
 freeze_epoch = 2
 num_epochs = 4
 
@@ -123,7 +128,17 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
-    validate(qat_model, validation_loader, device)
+    observer_states = [
+        (module, module.observer_enabled.clone())
+        for module in qat_model.modules()
+        if isinstance(module, FakeQuantizeBase)
+    ]
+    try:
+        qat_model.apply(disable_observer)
+        validate(qat_model, validation_loader, device)
+    finally:
+        for module, enabled in observer_states:
+            module.observer_enabled.copy_(enabled)
 ```
 
 고정 에포크는 모델에 따라 다릅니다. 짧은 미세 조정 실행의 대부분 동안 옵저버를 워밍업하고
