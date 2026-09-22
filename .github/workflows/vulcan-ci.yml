@@ -3,7 +3,6 @@ name: QAT Build, Test, and Publish
 run-name: ${{ github.event.pull_request.title || github.event.head_commit.message || github.ref_name || 'QAT CI' }} (${{ vars.VULCAN_ENV || 'production' }})
 
 on:
-  pull_request:
   push:
     branches:
       - "**"
