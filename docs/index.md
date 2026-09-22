@@ -44,10 +44,10 @@ The workflow is:
 The QAT wheel requires Python 3.10 or newer and PyTorch 2.8.x. Install it in the
 environment that already contains the model's training dependencies.
 
-Download a release, tag, or branch with `sima-cli`:
+Download the QAT package with `sima-cli`:
 
 ```bash
-sima-cli neat install qat@<release-or-branch>
+sima-cli neat install qat
 ```
 
 The command downloads the wheel without changing the active Python
