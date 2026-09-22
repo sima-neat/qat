@@ -71,7 +71,7 @@ def test_public_api_exposes_only_the_single_qat_mode() -> None:
         "dynamic_batch"
     ]
     assert dynamic_batch.kind is inspect.Parameter.KEYWORD_ONLY
-    assert dynamic_batch.default is False
+    assert dynamic_batch.default is True
 
     config = get_sima_quantization_config(is_qat=True)
     assert isinstance(config.weight.observer_or_fake_quant_ctr(), FakeQuantizeBase)
@@ -127,13 +127,12 @@ def test_repeated_lifecycle_calls_are_idempotent() -> None:
     torch.testing.assert_close(repeated(inputs), finalized(inputs), rtol=0, atol=0)
 
 
-def test_prepare_accepts_dynamic_training_batch() -> None:
+def test_prepare_accepts_dynamic_training_batch_by_default() -> None:
     example = torch.randn(1, 2, 4)
     prepared = sima_prepare_qat_model(
         BatchTokenLinear(),
         (example,),
         "cpu",
-        dynamic_batch=True,
     )
 
     for batch_size in (1, 2, 4):
@@ -147,7 +146,6 @@ def test_dynamic_training_model_exports_static_batch_one(tmp_path) -> None:
         BatchTokenLinear(),
         (example,),
         "cpu",
-        dynamic_batch=True,
     )
     prepared(example)
     sima_freeze_qat(prepared)
@@ -168,12 +166,13 @@ def test_dynamic_training_model_exports_static_batch_one(tmp_path) -> None:
     assert batch_dimension.dim_value == 1
 
 
-def test_static_capture_preserves_folded_batch_direction_geometry() -> None:
+def test_explicit_static_capture_preserves_folded_batch_direction_geometry() -> None:
     example = torch.randn(1, 4)
     prepared = sima_prepare_qat_model(
         FoldedBatchDirection(),
         (example,),
         "cpu",
+        dynamic_batch=False,
     )
 
     output = prepared(example)
@@ -181,14 +180,13 @@ def test_static_capture_preserves_folded_batch_direction_geometry() -> None:
     assert torch.isfinite(output).all()
 
 
-def test_dynamic_batch_opt_in_fails_closed_for_folded_geometry() -> None:
+def test_default_dynamic_batch_fails_closed_for_folded_geometry() -> None:
     example = torch.randn(1, 4)
     with pytest.raises(RuntimeError, match="Dynamic-batch QAT capture"):
         sima_prepare_qat_model(
             FoldedBatchDirection(),
             (example,),
             "cpu",
-            dynamic_batch=True,
         )
 
 
@@ -198,7 +196,6 @@ def test_dynamic_validation_does_not_mutate_returned_batchnorm_state() -> None:
         DynamicBatchNorm(),
         (example,),
         "cpu",
-        dynamic_batch=True,
     )
 
     running_means = [

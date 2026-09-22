@@ -166,7 +166,6 @@ def main() -> None:
         eager,
         (example,),
         device,
-        dynamic_batch=True,
     )
     del eager
     criterion = YOLO26Loss().to(device)

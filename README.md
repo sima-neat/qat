@@ -94,13 +94,12 @@ Pass-through forms are not errors: preparation, training, and export continue no
 They are listed explicitly so the package does not imply that fake quantization was applied where no
 annotator exists.
 
-Preparation preserves the exact example shapes by default. Models that are
-truly batch-polymorphic can opt in with
-`sima_prepare_qat_model(..., dynamic_batch=True)`. The opt-in capture is
-validated on the original example and fails closed when batch participates in
-folded recurrence, scan-direction, or layout geometry.
-This deliberately replaces prior automatic batch-one duplication; existing
-three-argument calls remain valid but now capture static shapes.
+Preparation keeps the leading tensor dimension dynamic by default so the same
+QAT graph can train with ordinary loader batch sizes and export with a concrete
+deployment batch. The capture is validated against the original model output.
+Models that intentionally require a fixed batch, including models that fold
+batch into recurrence, scan-direction, or layout geometry, can opt out with
+`sima_prepare_qat_model(..., dynamic_batch=False)`.
 Preparation captures isolated CPU copies of the module and example-input
 pytree, then moves only the returned QAT graph to `device`. The caller's
 module, parameters, buffers, training modes, devices, and input tensors are
@@ -108,7 +107,7 @@ left unchanged on both successful and failed capture.
 
 | function | purpose |
 |---|---|
-| `sima_prepare_qat_model(model, inputs, device, *, dynamic_batch=False)` | Capture the model and insert SiMa shift-aware fake-quant annotations. Dynamic training batch is explicit opt-in. |
+| `sima_prepare_qat_model(model, inputs, device, *, dynamic_batch=True)` | Capture the model and insert SiMa shift-aware fake-quant annotations. Set `dynamic_batch=False` only for intentionally fixed-batch models. |
 | `sima_freeze_qat(qat_model)` | Freeze observers and lock shift-aware weight scales before final fine-tuning. |
 | `sima_finalize_qat_model(qat_model)` | Fold the trained scaffolding into an inference-only quantized graph. |
 | `sima_export_onnx(qat_model, inputs, output_file, ...)` | Export the finalized model to an ONNX QuantizeLinear/DequantizeLinear graph. |

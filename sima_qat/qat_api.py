@@ -48,7 +48,7 @@ def sima_prepare_qat_model(
     inputs: Tuple,
     device: torch.device,
     *,
-    dynamic_batch: bool = False,
+    dynamic_batch: bool = True,
 ) -> GraphModule:
     """This function is the first transformation needed to perform QAT on a Pytorch model. It takes an
     eager-mode reference to the ML model and produces an FX version of the graph with special annotations
@@ -60,12 +60,13 @@ def sima_prepare_qat_model(
         QAT optimization will be limited to the graph given by the `input_graph` argument. This region
         must always be contained to the level of hierarchy as described by a single nn.Module.
 
-        Capture preserves the exact example shapes by default. This is required
-        for models that fold the batch dimension into recurrence, direction, or
-        channel geometry. Set ``dynamic_batch=True`` only when the model is
-        genuinely batch-polymorphic. Dynamic capture validates that the
-        resulting graph still executes the caller's original example before
-        QAT annotations are inserted.
+        The leading tensor dimension is treated as a dynamic batch by default,
+        allowing the prepared model to train with different batch sizes and
+        export with a concrete deployment batch. Set ``dynamic_batch=False``
+        for models that intentionally require a fixed batch or fold the batch
+        dimension into recurrence, direction, channel, or layout geometry.
+        Dynamic capture validates that the resulting graph preserves the
+        caller's original-example outputs before QAT annotations are inserted.
 
     Args:
         input_graph: an eager-mode `nn.Module` representing the model on which QAT is to be performed.
@@ -75,10 +76,10 @@ def sima_prepare_qat_model(
             process to build the compiled FX representation.
         device: a Pytorch `device` identifier. This will be the device on which the prepared model will
             be located after the preparation step is complete.
-        dynamic_batch: explicitly opt into a symbolic leading batch dimension
-            for tensor inputs sharing the first tensor's leading size. The
-            default is deliberately static. Existing three-argument calls
-            remain source-compatible and preserve the supplied example shape.
+        dynamic_batch: keep the leading dimension symbolic for tensor inputs
+            sharing the first tensor's leading size. This is enabled by default.
+            Set it to ``False`` only when the model intentionally requires the
+            exact batch size supplied in ``inputs``.
     Returns:
         GraphModule: a compiled version of the given graph with QAT annotations, ready to begin training.
     """
@@ -97,6 +98,7 @@ def sima_prepare_qat_model(
     capture_example_inputs = _capture_inputs_to_cpu(inputs)
     if dynamic_batch:
         try:
+            reference_model = copy.deepcopy(capture_graph)
             capture_inputs, dynamic_shapes = _dynamic_batch_capture(
                 capture_example_inputs
             )
@@ -105,18 +107,22 @@ def sima_prepare_qat_model(
                 capture_inputs,
                 dynamic_shapes=dynamic_shapes,
             ).module()
-            # Some networks fold batch into an internal recurrence or direction
-            # dimension. A duplicated batch-one capture can export successfully
-            # while hard-wiring the wrong internal geometry. Validate the graph on
-            # the exact example the caller supplied and fail before scaffolding.
+            # A duplicated batch-one capture can export successfully while
+            # hard-wiring a different branch or internal geometry. Re-run both
+            # isolated models with identical CPU RNG state and require semantic
+            # parity on the exact example supplied by the caller.
             validation_model = copy.deepcopy(m)
-            with torch.no_grad():
-                validation_model(*capture_example_inputs)
+            _validate_capture_output_parity(
+                reference_model,
+                validation_model,
+                capture_example_inputs,
+            )
         except Exception as error:
             raise RuntimeError(
-                "Dynamic-batch QAT capture does not execute the original "
-                "example. Keep dynamic_batch=False for models whose batch "
-                "dimension participates in folded recurrence or layout math."
+                "Dynamic-batch QAT capture does not preserve the original "
+                "example semantics. Set dynamic_batch=False for models that "
+                "require a fixed batch or whose batch dimension participates "
+                "in control flow, folded recurrence, or layout math."
             ) from error
     else:
         m = export_for_training(capture_graph, capture_example_inputs).module()
@@ -151,15 +157,53 @@ def _capture_inputs_to_cpu(inputs: Tuple) -> Tuple:
     return tree_map(capture_leaf, inputs)
 
 
+def _validate_capture_output_parity(
+    reference_model: nn.Module,
+    captured_model: nn.Module,
+    inputs: Tuple,
+) -> None:
+    """Require dynamic capture to preserve the original-example output pytree."""
+
+    with torch.random.fork_rng(devices=[]), torch.no_grad():
+        cpu_rng_state = torch.get_rng_state()
+        reference_output = reference_model(*inputs)
+        torch.set_rng_state(cpu_rng_state)
+        captured_output = captured_model(*inputs)
+
+    reference_leaves, reference_spec = tree_flatten(reference_output)
+    captured_leaves, captured_spec = tree_flatten(captured_output)
+    if reference_spec != captured_spec:
+        raise RuntimeError(
+            "dynamic capture changed the output pytree structure: "
+            f"expected {reference_spec}, found {captured_spec}"
+        )
+
+    for index, (reference, captured) in enumerate(
+        zip(reference_leaves, captured_leaves)
+    ):
+        if isinstance(reference, Tensor) and isinstance(captured, Tensor):
+            try:
+                torch.testing.assert_close(captured, reference, equal_nan=True)
+            except AssertionError as error:
+                raise RuntimeError(
+                    f"dynamic capture changed tensor output leaf {index}: {error}"
+                ) from error
+        elif type(reference) is not type(captured) or reference != captured:
+            raise RuntimeError(
+                "dynamic capture changed non-tensor output leaf "
+                f"{index}: expected {reference!r}, found {captured!r}"
+            )
+
+
 def _dynamic_batch_capture(inputs: Tuple) -> Tuple[Tuple, Optional[Any]]:
     """Build explicit dynamic-batch capture inputs and Torch shape hints.
 
     Torch specializes dimensions whose example value is zero or one. When the
     caller supplies batch one, capture uses an equivalent duplicated
     example because Torch specializes dimensions whose example value is one.
-    The caller must explicitly request this behavior through
-    :func:`sima_prepare_qat_model`; the exported graph is then validated on the
-    original inputs before being returned.
+    The caller can disable this behavior through :func:`sima_prepare_qat_model`
+    when the model intentionally requires a fixed batch. The exported graph is
+    validated on the original inputs before being returned.
     """
     leaves, _ = tree_flatten(inputs)
     tensor_inputs = [

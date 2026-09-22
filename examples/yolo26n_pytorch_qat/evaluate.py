@@ -408,7 +408,6 @@ def main() -> None:
             eager,
             (torch.zeros(1, 3, args.image_size, args.image_size),),
             device,
-            dynamic_batch=True,
         )
         del eager
         calibration_seconds = calibrate(
@@ -442,7 +441,6 @@ def main() -> None:
             eager,
             (torch.zeros(1, 3, args.image_size, args.image_size),),
             device,
-            dynamic_batch=True,
         )
         del eager
         checkpoint = torch.load(args.qat_checkpoint, map_location=device, weights_only=True)

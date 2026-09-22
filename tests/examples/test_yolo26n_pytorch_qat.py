@@ -87,13 +87,12 @@ def test_pure_model_shape_and_loss_backward() -> None:
     assert any(parameter.grad is not None for parameter in model.parameters())
 
 
-def test_full_model_dynamic_qat_prepare_forward_and_freeze() -> None:
+def test_full_model_default_dynamic_qat_prepare_forward_and_freeze() -> None:
     inputs = torch.randn(1, 3, 64, 64)
     prepared = sima_prepare_qat_model(
         build_yolo26n().train(),
         (inputs,),
         "cpu",
-        dynamic_batch=True,
     )
     outputs = prepared(torch.randn(2, 3, 64, 64))
     loss, _ = YOLO26Loss()(outputs, _target(2))

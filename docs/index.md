@@ -199,24 +199,28 @@ sima_export_onnx(
 
 ## Batch size
 
-Preparation captures the example shapes exactly by default. Keep the QAT batch
-size fixed, using `drop_last=True` when necessary, or explicitly opt into a
-dynamic leading batch dimension:
+Preparation keeps the leading tensor dimension dynamic by default. This lets
+the same prepared graph train with ordinary data-loader batch sizes, handle a
+short final batch, and export with the concrete batch size passed to
+`sima_export_onnx`.
+
+Most models need no batch option. Set `dynamic_batch=False` only when the model
+intentionally requires the exact example batch size:
 
 ```python
 qat_model = sima_prepare_qat_model(
     source_model,
     example_inputs,
     device=device,
-    dynamic_batch=True,
+    dynamic_batch=False,
 )
 ```
 
-Use dynamic batch only when the model is genuinely batch-polymorphic. The
-package validates the capture and rejects models where batch size participates
-in recurrence, direction, channel, or other layout geometry. This option
-affects the training graph; ONNX export uses the concrete shapes passed to
-`sima_export_onnx`.
+Fixed-batch capture is appropriate when the model asserts or branches on batch
+size, uses fixed-size recurrent state, or folds batch into direction, channel,
+or other layout geometry. Dynamic capture compares the captured output with
+the original model on the supplied example and fails with guidance to disable
+dynamic batch when it would change the model's behavior.
 
 ## Validate and compile
 

@@ -70,14 +70,17 @@ internals.
 
 ## Preserve batch semantics
 
-Preparation captures example shapes exactly by default. Keep a fixed training
-batch, using `drop_last=True` when appropriate, unless the model is genuinely
-batch-polymorphic.
+Preparation treats the leading tensor dimension as a dynamic batch by default.
+Use the ordinary three-argument call when samples are independent across the
+leading dimension; the prepared graph can train with varying loader batches
+and export the concrete shapes supplied to `sima_export_onnx`.
 
-Use `dynamic_batch=True` only when the leading tensor dimension is an ordinary
-batch dimension. Do not enable it for models that fold batch into recurrence,
-direction, channel, or layout geometry. A dynamic training capture still
-exports the concrete shapes supplied to `sima_export_onnx`.
+Set `dynamic_batch=False` only when the model intentionally requires the exact
+example batch size. Indicators include an explicit batch-size assertion or
+branch, fixed-size recurrent state, or code that folds batch into recurrence,
+direction, channel, or other layout geometry. Dynamic capture checks output
+parity on the supplied example and fails with fixed-batch guidance when capture
+would change the model's behavior.
 
 ## Resume training
 
@@ -116,8 +119,9 @@ their lack of QDQ annotation as a QAT integration failure.
 
 - If preparation fails, reduce the case to the model region or PyTorch export
   construct that failed; do not rewrite the ONNX graph as part of this skill.
-- If explicit dynamic-batch capture is rejected, return to static capture
-  unless the user wants to change the model's batch semantics.
+- If the default dynamic-batch capture reports changed semantics, retry with
+  `dynamic_batch=False` only after confirming that the model intentionally has
+  a fixed-batch contract.
 - If freeze reports incomplete or invalid quantization parameters, preserve
   the failure and identify the affected weighted operation. Do not bypass
   freeze or edit private observer state.
