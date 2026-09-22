@@ -29,7 +29,7 @@ def get_version(pkg_dir):
     with open(pkg_dir + '/VERSION', 'w') as fh:
         fh.write(yaml.dump(vinfo))
 
-    # This comes from Jenkins for upstream/downstream builds
+    # CI can supply a development version for upstream/downstream builds.
     if 'DEV_VERSION' in os.environ:
         version = version + '.dev0+' + os.environ['DEV_VERSION']
 
@@ -71,9 +71,11 @@ setuptools.setup(
     url='https://sima.ai',
     packages=setuptools.find_packages(exclude=('tests', 'tests.*')),
     package_data={'sima_qat': ['VERSION']},
-    license='Proprietary',
+    license='Apache-2.0',
+    license_files=('LICENSE',),
     classifiers=[
         'Programming Language :: Python :: 3.10',
         'Operating System :: OS Independent',
+        'License :: OSI Approved :: Apache Software License',
     ],
 )
