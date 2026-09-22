@@ -37,18 +37,18 @@ Keep this list scoped to the PyTorch training and standard ONNX QDQ workflow.
   Vulcan publication and package metadata.
 - [ ] Add lightweight formatting, lint, import, ONNX checker, and documentation
   link checks to CI.
-- [ ] Validate and document the supported Python, PyTorch, ONNX, and ONNX
+- [x] Validate and document the supported Python, PyTorch, ONNX, and ONNX
   Runtime versions.
 - [ ] Establish semantic versioning, release notes, artifact provenance, and a
   tested tag-to-package promotion path.
 
 ## Documentation
 
-- [ ] Keep one concise lifecycle guide for prepare, observer warm-up, freeze,
+- [x] Keep one concise lifecycle guide for prepare, observer warm-up, freeze,
   recovery training, checkpoint/resume, finalization, and export.
-- [ ] Publish the manifest-derived distinction between annotated,
+- [x] Publish the manifest-derived distinction between annotated,
   grid-propagating, mixed-output, decomposed, and pass-through operations.
-- [ ] Validate the documented commands against the released wheel.
+- [x] Validate the documented commands against the released wheel.
 
 Production readiness means a clean environment can install the wheel, train and
 resume a supported QAT model, freeze and finalize it deterministically, and
