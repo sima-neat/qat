@@ -13,7 +13,6 @@ import sima_qat
 from sima_qat import (
     sima_export_onnx,
     sima_finalize_qat_model,
-    sima_freeze_batchnorm_stats,
     sima_freeze_qat,
     sima_prepare_qat_model,
 )
@@ -62,7 +61,6 @@ class DynamicBatchNorm(nn.Module):
 def test_public_api_exposes_only_the_single_qat_mode() -> None:
     assert sima_qat.__all__ == [
         "sima_prepare_qat_model",
-        "sima_freeze_batchnorm_stats",
         "sima_freeze_qat",
         "sima_finalize_qat_model",
         "sima_export_onnx",
@@ -95,12 +93,11 @@ def test_finalize_retains_auto_freeze_compatibility() -> None:
     "operation",
     [
         lambda value: sima_prepare_qat_model(value, (), "cpu"),
-        sima_freeze_batchnorm_stats,
         sima_freeze_qat,
         sima_finalize_qat_model,
         lambda value: sima_export_onnx(value, (), "unused.onnx", device="cpu"),
     ],
-    ids=("prepare", "freeze_batchnorm", "freeze", "finalize", "export"),
+    ids=("prepare", "freeze", "finalize", "export"),
 )
 def test_public_transform_apis_reject_non_modules(operation) -> None:
     with pytest.raises(RuntimeError):
@@ -111,8 +108,6 @@ def test_repeated_lifecycle_calls_are_idempotent() -> None:
     inputs = torch.randn(2, 3, 8, 8)
     prepared = sima_prepare_qat_model(Conv2dModel(), (inputs,), "cpu")
     assert sima_prepare_qat_model(prepared, (inputs,), "cpu") is prepared
-    assert sima_freeze_batchnorm_stats(prepared) is prepared
-    assert sima_freeze_batchnorm_stats(prepared) is prepared
     prepared(inputs)
     assert sima_freeze_qat(prepared) is prepared
     frozen_state = {

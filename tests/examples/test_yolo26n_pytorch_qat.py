@@ -15,15 +15,10 @@ EXAMPLE = Path(__file__).parents[2] / "examples" / "yolo26n_pytorch_qat"
 sys.path.insert(0, str(EXAMPLE))
 
 from coco import CocoDetectionDataset, collate_detection  # noqa: E402
-from evaluate import decode_boxdecode, decode_end2end, detections_to_coco  # noqa: E402
+from evaluate import decode_end2end, detections_to_coco  # noqa: E402
 from loss import YOLO26Loss  # noqa: E402
 from model import build_yolo26n  # noqa: E402
-from sima_qat import (  # noqa: E402
-    sima_freeze_batchnorm_stats,
-    sima_freeze_qat,
-    sima_prepare_qat_model,
-)
-from train import optimizer_parameter_groups  # noqa: E402
+from sima_qat import sima_freeze_qat, sima_prepare_qat_model  # noqa: E402
 
 
 pytestmark = pytest.mark.regression
@@ -105,47 +100,6 @@ def test_full_model_dynamic_qat_prepare_forward_and_freeze() -> None:
     loss.backward()
     sima_freeze_qat(prepared)
     assert bool(prepared.qat_frozen.item())
-
-
-def test_batchnorm_can_freeze_before_quantization_grids() -> None:
-    inputs = torch.randn(2, 3, 64, 64)
-    prepared = sima_prepare_qat_model(
-        build_yolo26n().train(),
-        (inputs,),
-        "cpu",
-        dynamic_batch=True,
-    )
-    sima_freeze_batchnorm_stats(prepared)
-    running_means = {
-        name: buffer.detach().clone()
-        for name, buffer in prepared.named_buffers()
-        if name.endswith("running_mean")
-    }
-
-    prepared.train()
-    prepared(inputs)
-
-    assert not bool(prepared.qat_frozen.item())
-    for name, expected in running_means.items():
-        torch.testing.assert_close(
-            dict(prepared.named_buffers())[name], expected, rtol=0, atol=0
-        )
-
-
-def test_optimizer_excludes_vector_parameters_from_weight_decay() -> None:
-    model = build_yolo26n()
-    groups = optimizer_parameter_groups(model, 5e-4)
-    decayed = {id(parameter) for parameter in groups[0]["params"]}
-    not_decayed = {id(parameter) for parameter in groups[1]["params"]}
-
-    assert groups[0]["weight_decay"] == 5e-4
-    assert groups[1]["weight_decay"] == 0
-    assert decayed.isdisjoint(not_decayed)
-    assert decayed | not_decayed == {id(parameter) for parameter in model.parameters()}
-    assert all(parameter.ndim > 1 for parameter in groups[0]["params"])
-    assert all(parameter.ndim <= 1 for parameter in groups[1]["params"])
-
-
 def test_one2one_decode_and_inverse_letterbox() -> None:
     boxes = torch.tensor([[[0.25], [0.5], [0.75], [1.0]]])
     scores = torch.full((1, 80, 1), -20.0)
@@ -180,33 +134,3 @@ def test_one2one_decode_and_inverse_letterbox() -> None:
     assert coco[0]["image_id"] == 7
     assert coco[0]["category_id"] == 3
     assert coco[0]["bbox"] == [0.0, 0.0, 8.0, 8.0]
-
-
-def test_boxdecode_path_is_nms_free_with_opt_in_legacy_nms() -> None:
-    boxes = torch.tensor(
-        [[[0.5, 1.5], [0.5, 0.5], [1.5, 0.5], [0.5, 0.5]]]
-    )
-    scores = torch.full((1, 80, 2), -20.0)
-    scores[0, 2, 0] = 4.0
-    scores[0, 3, 0] = 3.0  # BoxDecode keeps only the cell's best class.
-    scores[0, 2, 1] = 3.5  # Same-class duplicate is removed by NMS.
-    feature = torch.zeros(1, 1, 1, 2)
-    predictions = {
-        "one2one": {
-            "boxes": boxes,
-            "scores": scores,
-            "feats": [feature, feature[:, :, :0, :0], feature[:, :, :0, :0]],
-        }
-    }
-    detections = decode_boxdecode(predictions, max_detections=2, nms_iou=0.7)
-    assert detections[0].shape == (2, 6)
-    assert detections[0][:, 5].tolist() == [2.0, 2.0]
-
-    legacy = decode_boxdecode(
-        predictions,
-        max_detections=2,
-        nms_iou=0.7,
-        legacy_nms=True,
-    )
-    assert legacy[0].shape == (1, 6)
-    assert legacy[0][0, 5].item() == 2

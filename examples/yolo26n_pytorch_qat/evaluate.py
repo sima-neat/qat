@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 import time
 from pathlib import Path
@@ -21,9 +20,6 @@ from loss import distances_to_boxes, make_anchors
 from model import build_yolo26n
 from sima_qat import sima_freeze_qat, sima_prepare_qat_model
 from train import load_portable_weights
-
-
-DEFAULT_COCO = Path("/project/ml_datasets/public_datasets/coco/coco_2017")
 
 
 class CocoImageDataset(Dataset):
@@ -137,121 +133,6 @@ def decode_end2end(
     return [image[image[:, 4] > confidence] for image in detections]
 
 
-def _cxx_lround(value: float) -> int:
-    return math.floor(value + 0.5) if value >= 0 else math.ceil(value - 0.5)
-
-
-def _boxdecode_class_nms(candidates: Tensor, iou_threshold: float) -> Tensor:
-    """Match genericboxdecode's integer, class-aware NMS on one image."""
-
-    if not candidates.numel():
-        return candidates
-    values = candidates.tolist()
-    threshold = _cxx_lround(iou_threshold * 256)
-    keep = []
-    by_class: dict[int, list[int]] = {}
-    geometry = []
-    for index, row in enumerate(values):
-        class_index = int(row[5])
-        by_class.setdefault(class_index, []).append(index)
-        x1, y1, x2, y2 = row[:4]
-        geometry.append(
-            (
-                _cxx_lround(x1),
-                _cxx_lround(y1),
-                _cxx_lround(x2),
-                _cxx_lround(y2),
-                _cxx_lround((x2 - x1) * (y2 - y1)),
-            )
-        )
-    for class_indices in by_class.values():
-        class_indices.sort(key=lambda index: values[index][4], reverse=True)
-        suppressed = set()
-        for position, index in enumerate(class_indices):
-            if index in suppressed:
-                continue
-            keep.append(index)
-            ax1, ay1, ax2, ay2, area_a = geometry[index]
-            for candidate in class_indices[position + 1 :]:
-                if candidate in suppressed:
-                    continue
-                bx1, by1, bx2, by2, area_b = geometry[candidate]
-                intersection = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(
-                    0, min(ay2, by2) - max(ay1, by1)
-                )
-                union = area_a + area_b - intersection
-                scaled_iou = 0 if union <= 0 else intersection * 256 // union
-                if scaled_iou > threshold:
-                    suppressed.add(candidate)
-    return candidates[torch.tensor(keep, dtype=torch.long)]
-
-
-def decode_boxdecode(
-    predictions: dict[str, dict[str, Tensor | list[Tensor]]],
-    strides: tuple[int, ...] = (8, 16, 32),
-    max_detections: int = 300,
-    confidence: float = 0.001,
-    nms_iou: float = 0.7,
-    legacy_nms: bool = False,
-) -> list[Tensor]:
-    """Emulate YOLO26 BoxDecode with the corrected NMS-free contract.
-
-    ``legacy_nms`` retains the old class-aware integer NMS path for regression
-    comparisons. Candidate production still follows BoxDecode: best class per
-    cell, confidence filtering, a per-head ``top_k`` cap, then final ``top_k``.
-    """
-
-    boxes, scores = _decode_raw_boxes(predictions, strides)
-    best_scores, best_classes = scores.max(dim=-1)
-    features = predictions["one2one"]["feats"]
-    if not isinstance(features, list):
-        features = list(features)
-    level_sizes = [int(feature.shape[-2] * feature.shape[-1]) for feature in features]
-    if sum(level_sizes) != scores.shape[1]:
-        raise RuntimeError(
-            f"Feature levels contain {sum(level_sizes)} cells, scores contain {scores.shape[1]}"
-        )
-    output = []
-    for image_boxes, image_scores, image_classes in zip(
-        boxes, best_scores, best_classes
-    ):
-        level_candidates = []
-        offset = 0
-        for level_size in level_sizes:
-            level_boxes = image_boxes[offset : offset + level_size]
-            level_scores = image_scores[offset : offset + level_size]
-            level_classes = image_classes[offset : offset + level_size]
-            offset += level_size
-            valid = level_scores >= confidence
-            level_boxes = level_boxes[valid]
-            level_scores = level_scores[valid]
-            level_classes = level_classes[valid]
-            count = min(max_detections, level_scores.numel())
-            if count:
-                level_scores, indices = level_scores.topk(count)
-                level_candidates.append(
-                    torch.cat(
-                        (
-                            level_boxes[indices],
-                            level_scores[:, None],
-                            level_classes[indices, None].to(level_boxes.dtype),
-                        ),
-                        dim=-1,
-                    )
-                )
-        if level_candidates:
-            candidates = torch.cat(level_candidates).cpu()
-        else:
-            candidates = torch.empty((0, 6), dtype=image_boxes.dtype)
-        if legacy_nms:
-            candidates = _boxdecode_class_nms(candidates, nms_iou)
-        if candidates.shape[0] > max_detections:
-            indices = candidates[:, 4].topk(max_detections).indices
-            candidates = candidates[indices]
-        output.append(candidates)
-    return output
-
-
 def detections_to_coco(
     detections: list[Tensor],
     metadata: list[dict[str, Any]],
@@ -327,8 +208,6 @@ def collect_predictions(
     workers: int,
     confidence: float,
     max_detections: int,
-    nms_iou: float,
-    legacy_nms: bool,
     log_interval: int,
 ) -> tuple[list[dict[str, Any]], float]:
     loader = DataLoader(
@@ -345,20 +224,11 @@ def collect_predictions(
     started = time.monotonic()
     for step, (images, metadata) in enumerate(loader):
         outputs = model(images.to(device, non_blocking=True))
-        if legacy_nms:
-            decoded = decode_boxdecode(
-                outputs,
-                confidence=confidence,
-                max_detections=max_detections,
-                nms_iou=nms_iou,
-                legacy_nms=True,
-            )
-        else:
-            decoded = decode_end2end(
-                outputs,
-                confidence=confidence,
-                max_detections=max_detections,
-            )
+        decoded = decode_end2end(
+            outputs,
+            confidence=confidence,
+            max_detections=max_detections,
+        )
         results.extend(detections_to_coco(decoded, metadata, dataset.category_ids))
         if step % log_interval == 0 or step + 1 == len(loader):
             image_count = min((step + 1) * batch_size, len(dataset))
@@ -415,26 +285,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--confidence", type=float, default=0.001)
     parser.add_argument("--max-detections", type=int, default=300)
-    parser.add_argument("--nms-iou", type=float, default=0.7)
-    parser.add_argument(
-        "--legacy-nms",
-        action="store_true",
-        help="Re-enable the old BoxDecode class-aware NMS path for comparison",
-    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--calibration-limit", type=int, default=1024)
     parser.add_argument("--calibration-seed", type=int, default=42)
     parser.add_argument("--log-interval", type=int, default=50)
-    parser.add_argument("--val-images", default=str(DEFAULT_COCO / "val2017"))
     parser.add_argument(
-        "--val-annotations",
-        default=str(DEFAULT_COCO / "annotations/instances_val2017.json"),
+        "--val-images", required=True, help="COCO validation image directory"
     )
-    parser.add_argument("--calibration-images", default=str(DEFAULT_COCO / "train2017"))
     parser.add_argument(
-        "--calibration-annotations",
-        default=str(DEFAULT_COCO / "annotations/instances_train2017.json"),
+        "--val-annotations", required=True, help="COCO validation annotation JSON"
     )
+    parser.add_argument("--calibration-images", help="COCO training image directory")
+    parser.add_argument("--calibration-annotations", help="COCO training annotation JSON")
     return parser.parse_args()
 
 
@@ -443,12 +305,19 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("image-size must be a positive multiple of 32")
     if args.batch_size < 1 or args.workers < 0 or args.calibration_limit < 1:
         raise ValueError("batch-size/calibration-limit must be positive and workers non-negative")
-    if not 0 <= args.confidence <= 1 or not 0 <= args.nms_iou <= 1:
-        raise ValueError("confidence and nms-iou must be in [0, 1]")
+    if not 0 <= args.confidence <= 1:
+        raise ValueError("confidence must be in [0, 1]")
     if args.max_detections < 1:
         raise ValueError("max-detections must be positive")
     if args.mode == "qat-trained" and not args.qat_checkpoint:
         raise ValueError("--qat-checkpoint is required for qat-trained mode")
+    if args.mode in ("int8-pretrain", "both") and not (
+        args.calibration_images and args.calibration_annotations
+    ):
+        raise ValueError(
+            "--calibration-images and --calibration-annotations are required "
+            "for int8-pretrain and both modes"
+        )
 
 
 def run_variant(
@@ -469,8 +338,6 @@ def run_variant(
         args.workers,
         args.confidence,
         args.max_detections,
-        args.nms_iou,
-        args.legacy_nms,
         args.log_interval,
     )
     prediction_path = output / f"{name}_predictions.json"
@@ -603,8 +470,7 @@ def main() -> None:
     summary = {
         "image_size": args.image_size,
         "confidence": args.confidence,
-        "nms_iou": args.nms_iou,
-        "postprocess": "legacy_nms" if args.legacy_nms else "native_nms_free",
+        "postprocess": "native_nms_free",
         "max_detections": args.max_detections,
         "results": results,
     }

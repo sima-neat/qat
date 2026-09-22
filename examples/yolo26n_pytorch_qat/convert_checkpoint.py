@@ -8,7 +8,6 @@ training process nor its checkpoints depend on that package.
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 import torch
@@ -20,24 +19,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, help="Ultralytics yolo26n.pt checkpoint")
     parser.add_argument("--output", required=True, help="Portable state-dict output")
-    parser.add_argument(
-        "--ultralytics-source",
-        help="Optional checkout containing the ultralytics Python package",
-    )
     parser.add_argument("--verify-size", type=int, default=160)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.ultralytics_source:
-        sys.path.insert(0, str(Path(args.ultralytics_source).resolve()))
     try:
         from ultralytics import YOLO
     except ImportError as error:
         raise SystemExit(
-            "Checkpoint conversion requires Ultralytics once. Install it or pass "
-            "--ultralytics-source; QAT training itself does not import it."
+            "Checkpoint conversion requires Ultralytics. Install it in the conversion "
+            "environment; QAT training itself does not import it."
         ) from error
 
     source = YOLO(args.source).model.float().cpu().eval()

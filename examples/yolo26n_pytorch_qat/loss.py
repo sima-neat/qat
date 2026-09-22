@@ -342,29 +342,22 @@ class YOLO26Loss(nn.Module):
         classes: int = 80,
         strides: tuple[int, ...] = (8, 16, 32),
         gains: LossGains = LossGains(),
-        one2many_weight: float = 0.1,
     ) -> None:
         super().__init__()
-        if not 0 <= one2many_weight <= 1:
-            raise ValueError("one2many_weight must be between zero and one")
         self.one2many = DetectionHeadLoss(classes, strides, 10, None, gains)
         self.one2one = DetectionHeadLoss(classes, strides, 7, 1, gains)
-        self.one2many_weight = one2many_weight
 
     def forward(
         self,
         predictions: dict[str, dict[str, Tensor | list[Tensor]]],
         batch: dict[str, Tensor],
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        one2many_weight = self.one2many_weight
-        one2one_weight = 1.0 - one2many_weight
         one2many = self.one2many(predictions["one2many"], batch)
         one2one = self.one2one(predictions["one2one"], batch)
-        components = one2many * one2many_weight + one2one * one2one_weight
+        components = one2many * 0.1 + one2one * 0.9
         metrics = {
             "box": components[0].detach(),
             "classification": components[1].detach(),
             "l1": components[2].detach(),
-            "one2many_weight": components.new_tensor(one2many_weight),
         }
         return components.sum(), metrics
