@@ -11,30 +11,32 @@ exported to an INT8 Q/DQ ONNX graph.
 See the [QAT user guide](docs/index.md) for installation and the complete
 training-to-export workflow.
 
-## Setup
+## Install
+
+Download the wheel and install or refresh the QAT coding-agent skill:
 
 ```bash
-# install uv (one time)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-# restart your shell, or:
-source $HOME/.local/bin/env
-
-# then from the repo root:
-cd /path/to/qat
-./setup_env.sh                 # -> .venv, python 3.12
+sima-cli neat install qat
 ```
 
-`setup_env.sh` accepts optional arguments to override the defaults:
+This does not change your Python environment. Activate your existing PyTorch
+training environment, change to the download directory, then install the wheel:
 
 ```bash
-./setup_env.sh .venv311 3.11   # custom venv dir and python version
+python -m pip install ./sima_qat-*.whl
 ```
 
-Once setup completes (look for `SETUP_DONE_OK`), activate the environment:
+## Development setup
+
+From the repository root, using Python 3.10 or newer:
 
 ```bash
+python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install -e '.[dev]'
 ```
+
+This installs the package in editable mode, its dependencies, and test tools.
 
 ## Usage
 
@@ -49,11 +51,13 @@ from sima_qat import (
     sima_export_onnx,
 )
 
-model = ...                                  # any torch.nn.Module
+model = ...                                  # your pretrained torch.nn.Module
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 example_inputs = (torch.randn(1, 3, 224, 224),)
 
 # 1. Insert shift-aware fake-quant scaffolding.
-qat_model = sima_prepare_qat_model(model, example_inputs, device='cuda')
+qat_model = sima_prepare_qat_model(model, example_inputs, device=device)
+optimizer = torch.optim.AdamW(qat_model.parameters(), lr=1e-5)
 
 # 2. Warm up observers with your normal training loop ...
 
@@ -61,12 +65,17 @@ qat_model = sima_prepare_qat_model(model, example_inputs, device='cuda')
 sima_freeze_qat(qat_model)
 # ... continue training qat_model ...
 
-# 4. Convert to inference-only (fake-quant / INT8) form
-qat_model = sima_finalize_qat_model(qat_model)
+# 4. Finalize on CPU for inference and export.
+final_model = sima_finalize_qat_model(qat_model.cpu())
 
 # 5. Export to an INT8 Q/DQ ONNX graph
-sima_export_onnx(qat_model, example_inputs, 'model.onnx', device='cuda')
+sima_export_onnx(final_model, example_inputs, "model.qdq.onnx", device="cpu")
 ```
+
+Construct the optimizer after preparation, using the returned model's parameters.
+During validation, temporarily disable observers while retaining fake quantization,
+then restore their previous enabled states. See the [user guide](docs/index.md)
+for the complete training, validation, checkpoint, and export workflow.
 
 Shift-aware QAT constrains each convolution or linear weight scale to a power-of-two relationship
 with its input and output activation grids. Calling `sima_freeze_qat` explicitly leaves time to
@@ -96,7 +105,9 @@ annotator exists.
 
 Preparation keeps the leading tensor dimension dynamic by default so the same
 QAT graph can train with ordinary loader batch sizes and export with a concrete
-deployment batch. The capture is validated against the original model output.
+deployment batch. Capture uses explicit dynamic-shape constraints and checks
+parity on the supplied example and the batch-one boundary; these checks are not
+a proof of parity for arbitrary batches.
 Models that intentionally require a fixed batch, including models that fold
 batch into recurrence, scan-direction, or layout geometry, can opt out with
 `sima_prepare_qat_model(..., dynamic_batch=False)`.
@@ -179,8 +190,9 @@ Generated ONNX models are written to `exported_models/` (gitignored).
 
 `.github/workflows/vulcan-ci.yml` builds the wheel on a public Ubuntu runner,
 installs it into a fresh CPU environment, and runs the regression suite from
-outside the checkout. Pull requests stop after validation. Branch and tag
-pushes publish that same tested wheel, its checksum, and package metadata to
+outside the checkout. It runs on branch and tag pushes or manual dispatch,
+without a separate pull-request trigger. Successful runs publish that same
+tested wheel, its checksum, and package metadata to
 Vulcan, then advance only that branch or tag's `latest.tag` pointer. The
 `VULCAN_ENV` repository variable selects the destination and defaults to
 `production`, matching the core package workflow.
@@ -192,7 +204,8 @@ sima_qat/            # the package
   qat_api.py         # public API: prepare / freeze / finalize / export
   sima_quantizer.py  # SiMa PT2E quantizer (annotators, fusion patterns)
   onnx_ops.py        # custom ONNX symbolic functions for Q/DQ ops
-examples/            # MNIST and ImageNet training + export examples
+examples/            # MNIST, ImageNet, and YOLO26n training + export examples
+docs/                # user guide and translations
+skills/sima-qat/      # coding-agent skill for QAT workflows
 tests/               # operator matrix, QAT lifecycle, integration, and nightly model tests
-setup_env.sh         # one-shot venv + dependency bootstrap
 ```

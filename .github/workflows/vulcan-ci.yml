@@ -47,7 +47,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: pyproject.toml
 
       - name: Install build tools
         run: python -m pip install --upgrade pip build twine
@@ -57,7 +57,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf build dist sima_qat.egg-info
-          GIT_HASH="${GITHUB_SHA:0:7}" python -m build --wheel --outdir dist
+          python -m build --wheel --outdir dist
 
           mapfile -t wheels < <(find dist -maxdepth 1 -type f -name 'sima_qat-*.whl' | sort)
           if [[ "${#wheels[@]}" -ne 1 ]]; then
@@ -89,7 +89,7 @@ jobs:
 
           rm -rf "${test_root}"
           mkdir -p "${test_root}"
-          cp -a tests examples pytest.ini "${test_root}/"
+          cp -a tests examples pyproject.toml "${test_root}/"
           cd "${test_root}"
 
           "${test_venv}/bin/python" - <<'PY'
