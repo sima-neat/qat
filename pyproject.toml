@@ -1,7 +1,52 @@
 [build-system]
 requires = [
-  "setuptools>=68",
+  "setuptools>=77",
   "wheel",
-  "PyYAML>=6",
 ]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "sima-qat"
+version = "1.0.0"
+description = "SiMa.ai QAT implementation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{name = "SiMa.ai", email = "support@sima.ai"}]
+classifiers = [
+  "Programming Language :: Python :: 3.10",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "numpy==1.26.4",
+  "torch==2.8.0",
+  "torchvision==0.23.0",
+  "onnx==1.17.0",
+  "onnxruntime==1.21.1",
+  "pytorch-lightning==2.4.0",
+]
+
+[project.urls]
+Homepage = "https://sima.ai"
+
+[project.optional-dependencies]
+tests = ["pytest==7.0.0", "pytest-cov", "pytest-timeout", "pytest-randomly"]
+dev = ["pytest==7.0.0", "pytest-cov", "pytest-timeout", "pytest-randomly"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["sima_qat", "sima_qat.*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+addopts = "-m regression"
+testpaths = ["tests"]
+markers = [
+  "premerge: marks tests to run before merging",
+  "regression: marks tests for regular regression runs",
+  "postmerge: marks tests to run after merging",
+  "nightly: marks tests for nightly runs",
+]
