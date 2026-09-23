@@ -1,5 +1,7 @@
 """BatchNorm folding, freezing, and finalization regressions."""
 
+import warnings
+
 import pytest
 import torch
 
@@ -128,3 +130,17 @@ def test_standalone_batchnorm_is_replaced_during_finalization() -> None:
         node.target != torch.ops.aten._native_batch_norm_legit_no_training.default
         for node in finalized.graph.nodes
     )
+
+
+def test_conv_batchnorm_finalization_does_not_double_erase_nodes() -> None:
+    inputs = torch.randn(2, 3, 8, 8)
+    model = sima_prepare_qat_model(ConvBnModel(), (inputs,), "cpu")
+    model(inputs)
+    sima_freeze_qat(model)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        finalized = sima_finalize_qat_model(model)
+
+    assert torch.isfinite(finalized(inputs)).all()
+    assert not any("already erased node" in str(item.message) for item in caught)

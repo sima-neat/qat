@@ -1,11 +1,13 @@
 """Public API contract for the single shift-aware QAT implementation."""
 
 import inspect
+import warnings
 
 import onnx
 import pytest
 import torch
 from torch import nn
+from torch.ao.quantization import disable_fake_quant, disable_observer
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
 
 import sima_qat
@@ -70,7 +72,7 @@ def test_public_api_exposes_only_the_single_qat_mode() -> None:
         "dynamic_batch"
     ]
     assert dynamic_batch.kind is inspect.Parameter.KEYWORD_ONLY
-    assert dynamic_batch.default is False
+    assert dynamic_batch.default is True
 
     config = get_sima_quantization_config(is_qat=True)
     assert isinstance(config.weight.observer_or_fake_quant_ctr(), FakeQuantizeBase)
@@ -88,18 +90,63 @@ def test_finalize_retains_auto_freeze_compatibility() -> None:
     assert torch.isfinite(finalized(inputs)).all()
 
 
-def test_prepare_accepts_dynamic_training_batch() -> None:
-    example = torch.randn(1, 2, 4)
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda value: sima_prepare_qat_model(value, (), "cpu"),
+        sima_freeze_qat,
+        sima_finalize_qat_model,
+        lambda value: sima_export_onnx(value, (), "unused.onnx", device="cpu"),
+    ],
+    ids=("prepare", "freeze", "finalize", "export"),
+)
+def test_public_transform_apis_reject_non_modules(operation) -> None:
+    with pytest.raises(RuntimeError):
+        operation(object())
+
+
+def test_repeated_lifecycle_calls_are_idempotent() -> None:
+    inputs = torch.randn(2, 3, 8, 8)
+    prepared = sima_prepare_qat_model(Conv2dModel(), (inputs,), "cpu")
+    assert sima_prepare_qat_model(prepared, (inputs,), "cpu") is prepared
+    prepared(inputs)
+    assert sima_freeze_qat(prepared) is prepared
+    frozen_state = {
+        name: value.detach().clone() for name, value in prepared.state_dict().items()
+    }
+    assert sima_freeze_qat(prepared) is prepared
+    for name, expected in frozen_state.items():
+        torch.testing.assert_close(prepared.state_dict()[name], expected, rtol=0, atol=0)
+
+    finalized = sima_finalize_qat_model(prepared)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        repeated = sima_finalize_qat_model(finalized)
+
+    assert repeated is finalized
+    assert not caught
+    torch.testing.assert_close(repeated(inputs), finalized(inputs), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("capture_batch", [1, 2, 4])
+def test_prepare_accepts_dynamic_training_batch_by_default(capture_batch) -> None:
+    example = torch.randn(capture_batch, 2, 4)
+    source = BatchTokenLinear()
     prepared = sima_prepare_qat_model(
-        BatchTokenLinear(),
+        source,
         (example,),
         "cpu",
-        dynamic_batch=True,
     )
 
     for batch_size in (1, 2, 4):
         output = prepared(torch.randn(batch_size, 2, 4))
         assert output.shape == (batch_size, 3, 4)
+
+    prepared.apply(disable_fake_quant)
+    prepared.apply(disable_observer)
+    for batch_size in (1, 2, 4):
+        inputs = torch.randn(batch_size, 2, 4)
+        torch.testing.assert_close(prepared(inputs), source(inputs))
 
 
 def test_dynamic_training_model_exports_static_batch_one(tmp_path) -> None:
@@ -108,7 +155,6 @@ def test_dynamic_training_model_exports_static_batch_one(tmp_path) -> None:
         BatchTokenLinear(),
         (example,),
         "cpu",
-        dynamic_batch=True,
     )
     prepared(example)
     sima_freeze_qat(prepared)
@@ -129,12 +175,13 @@ def test_dynamic_training_model_exports_static_batch_one(tmp_path) -> None:
     assert batch_dimension.dim_value == 1
 
 
-def test_static_capture_preserves_folded_batch_direction_geometry() -> None:
+def test_explicit_static_capture_preserves_folded_batch_direction_geometry() -> None:
     example = torch.randn(1, 4)
     prepared = sima_prepare_qat_model(
         FoldedBatchDirection(),
         (example,),
         "cpu",
+        dynamic_batch=False,
     )
 
     output = prepared(example)
@@ -142,14 +189,13 @@ def test_static_capture_preserves_folded_batch_direction_geometry() -> None:
     assert torch.isfinite(output).all()
 
 
-def test_dynamic_batch_opt_in_fails_closed_for_folded_geometry() -> None:
+def test_default_dynamic_batch_fails_closed_for_folded_geometry() -> None:
     example = torch.randn(1, 4)
     with pytest.raises(RuntimeError, match="Dynamic-batch QAT capture"):
         sima_prepare_qat_model(
             FoldedBatchDirection(),
             (example,),
             "cpu",
-            dynamic_batch=True,
         )
 
 
@@ -159,7 +205,6 @@ def test_dynamic_validation_does_not_mutate_returned_batchnorm_state() -> None:
         DynamicBatchNorm(),
         (example,),
         "cpu",
-        dynamic_batch=True,
     )
 
     running_means = [

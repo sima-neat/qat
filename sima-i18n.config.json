@@ -1,0 +1,77 @@
+{
+  "sourceDir": "docs",
+  "translationDir": "docs/i18n/{locale}",
+  "manifest": "docs/i18n/translation-sources.json",
+  "excludedPrefixes": ["docs/i18n/"],
+  "canonicalTerms": [
+    "SiMa.ai",
+    "SiMa QAT",
+    "Model Compiler",
+    "PyTorch",
+    "ONNX",
+    "ONNX Runtime",
+    "INT8",
+    "QAT",
+    "PTQ",
+    "QDQ",
+    "Codex",
+    "Claude",
+    "Python"
+  ],
+  "locales": {
+    "ko": {
+      "name": "Korean",
+      "code": "ko",
+      "terms": {
+        "model": "모델",
+        "graph": "그래프",
+        "quantization": "양자화",
+        "training": "학습",
+        "validation": "검증",
+        "tensor": "텐서"
+      }
+    },
+    "ja": {
+      "name": "Japanese",
+      "code": "ja",
+      "terms": {
+        "model": "モデル",
+        "graph": "グラフ",
+        "quantization": "量子化",
+        "training": "学習",
+        "validation": "検証",
+        "tensor": "テンソル"
+      }
+    },
+    "zh-Hant": {
+      "name": "Traditional Chinese (Taiwan)",
+      "code": "zh-Hant-TW",
+      "terms": {
+        "model": "模型",
+        "graph": "圖",
+        "quantization": "量化",
+        "training": "訓練",
+        "validation": "驗證",
+        "tensor": "張量"
+      }
+    },
+    "uk": {
+      "name": "Ukrainian (Ukraine)",
+      "code": "uk-UA",
+      "terms": {
+        "model": "модель",
+        "graph": "граф",
+        "quantization": "квантування",
+        "training": "навчання",
+        "validation": "перевірка",
+        "tensor": "тензор"
+      }
+    }
+  },
+  "provider": {
+    "type": "ollama",
+    "model": "translategemma:27b",
+    "endpoint": "http://127.0.0.1:11434/api/chat",
+    "timeoutMs": 300000
+  }
+}

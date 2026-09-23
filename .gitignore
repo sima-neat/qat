@@ -1,5 +1,12 @@
 *.pyc
 *.log
 *.onnx
+.venv/
+build/
+dist/
+*.egg-info/
+sima_qat/VERSION
 data/
 exported_models/
+runs/
+examples/yolo26n_pytorch_qat/logs/

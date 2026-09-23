@@ -1,0 +1,8 @@
+id: sima-qat
+type: skill
+version: 0.1.0
+name: SiMa QAT
+description: Integrate and validate quantization-aware training with the SiMa QAT package.
+agents:
+  - codex
+  - claude

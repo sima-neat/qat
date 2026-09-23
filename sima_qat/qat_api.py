@@ -1,32 +1,3 @@
-#**************************************************************************
-#||                        SiMa.ai CONFIDENTIAL                          ||
-#||   Unpublished Copyright (c) 2024 SiMa.ai, All Rights Reserved.       ||
-#**************************************************************************
-# NOTICE:  All information contained herein is, and remains the property of
-# SiMa.ai. The intellectual and technical concepts contained herein are
-# proprietary to SiMa and may be covered by U.S. and Foreign Patents,
-# patents in process, and are protected by trade secret or copyright law.
-#
-# Dissemination of this information or reproduction of this material is
-# strictly forbidden unless prior written permission is obtained from
-# SiMa.ai.  Access to the source code contained herein is hereby forbidden
-# to anyone except current SiMa.ai employees, managers or contractors who
-# have executed Confidentiality and Non-disclosure agreements explicitly
-# covering such access.
-#
-# The copyright notice above does not evidence any actual or intended
-# publication or disclosure  of  this source code, which includes information
-# that is confidential and/or proprietary, and is a trade secret, of SiMa.ai.
-#
-# ANY REPRODUCTION, MODIFICATION, DISTRIBUTION, PUBLIC PERFORMANCE, OR PUBLIC
-# DISPLAY OF OR THROUGH USE OF THIS SOURCE CODE WITHOUT THE EXPRESS WRITTEN
-# CONSENT OF SiMa.ai IS STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE
-# LAWS AND INTERNATIONAL TREATIES. THE RECEIPT OR POSSESSION OF THIS SOURCE
-# CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS TO
-# REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE, USE, OR
-# SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
-#
-#**************************************************************************
 import copy
 import math
 import operator
@@ -77,7 +48,7 @@ def sima_prepare_qat_model(
     inputs: Tuple,
     device: torch.device,
     *,
-    dynamic_batch: bool = False,
+    dynamic_batch: bool = True,
 ) -> GraphModule:
     """This function is the first transformation needed to perform QAT on a Pytorch model. It takes an
     eager-mode reference to the ML model and produces an FX version of the graph with special annotations
@@ -89,12 +60,13 @@ def sima_prepare_qat_model(
         QAT optimization will be limited to the graph given by the `input_graph` argument. This region
         must always be contained to the level of hierarchy as described by a single nn.Module.
 
-        Capture preserves the exact example shapes by default. This is required
-        for models that fold the batch dimension into recurrence, direction, or
-        channel geometry. Set ``dynamic_batch=True`` only when the model is
-        genuinely batch-polymorphic. Dynamic capture validates that the
-        resulting graph still executes the caller's original example before
-        QAT annotations are inserted.
+        The leading tensor dimension is treated as a dynamic batch by default,
+        allowing the prepared model to train with different batch sizes and
+        export with a concrete deployment batch. Set ``dynamic_batch=False``
+        for models that intentionally require a fixed batch or fold the batch
+        dimension into recurrence, direction, channel, or layout geometry.
+        Dynamic capture validates that the resulting graph preserves the
+        caller's original-example outputs before QAT annotations are inserted.
 
     Args:
         input_graph: an eager-mode `nn.Module` representing the model on which QAT is to be performed.
@@ -104,10 +76,10 @@ def sima_prepare_qat_model(
             process to build the compiled FX representation.
         device: a Pytorch `device` identifier. This will be the device on which the prepared model will
             be located after the preparation step is complete.
-        dynamic_batch: explicitly opt into a symbolic leading batch dimension
-            for tensor inputs sharing the first tensor's leading size. The
-            default is deliberately static. Existing three-argument calls
-            remain source-compatible and preserve the supplied example shape.
+        dynamic_batch: keep the leading dimension symbolic for tensor inputs
+            sharing the first tensor's leading size. This is enabled by default.
+            Set it to ``False`` only when the model intentionally requires the
+            exact batch size supplied in ``inputs``.
     Returns:
         GraphModule: a compiled version of the given graph with QAT annotations, ready to begin training.
     """
@@ -126,6 +98,7 @@ def sima_prepare_qat_model(
     capture_example_inputs = _capture_inputs_to_cpu(inputs)
     if dynamic_batch:
         try:
+            reference_model = copy.deepcopy(capture_graph)
             capture_inputs, dynamic_shapes = _dynamic_batch_capture(
                 capture_example_inputs
             )
@@ -134,18 +107,26 @@ def sima_prepare_qat_model(
                 capture_inputs,
                 dynamic_shapes=dynamic_shapes,
             ).module()
-            # Some networks fold batch into an internal recurrence or direction
-            # dimension. A duplicated batch-one capture can export successfully
-            # while hard-wiring the wrong internal geometry. Validate the graph on
-            # the exact example the caller supplied and fail before scaffolding.
-            validation_model = copy.deepcopy(m)
-            with torch.no_grad():
-                validation_model(*capture_example_inputs)
+            # Torch treats batch one specially even with an explicit Dim.
+            # Check that boundary as well as the original example, using fresh
+            # copies so validation cannot change training buffers or inputs.
+            validation_inputs = [capture_example_inputs]
+            if dynamic_shapes is not None:
+                validation_inputs.append(tree_map(
+                    lambda value, shape: value[:1] if shape else value,
+                    capture_example_inputs,
+                    dynamic_shapes,
+                ))
+            for example in validation_inputs:
+                _validate_capture_output_parity(
+                    copy.deepcopy(reference_model), copy.deepcopy(m), example
+                )
         except Exception as error:
             raise RuntimeError(
-                "Dynamic-batch QAT capture does not execute the original "
-                "example. Keep dynamic_batch=False for models whose batch "
-                "dimension participates in folded recurrence or layout math."
+                "Dynamic-batch QAT capture does not preserve the original "
+                "example semantics. Set dynamic_batch=False for models that "
+                "require a fixed batch or whose batch dimension participates "
+                "in control flow, folded recurrence, or layout math."
             ) from error
     else:
         m = export_for_training(capture_graph, capture_example_inputs).module()
@@ -180,15 +161,55 @@ def _capture_inputs_to_cpu(inputs: Tuple) -> Tuple:
     return tree_map(capture_leaf, inputs)
 
 
+def _validate_capture_output_parity(
+    reference_model: nn.Module,
+    captured_model: nn.Module,
+    inputs: Tuple,
+) -> None:
+    """Require dynamic capture to preserve the given example's output pytree."""
+
+    with torch.random.fork_rng(devices=[]), torch.no_grad():
+        cpu_rng_state = torch.get_rng_state()
+        reference_output = reference_model(*copy.deepcopy(inputs))
+        torch.set_rng_state(cpu_rng_state)
+        captured_output = captured_model(*copy.deepcopy(inputs))
+
+    reference_leaves, reference_spec = tree_flatten(reference_output)
+    captured_leaves, captured_spec = tree_flatten(captured_output)
+    if reference_spec != captured_spec:
+        raise RuntimeError(
+            "dynamic capture changed the output pytree structure: "
+            f"expected {reference_spec}, found {captured_spec}"
+        )
+
+    for index, (reference, captured) in enumerate(
+        zip(reference_leaves, captured_leaves)
+    ):
+        if isinstance(reference, Tensor) and isinstance(captured, Tensor):
+            try:
+                torch.testing.assert_close(captured, reference, equal_nan=True)
+            except AssertionError as error:
+                raise RuntimeError(
+                    f"dynamic capture changed tensor output leaf {index}: {error}"
+                ) from error
+        elif type(reference) is not type(captured) or reference != captured:
+            raise RuntimeError(
+                "dynamic capture changed non-tensor output leaf "
+                f"{index}: expected {reference!r}, found {captured!r}"
+            )
+
+
 def _dynamic_batch_capture(inputs: Tuple) -> Tuple[Tuple, Optional[Any]]:
     """Build explicit dynamic-batch capture inputs and Torch shape hints.
 
     Torch specializes dimensions whose example value is zero or one. When the
     caller supplies batch one, capture uses an equivalent duplicated
     example because Torch specializes dimensions whose example value is one.
-    The caller must explicitly request this behavior through
-    :func:`sima_prepare_qat_model`; the exported graph is then validated on the
-    original inputs before being returned.
+    The caller can disable this behavior through :func:`sima_prepare_qat_model`
+    when the model intentionally requires a fixed batch. The exported graph is
+    validated on the original inputs and the batch-one boundary before being
+    returned. Explicit shape hints reject narrowed batch ranges; parity probes
+    supplement those constraints rather than proving arbitrary-batch parity.
     """
     leaves, _ = tree_flatten(inputs)
     tensor_inputs = [
@@ -212,9 +233,10 @@ def _dynamic_batch_capture(inputs: Tuple) -> Tuple[Tuple, Optional[Any]]:
         ),
         inputs,
     )
+    batch_dim = Dim("batch", min=1)
     dynamic_shapes = tree_map(
         lambda tensor: (
-            {0: Dim.AUTO}
+            {0: batch_dim}
             if isinstance(tensor, Tensor) and is_batched(tensor)
             else None
         ),
@@ -392,7 +414,7 @@ def _safe_power_of_two_weight_scale(
     computed by a PT2E QAT pattern such as Conv-BatchNorm folding.
 
     Scales are rounded one float32 ULP toward zero when necessary. This keeps
-    the normalized multiplier on the safe side of AFE's power-of-two boundary,
+    the normalized multiplier on the safe side of its power-of-two boundary,
     preventing a value infinitesimally above the boundary from selecting the
     next shift and a 0.5 correction factor.
     """
@@ -425,7 +447,7 @@ def _safe_power_of_two_weight_scale(
         )
         scales = ((sy / sx) * target_ratio).to(torch.float32)
 
-        # Work with the exact float32 values AFE will ingest. Always start one
+        # Work with the exact float32 values persisted in the QDQ graph. Start one
         # ULP below the exact boundary so alternate float32 multiplication
         # order cannot move the imported ratio to the unsafe side.
         zero = torch.zeros_like(scales)
@@ -455,39 +477,30 @@ def _safe_power_of_two_weight_scale(
     return scales.to(minimum_weight_scale.device)
 
 
-def _stage_coarser_activation_grid(
+def _stage_activation_grid(
     fake_quant: FakeQuantizeBase,
     scale: Tensor,
     zero_point: Tensor,
-    multiplier: int,
+    requested_scale: Tensor,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Stage an observer-stable coarser activation grid without mutation.
-
-    AFE requantization supports only non-negative right shifts. When a weight
-    needs a shift smaller than zero, coarsening the weighted operation's output
-    grid by a power of two makes the contract realizable. Work on an observer
-    copy so a later failure leaves the prepared model completely unchanged.
-    """
-    if multiplier < 2 or multiplier & (multiplier - 1):
-        raise ValueError(
-            "activation-grid multiplier must be a power of two >= 2, "
-            f"found {multiplier}"
-        )
-    if scale.numel() != 1 or zero_point.numel() != 1:
+    """Stage an observer-stable activation grid without mutating the model."""
+    if scale.numel() != 1 or zero_point.numel() != 1 or requested_scale.numel() != 1:
         raise RuntimeError(
             "Shift-aware activation retargeting requires per-tensor qparams"
         )
+    requested_scale = requested_scale.to(device=scale.device, dtype=scale.dtype)
+    if (
+        not bool(torch.isfinite(requested_scale).all())
+        or bool((requested_scale <= 0).any())
+    ):
+        raise RuntimeError("Requested activation grid is non-finite or non-positive")
     observer = copy.deepcopy(fake_quant.activation_post_process)
     if not hasattr(observer, "min_val") or not hasattr(observer, "max_val"):
         raise RuntimeError(
             f"Activation observer {type(observer).__name__} cannot persist a retargeted grid"
         )
 
-    requested_scale = scale.detach() * multiplier
-    # Keep the affine grid's integer origin fixed.  For x=(q-z)*s, replacing
-    # s by m*s while retaining z produces a coarser grid nested in the old
-    # grid and continues to represent real zero exactly.  Dividing z by m
-    # would translate the grid and needlessly perturb every asymmetric value.
+    # Keep the affine grid's integer origin fixed so real zero stays exact.
     requested_zero_point = zero_point.detach().clone()
     lower = (
         (observer.quant_min - requested_zero_point.to(requested_scale.dtype))
@@ -512,9 +525,94 @@ def _stage_coarser_activation_grid(
     if not torch.equal(persisted_zero_point, requested_zero_point):
         raise RuntimeError(
             "Activation observer could not preserve the asymmetric zero point "
-            "while persisting a coarser grid"
+            "while persisting a retargeted grid"
         )
     return persisted_scale, persisted_zero_point, lower, upper
+
+
+def _stage_coarser_activation_grid(
+    fake_quant: FakeQuantizeBase,
+    scale: Tensor,
+    zero_point: Tensor,
+    multiplier: int,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Stage a power-of-two coarser activation grid without mutation.
+
+    Shift-aware QAT uses non-negative right shifts. When a weight needs a shift
+    smaller than zero, coarsening the weighted operation's output grid by a
+    power of two makes the contract realizable. Work on an observer copy so a
+    later failure leaves the prepared model completely unchanged.
+    """
+    if multiplier < 2 or multiplier & (multiplier - 1):
+        raise ValueError(
+            "activation-grid multiplier must be a power of two >= 2, "
+            f"found {multiplier}"
+        )
+    requested_scale = scale.detach() * multiplier
+    return _stage_activation_grid(fake_quant, scale, zero_point, requested_scale)
+
+
+def _shared_weight_output_scale(
+    input_scale: Tensor,
+    weight_scales: Tensor,
+    minimum_output_scale: Tensor,
+) -> Tensor:
+    """Choose a non-clipping output grid for an already locked tied weight.
+
+    Scales produced by :func:`_safe_power_of_two_weight_scale` differ across
+    channels only by powers of two relative to its anchor invocation. A later
+    invocation can therefore keep that exact weight tensor and select one
+    scalar output scale that changes only the per-channel right shifts.
+    """
+    if input_scale.numel() != 1 or minimum_output_scale.numel() != 1:
+        raise RuntimeError("Shared-weight retargeting requires per-tensor activations")
+    sx = float(input_scale.reshape(-1)[0].detach().cpu())
+    old_sy = float(minimum_output_scale.reshape(-1)[0].detach().cpu())
+    products = sx * weight_scales.detach().reshape(-1).to(torch.float64).cpu()
+    if not bool(torch.isfinite(products).all()) or bool((products <= 0).any()):
+        raise RuntimeError("Shared-weight products must be finite and positive")
+
+    reference = float(products.max())
+    required_ratio = old_sy / reference
+    shift = max(0, math.ceil(math.log2(required_ratio)))
+    if shift > _MAX_REQUANT_SHIFT:
+        raise RuntimeError(
+            "A tied weight would require a requantization shift greater than "
+            f"{_MAX_REQUANT_SHIFT}"
+        )
+    requested = torch.tensor(
+        [reference * (2.0 ** shift)],
+        device=minimum_output_scale.device,
+        dtype=minimum_output_scale.dtype,
+    )
+    while float(requested.item()) < old_sy and shift < _MAX_REQUANT_SHIFT:
+        shift += 1
+        requested.mul_(2.0)
+    if float(requested.item()) < old_sy:
+        raise RuntimeError("Unable to retain the observed range for a tied weight")
+    return requested
+
+
+def _shift_ratios_are_realizable(
+    input_scale: Tensor,
+    weight_scales: Tensor,
+    output_scale: Tensor,
+) -> bool:
+    ratios = (
+        input_scale.detach().reshape(-1)[0].to(torch.float64).cpu()
+        * weight_scales.detach().reshape(-1).to(torch.float64).cpu()
+        / output_scale.detach().reshape(-1)[0].to(torch.float64).cpu()
+    )
+    if not bool(torch.isfinite(ratios).all()) or bool((ratios <= 0).any()):
+        return False
+    shifts = -torch.ceil(torch.log2(ratios))
+    normalized = ratios * torch.pow(2.0, shifts)
+    return bool(
+        (shifts >= _MIN_REQUANT_SHIFT).all()
+        and (shifts <= _MAX_REQUANT_SHIFT).all()
+        and (normalized <= 1.0).all()
+        and (normalized > 0.99999).all()
+    )
 
 
 def _freeze_batchnorm_stats(module: GraphModule) -> None:
@@ -556,7 +654,7 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
     # staged rows until every graph constraint validates so freeze remains
     # atomic even when output-grid coarsening is required.
     activation_qparams = []
-    for fake_quant in qat_model.modules():
+    for name, fake_quant in qat_model.named_modules():
         if (
             not isinstance(fake_quant, FakeQuantizeBase)
             or getattr(fake_quant, "is_per_channel", False)
@@ -569,9 +667,20 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
                 "Shift-aware QAT could not calculate valid activation qparams "
                 f"from {type(fake_quant.activation_post_process).__name__}: {error}"
             ) from error
+        scale = scale.to(device=fake_quant.scale.device, dtype=fake_quant.scale.dtype)
+        if (
+            not bool(torch.isfinite(scale).all() and (scale > 0).all())
+            or not bool(torch.isfinite(zero_point).all())
+        ):
+            raise RuntimeError(
+                f"Invalid activation qparams for {name}: scales must be finite "
+                "and positive and zero points finite. Check observed values and "
+                "operator domains after input quantization (for example, log "
+                "requires positive inputs and reciprocal requires nonzero inputs)."
+            )
         activation_qparams.append([
             fake_quant,
-            scale.to(device=fake_quant.scale.device, dtype=fake_quant.scale.dtype),
+            scale,
             zero_point.to(
                 device=fake_quant.zero_point.device,
                 dtype=fake_quant.zero_point.dtype,
@@ -688,19 +797,82 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
             "Shift-aware activation-grid constraint solver did not converge"
         )
 
-    locked_scales = []
+    # Lock tied weights once, in graph order. Later invocations retain that
+    # exact weight grid and coarsen their output activation grid just enough
+    # to select a legal right shift. Computing and writing one scale per call
+    # would make the last call silently invalidate every earlier call that
+    # shares the fake-quantized weight.
+    locked_scales_by_weight = {}
     for node, input_fq, weight_fq, output_fq, minimum_weight_scale in contracts:
+        input_row = activation_qparams_by_id[id(input_fq)]
+        output_row = activation_qparams_by_id[id(output_fq)]
+        weight_id = id(weight_fq)
+        if weight_id not in locked_scales_by_weight:
+            try:
+                scales = _safe_power_of_two_weight_scale(
+                    input_row[1],
+                    output_row[1],
+                    minimum_weight_scale,
+                )
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"Shift-aware QAT could not solve weight grid for {node.name}: {error}"
+                ) from error
+            locked_scales_by_weight[weight_id] = (weight_fq, scales)
+            continue
+
+        _, scales = locked_scales_by_weight[weight_id]
+        if _shift_ratios_are_realizable(input_row[1], scales, output_row[1]):
+            continue
+        old_scale = float(output_row[1].reshape(-1)[0].detach().cpu())
+        old_zero_point = int(output_row[2].reshape(-1)[0].detach().cpu())
         try:
-            scales = _safe_power_of_two_weight_scale(
-                activation_qparams_by_id[id(input_fq)][1],
-                activation_qparams_by_id[id(output_fq)][1],
-                minimum_weight_scale,
+            requested_scale = _shared_weight_output_scale(
+                input_row[1], scales, output_row[1]
+            )
+            scale, zero_point, lower, upper = _stage_activation_grid(
+                output_fq,
+                output_row[1],
+                output_row[2],
+                requested_scale,
             )
         except RuntimeError as error:
             raise RuntimeError(
-                f"Shift-aware QAT could not solve weight grid for {node.name}: {error}"
+                f"Shift-aware QAT could not align tied weight grid for {node.name}: {error}"
             ) from error
-        locked_scales.append((weight_fq, scales))
+        if not _shift_ratios_are_realizable(input_row[1], scales, scale):
+            raise RuntimeError(
+                f"Shift-aware QAT could not represent tied weight grid for {node.name}"
+            )
+        output_row[1] = scale
+        output_row[2] = zero_point
+        output_row[3] = lower
+        output_row[4] = upper
+        new_scale = float(scale.reshape(-1)[0].detach().cpu())
+        activation_retargets.append({
+            "op": node.name,
+            "scale_before": old_scale,
+            "scale_after": new_scale,
+            "zero_point_before": old_zero_point,
+            "zero_point_after": int(zero_point.reshape(-1)[0].detach().cpu()),
+            "shared_weight_alignment": True,
+        })
+
+    # A retargeted shared activation can participate in more than one graph
+    # contract. Validate the complete fixed point before mutating any module.
+    for node, input_fq, weight_fq, output_fq, _ in contracts:
+        _, scales = locked_scales_by_weight[id(weight_fq)]
+        if not _shift_ratios_are_realizable(
+            activation_qparams_by_id[id(input_fq)][1],
+            scales,
+            activation_qparams_by_id[id(output_fq)][1],
+        ):
+            raise RuntimeError(
+                "Shift-aware QAT tied-weight alignment invalidated another "
+                f"contract at {node.name}"
+            )
+
+    locked_scales = list(locked_scales_by_weight.values())
 
     fake_quantizers = [
         module for module in qat_model.modules() if isinstance(module, FakeQuantizeBase)
@@ -739,25 +911,30 @@ def sima_freeze_qat(qat_model: GraphModule) -> GraphModule:
     return qat_model
 
 
-def _ensure_bn_tracking_meta(gm: GraphModule) -> None:
-    """torch >= 2.8 `convert_pt2e` QAT bn-folding reads `node.meta["source_fn_stack"]`
-    on the BatchNorm `num_batches_tracked += 1` in-place add nodes, but graphs produced
-    by `export_for_training` don't always populate it -> KeyError. Those nodes have the
-    shape `aten.add_.Tensor(get_attr, 1)`; tag them so torch's loop erases them (its
-    intent for BN tracking nodes)."""
+def _remove_batchnorm_tracking_updates(gm: GraphModule) -> None:
+    """Remove dead BatchNorm batch-counter updates before PT2E conversion.
+
+    Frozen BatchNorm statistics no longer consume ``num_batches_tracked``.
+    Removing its dead in-place increment here also prevents PT2E's Conv-BN
+    folding passes from attempting to erase the same node more than once.
+    """
     if not hasattr(gm, "graph"):
         return
-    bn_tag = [("bn_num_batches_tracked", torch.nn.modules.batchnorm.BatchNorm2d)]
-    for node in gm.graph.nodes:
+    for node in list(gm.graph.nodes):
         if (
             node.op == "call_function"
             and node.target == torch.ops.aten.add_.Tensor
             and len(node.args) >= 2
             and getattr(node.args[0], "op", None) == "get_attr"
+            and str(getattr(node.args[0], "target", "")).endswith(
+                "num_batches_tracked"
+            )
             and node.args[1] == 1
-            and "source_fn_stack" not in node.meta
+            and not node.users
         ):
-            node.meta["source_fn_stack"] = bn_tag
+            gm.graph.erase_node(node)
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
 
 
 def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
@@ -777,6 +954,8 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
     
     if not isinstance(qat_model, GraphModule):
         return qat_model
+    if qat_model.meta.get("qat_state") == "fq":
+        return qat_model
     if not bool(getattr(qat_model, "qat_frozen", torch.tensor([0])).item()):
         warnings.warn(
             "Finalizing a shift-aware model before sima_freeze_qat(); scales will be locked now. "
@@ -785,8 +964,17 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
         )
         sima_freeze_qat(qat_model)
     print(f"Removing QAT scaffold and quantizing network ...")
-    _ensure_bn_tracking_meta(qat_model)
-    m = convert_pt2e(qat_model, use_reference_representation=False)
+    _remove_batchnorm_tracking_updates(qat_model)
+    with warnings.catch_warnings():
+        # Torch 2.8 can report a second erase for an overlapping Conv-BN
+        # pattern after the node was already removed successfully. Output and
+        # graph validation below cover the resulting folded graph.
+        warnings.filterwarnings(
+            "ignore",
+            message=r"erase_node\(batch_norm_\d+\) on an already erased node",
+            category=UserWarning,
+        )
+        m = convert_pt2e(qat_model, use_reference_representation=False)
     sima_mod = SimaQatWrapper(source=m, label='fq')
     # We must call eval() to invoke internal functions to put the GraphModule in eval state. Once we are
     # in FQ mode, we always remain in eval mode.
@@ -810,16 +998,29 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
     if not isinstance(qat_model, nn.Module):
         raise RuntimeError(f"Input graph to export function must be of type nn.Module, found {type(qat_model)}")
     qat_model = check_graph_nodes(qat_model, device='cpu')
-    torch.onnx.export(
-        qat_model,
-        inputs[0],
-        output_file,
-        export_params=True,
-        opset_version=17,
-        do_constant_folding=True,
-        input_names = input_names,
-        output_names = output_names,
-    )
+    with warnings.catch_warnings():
+        # ONNX InstanceNormalization always uses input statistics, matching
+        # PyTorch InstanceNorm with track_running_stats=False. The legacy
+        # exporter labels that valid behavior as train=True and warns solely
+        # because the surrounding export is in evaluation mode.
+        warnings.filterwarnings(
+            "ignore",
+            message=(
+                r"ONNX export mode is set to TrainingMode\.EVAL, but operator "
+                r"'instance_norm' is set to train=True\..*"
+            ),
+            category=UserWarning,
+        )
+        torch.onnx.export(
+            qat_model,
+            inputs,
+            output_file,
+            export_params=True,
+            opset_version=17,
+            do_constant_folding=True,
+            input_names=input_names,
+            output_names=output_names,
+        )
     qat_model = check_graph_nodes(qat_model, device=device)
     return qat_model
 

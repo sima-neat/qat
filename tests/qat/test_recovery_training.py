@@ -103,3 +103,25 @@ def test_frozen_checkpoint_resumes_without_legacy_mode_state() -> None:
     unsupported_state["shift_aware_qat"] = torch.tensor([False])
     with pytest.raises(RuntimeError, match="Only shift-aware"):
         resumed.load_state_dict(unsupported_state)
+
+
+def test_observer_updating_checkpoint_round_trip() -> None:
+    inputs = torch.randn(2, 3, 8, 8)
+    next_inputs = torch.randn(2, 3, 8, 8)
+    model = sima_prepare_qat_model(TinyClassifier(), (inputs,), "cpu")
+    model(inputs)
+    state = model.state_dict()
+
+    resumed = sima_prepare_qat_model(TinyClassifier(), (inputs,), "cpu")
+    resumed.load_state_dict(state)
+
+    assert not bool(resumed.qat_frozen.item())
+    assert resumed.state_dict().keys() == state.keys()
+    for name, expected in state.items():
+        torch.testing.assert_close(resumed.state_dict()[name], expected, rtol=0, atol=0)
+    torch.testing.assert_close(resumed(inputs), model(inputs), rtol=0, atol=0)
+
+    model(next_inputs)
+    resumed(next_inputs)
+    for name, expected in model.state_dict().items():
+        torch.testing.assert_close(resumed.state_dict()[name], expected, rtol=0, atol=0)

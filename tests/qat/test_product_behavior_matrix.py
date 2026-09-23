@@ -48,6 +48,35 @@ class FoldedDirection(nn.Module):
         return inputs[:, None].expand(-1, 2, -1).reshape(1, 8)
 
 
+class BatchDependentBranch(nn.Module):
+    """A shape-valid capture whose batch-two branch is wrong for batch one."""
+
+    def forward(self, inputs):
+        if inputs.shape[0] > 1:
+            return inputs + 10
+        return inputs - 10
+
+
+class DynamicDropout(nn.Module):
+    def forward(self, inputs):
+        return torch.nn.functional.dropout(
+            inputs,
+            p=0.5,
+            training=self.training,
+        )
+
+
+class NestedDynamicOutput(nn.Module):
+    def forward(self, inputs):
+        return {
+            "prediction": inputs * 2,
+            "auxiliary": (
+                inputs.mean(dim=-1),
+                inputs.argmax(dim=-1),
+            ),
+        }
+
+
 class MultiInputBatch(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -299,19 +328,25 @@ def _assert_source_equal(model, snapshot) -> None:
             torch.testing.assert_close(parameters[name].grad, expected, rtol=0, atol=0)
 
 
-def test_static_default_preserves_ordinary_and_folded_geometry() -> None:
+def test_dynamic_default_handles_ordinary_batch_geometry() -> None:
     ordinary = torch.randn(1, 2, 4)
     prepared = sima_prepare_qat_model(BatchTokenLinear(), (ordinary,), "cpu")
     assert prepared(ordinary).shape == (1, 3, 4)
-    with pytest.raises((RuntimeError, AssertionError)):
-        prepared(torch.randn(2, 2, 4))
+    assert prepared(torch.randn(2, 2, 4)).shape == (2, 3, 4)
 
+
+def test_explicit_static_capture_preserves_folded_geometry() -> None:
     folded = torch.randn(1, 4)
-    prepared_folded = sima_prepare_qat_model(FoldedDirection(), (folded,), "cpu")
+    prepared_folded = sima_prepare_qat_model(
+        FoldedDirection(),
+        (folded,),
+        "cpu",
+        dynamic_batch=False,
+    )
     assert prepared_folded(folded).shape == (1, 8)
 
 
-def test_explicit_dynamic_batch_handles_multi_input_shared_and_static_leading_dims() -> None:
+def test_dynamic_default_handles_multi_input_shared_and_static_leading_dims() -> None:
     values = torch.randn(1, 2, 4)
     mask = torch.randn(1, 2, 4)
     static_table = torch.randn(3, 4)
@@ -321,7 +356,6 @@ def test_explicit_dynamic_batch_handles_multi_input_shared_and_static_leading_di
         source,
         (values, mask, static_table),
         "cpu",
-        dynamic_batch=True,
     )
     for batch in (1, 2, 4):
         output = prepared(
@@ -362,9 +396,7 @@ def test_successful_dynamic_prepare_leaves_source_mode_state_and_device_unchange
     example = torch.randn(1, 3, 4, 4)
     snapshot = _snapshot_source(source)
 
-    prepared = sima_prepare_qat_model(
-        source, (example,), "cpu", dynamic_batch=True
-    )
+    prepared = sima_prepare_qat_model(source, (example,), "cpu")
 
     _assert_source_equal(source, snapshot)
     for batch in (1, 2, 4):
@@ -377,9 +409,54 @@ def test_dynamic_batch_failure_leaves_source_and_batchnorm_unchanged() -> None:
     snapshot = _snapshot_source(source)
 
     with pytest.raises(RuntimeError, match="Dynamic-batch QAT capture"):
-        sima_prepare_qat_model(source, (example,), "cpu", dynamic_batch=True)
+        sima_prepare_qat_model(source, (example,), "cpu")
 
     _assert_source_equal(source, snapshot)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+def test_dynamic_batch_rejects_semantically_different_batch_branch(batch_size) -> None:
+    example = torch.ones(batch_size, 4)
+    source = BatchDependentBranch()
+    expected = source(example)
+
+    with pytest.raises(RuntimeError, match="does not preserve.*semantics"):
+        sima_prepare_qat_model(source, (example,), "cpu")
+
+    torch.testing.assert_close(source(example), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_dynamic_batch_rejects_narrowed_batch_range(batch_size) -> None:
+    class BatchThreshold(nn.Module):
+        def forward(self, inputs):
+            return inputs + 10 if inputs.shape[0] >= 4 else inputs - 10
+
+    with pytest.raises(RuntimeError, match="dynamic_batch=False"):
+        sima_prepare_qat_model(BatchThreshold(), (torch.ones(batch_size, 4),), "cpu")
+
+
+def test_dynamic_batch_parity_reuses_rng_for_stochastic_outputs() -> None:
+    prepared = sima_prepare_qat_model(
+        DynamicDropout().train(),
+        (torch.randn(1, 8),),
+        "cpu",
+    )
+
+    assert prepared(torch.randn(3, 8)).shape == (3, 8)
+
+
+def test_dynamic_batch_parity_supports_nested_output_pytrees() -> None:
+    prepared = sima_prepare_qat_model(
+        NestedDynamicOutput(),
+        (torch.randn(1, 4),),
+        "cpu",
+    )
+
+    output = prepared(torch.randn(3, 4))
+    assert output["prediction"].shape == (3, 4)
+    assert output["auxiliary"][0].shape == (3,)
+    assert output["auxiliary"][1].shape == (3,)
 
 
 def test_solver_propagates_coarsened_grid_through_multi_op_chain() -> None:
@@ -552,12 +629,19 @@ def test_cpu_wrapper_buffers_follow_graph_device() -> None:
     assert finalized.qat_frozen.device.type == "cpu"
 
 
-def test_corrupted_observers_preserve_prepared_finalized_and_onnx_qparams(tmp_path) -> None:
+def test_frozen_checkpoint_preserves_finalized_and_onnx_qparams(tmp_path) -> None:
     inputs = torch.randn(1, 3, 4, 4)
     model = sima_prepare_qat_model(Conv2dModel(), (inputs,), "cpu")
     model(inputs)
     sima_freeze_qat(model)
-    fake_quantizers = [module for module in model.modules() if isinstance(module, FakeQuantizeBase)]
+    state = model.state_dict()
+    resumed = sima_prepare_qat_model(Conv2dModel(), (inputs,), "cpu")
+    resumed.load_state_dict(state)
+    assert bool(resumed.qat_frozen.item())
+
+    fake_quantizers = [
+        module for module in resumed.modules() if isinstance(module, FakeQuantizeBase)
+    ]
     frozen = Counter(
         _qparam_key(
             module.scale.detach().cpu().numpy(),
@@ -572,8 +656,8 @@ def test_corrupted_observers_preserve_prepared_finalized_and_onnx_qparams(tmp_pa
         torch.testing.assert_close(scale, module.scale, rtol=0, atol=0)
         torch.testing.assert_close(zero_point, module.zero_point, rtol=0, atol=0)
     with torch.no_grad():
-        prepared_output = model(inputs).clone()
-    finalized = sima_finalize_qat_model(model)
+        prepared_output = resumed(inputs).clone()
+    finalized = sima_finalize_qat_model(resumed)
     with torch.no_grad():
         finalized_output = finalized(inputs)
     torch.testing.assert_close(finalized_output, prepared_output, rtol=0, atol=0)

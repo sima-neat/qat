@@ -8,6 +8,9 @@ exported to an INT8 Q/DQ ONNX graph.
 
 **Required PyTorch:** 2.8.x (the provided environment pins 2.8.0; Python ≥ 3.10).
 
+See the [QAT user guide](docs/index.md) for installation and the complete
+training-to-export workflow.
+
 ## Setup
 
 ```bash
@@ -54,7 +57,7 @@ qat_model = sima_prepare_qat_model(model, example_inputs, device='cuda')
 
 # 2. Warm up observers with your normal training loop ...
 
-# 3. Lock AFE-compatible power-of-two scales, then fine-tune for a few more epochs.
+# 3. Lock shift-aware power-of-two scales, then fine-tune for a few more epochs.
 sima_freeze_qat(qat_model)
 # ... continue training qat_model ...
 
@@ -65,19 +68,38 @@ qat_model = sima_finalize_qat_model(qat_model)
 sima_export_onnx(qat_model, example_inputs, 'model.onnx', device='cuda')
 ```
 
-Shift-aware QAT constrains each convolution or linear weight scale so that AFE can use its native
-integer shift requantization without rescaling the learned INT8 weight codes. Calling
-`sima_freeze_qat` explicitly leaves time to fine-tune against those locked scales. Finalization will
-lock them automatically if necessary, but fine-tuning after the explicit call generally gives better
-accuracy.
+Shift-aware QAT constrains each convolution or linear weight scale to a power-of-two relationship
+with its input and output activation grids. Calling `sima_freeze_qat` explicitly leaves time to
+fine-tune against those locked scales. Finalization locks them automatically if necessary, but
+fine-tuning after the explicit call generally gives better accuracy.
 
-Preparation preserves the exact example shapes by default. Models that are
-truly batch-polymorphic can opt in with
-`sima_prepare_qat_model(..., dynamic_batch=True)`. The opt-in capture is
-validated on the original example and fails closed when batch participates in
-folded recurrence, scan-direction, or layout geometry.
-This deliberately replaces prior automatic batch-one duplication; existing
-three-argument calls remain valid but now capture static shapes.
+## Operator contract
+
+The operator manifest describes which captured PyTorch forms receive QAT annotations, which reuse an
+existing quantization grid, and which remain ordinary floating-point operations. It is a contract for
+training and standard opset-17 QDQ export, not for a particular execution backend.
+
+| family | QAT contract |
+|---|---|
+| Conv1d, Conv2d, Linear | signed W8A8 with shift-aware per-channel weight locking |
+| MatMul, MM, BMM, BAddBMM | signed activation QDQ on floating tensor operands |
+| Softmax, LayerNorm | signed activation QDQ with the original logical axes preserved |
+| InstanceNorm | input-statistics behavior (`track_running_stats=False`) with finalized PyTorch/ONNX Runtime parity |
+| Erf and GELU | Erf and exact (`approximate="none"`) GELU are annotated; tanh GELU passes through unannotated |
+| Concat | W8A8; repeated-input and identity-prefix layouts share the payload grid |
+| ArgMax, TopK | values may participate in QAT; integer index outputs are never fake-quantized |
+| PReLU, ConvTranspose, Embedding, GridSample, ReduceMin, CumSum | trainable pass-through forms with no QAT annotation |
+
+Pass-through forms are not errors: preparation, training, and export continue normally around them.
+They are listed explicitly so the package does not imply that fake quantization was applied where no
+annotator exists.
+
+Preparation keeps the leading tensor dimension dynamic by default so the same
+QAT graph can train with ordinary loader batch sizes and export with a concrete
+deployment batch. The capture is validated against the original model output.
+Models that intentionally require a fixed batch, including models that fold
+batch into recurrence, scan-direction, or layout geometry, can opt out with
+`sima_prepare_qat_model(..., dynamic_batch=False)`.
 Preparation captures isolated CPU copies of the module and example-input
 pytree, then moves only the returned QAT graph to `device`. The caller's
 module, parameters, buffers, training modes, devices, and input tensors are
@@ -85,16 +107,17 @@ left unchanged on both successful and failed capture.
 
 | function | purpose |
 |---|---|
-| `sima_prepare_qat_model(model, inputs, device, *, dynamic_batch=False)` | Capture the model and insert SiMa shift-aware fake-quant annotations. Dynamic training batch is explicit opt-in. |
-| `sima_freeze_qat(qat_model)` | Freeze observers and lock AFE-compatible weight scales before final fine-tuning. |
+| `sima_prepare_qat_model(model, inputs, device, *, dynamic_batch=True)` | Capture the model and insert SiMa shift-aware fake-quant annotations. Set `dynamic_batch=False` only for intentionally fixed-batch models. |
+| `sima_freeze_qat(qat_model)` | Freeze observers and lock shift-aware weight scales before final fine-tuning. |
 | `sima_finalize_qat_model(qat_model)` | Fold the trained scaffolding into an inference-only quantized graph. |
 | `sima_export_onnx(qat_model, inputs, output_file, ...)` | Export the finalized model to an ONNX QuantizeLinear/DequantizeLinear graph. |
 
 ## Examples
 
 [examples/mnist](examples/mnist) and [examples/imagenet](examples/imagenet) are runnable
-PyTorch-Lightning workflows that wire the API into the `on_train_start` (prepare) /
-`on_train_epoch_start` (freeze) / `on_train_end` (finalize) / `on_fit_end` (export) hooks.
+PyTorch-Lightning workflows that prepare QAT at the start of `configure_optimizers`, before the
+optimizer captures parameter references, then use `on_train_epoch_start` (freeze) /
+`on_train_end` (finalize) / `on_fit_end` (export) hooks.
 By default, they freeze the quantization grids at the start of the final epoch, leaving that epoch
 for recovery training. Use `--freeze-epoch N` to select another zero-based epoch, or
 `--freeze-epoch -1` to retain the old finalize-only behavior. Each has the same four scripts:
@@ -122,6 +145,14 @@ python export_onnx.py --model resnet18
 
 Pass `--disable-qat` to either `train.py` to train a plain float baseline instead of QAT.
 
+**YOLO26n** — [examples/yolo26n_pytorch_qat](examples/yolo26n_pytorch_qat) is a
+plain-PyTorch COCO QAT workflow. It reads COCO JSON directly, reproduces the
+YOLO26 dual-head objective, and exports the finalized QDQ model outputs.
+Ultralytics is used only by an isolated, one-time checkpoint converter; the
+model, data path, loss, optimizer, and training process have no Ultralytics
+runtime dependency. See the example README for COCO128 smoke and full COCO 2017
+commands.
+
 ## Tests
 
 ```bash
@@ -143,6 +174,16 @@ pytest -m nightly tests/end_to_end
 ```
 
 Generated ONNX models are written to `exported_models/` (gitignored).
+
+## CI/CD
+
+`.github/workflows/vulcan-ci.yml` builds the wheel on a public Ubuntu runner,
+installs it into a fresh CPU environment, and runs the regression suite from
+outside the checkout. Pull requests stop after validation. Branch and tag
+pushes publish that same tested wheel, its checksum, and package metadata to
+Vulcan, then advance only that branch or tag's `latest.tag` pointer. The
+`VULCAN_ENV` repository variable selects the destination and defaults to
+`production`, matching the core package workflow.
 
 ## Layout
 
