@@ -40,6 +40,23 @@ class IdentityPaddingConcat(nn.Module):
         return torch.cat((prefix, inputs[:-1]), dim=0)
 
 
+class UnitPrefixConcat(nn.Module):
+    def forward(self, inputs: Tensor) -> Tensor:
+        return torch.cat((torch.ones_like(inputs[:, :1]), inputs[:, 1:]), dim=1)
+
+
+class NonzeroConstantPad(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(1, 1, 1)
+        with torch.no_grad():
+            self.conv.weight.zero_()
+            self.conv.bias.fill_(0.15)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return torch.nn.functional.pad(self.conv(inputs), (1, 1, 1, 1), value=1.0)
+
+
 class ApproximateGelu(nn.Module):
     def forward(self, inputs: Tensor) -> Tensor:
         return torch.nn.functional.gelu(inputs, approximate="tanh")
@@ -138,12 +155,11 @@ def test_repeated_input_concat_reuses_the_payload_grid() -> None:
     assert _qdq_qparams(output_quantizer) == _qdq_qparams(input_dequantizers[0])
 
 
-@pytest.mark.parametrize("identity", [0.0, 1.0])
-def test_identity_padding_concat_reuses_the_payload_grid(identity: float) -> None:
+def test_zero_padding_concat_reuses_the_payload_grid() -> None:
     # Batch slicing generates a narrowed Torch shape guard; this test checks
     # concat quantization, not dynamic capture, so use the fixed-batch fallback.
     cat = _converted_cat(
-        IdentityPaddingConcat(identity), torch.randn(4, 3, 8, 8), dynamic_batch=False
+        IdentityPaddingConcat(0.0), torch.randn(4, 3, 8, 8), dynamic_batch=False
     )
     input_dequantizers = list(cat.args[0])
     output_quantizer = next(
@@ -155,6 +171,35 @@ def test_identity_padding_concat_reuses_the_payload_grid(identity: float) -> Non
     assert len(input_dequantizers) == 2
     assert _qdq_qparams(input_dequantizers[0]) == _qdq_qparams(input_dequantizers[1])
     assert _qdq_qparams(output_quantizer) == _qdq_qparams(input_dequantizers[1])
+
+
+def test_ones_prefix_concat_preserves_the_unit_value() -> None:
+    inputs = torch.linspace(0.1, 0.2, 24).reshape(2, 4, 3)
+    source = UnitPrefixConcat()
+    prepared = sima_prepare_qat_model(source, (inputs,), "cpu")
+    for _ in range(100):
+        prepared(inputs)
+    sima_freeze_qat(prepared)
+    frozen = prepared(inputs).detach()
+    torch.testing.assert_close(
+        frozen[:, :1], torch.ones_like(frozen[:, :1]), rtol=0, atol=0.01
+    )
+    finalized = sima_finalize_qat_model(prepared)
+    torch.testing.assert_close(finalized(inputs), frozen, rtol=0, atol=0)
+
+
+def test_nonzero_constant_pad_observes_the_fill_value() -> None:
+    inputs = torch.linspace(-1, 1, 8).reshape(2, 1, 2, 2)
+    source = NonzeroConstantPad()
+    expected = source(inputs).detach()
+    prepared = sima_prepare_qat_model(source, (inputs,), "cpu")
+    for _ in range(100):
+        prepared(inputs)
+    sima_freeze_qat(prepared)
+    frozen = prepared(inputs).detach()
+    torch.testing.assert_close(frozen, expected, rtol=0, atol=0.01)
+    finalized = sima_finalize_qat_model(prepared)
+    torch.testing.assert_close(finalized(inputs), frozen, rtol=0, atol=0)
 
 
 def test_attention_core_finalizes_and_exports_all_inputs(tmp_path) -> None:

@@ -718,9 +718,23 @@ def _sima_annotate_grid_preserving(
         if source_annotation is None or source_annotation.output_qspec is None:
             continue
         shared_qspec = SharedQuantizationSpec(input_node)
+        output_qspec = shared_qspec
+        if node.target == torch.ops.aten.pad.default:
+            mode = (
+                node.args[2]
+                if len(node.args) > 2
+                else node.kwargs.get("mode", "constant")
+            )
+            value = (
+                node.args[3]
+                if len(node.args) > 3
+                else node.kwargs.get("value")
+            )
+            if mode == "constant" and value not in (None, 0, 0.0):
+                output_qspec = get_output_act_qspec(quantization_config)
         node.meta["quantization_annotation"] = QuantizationAnnotation(
             input_qspec_map={input_node: shared_qspec},
-            output_qspec=shared_qspec,
+            output_qspec=output_qspec,
             _annotated=True,
         )
         annotated.append([node])
@@ -1448,10 +1462,7 @@ def _sima_annotate_cat(
 
         identity_padding_reference = None
         if len(inputs) == 2 and all(isinstance(value, Node) for value in inputs):
-            identity_padding_targets = {
-                torch.ops.aten.zeros_like.default,
-                torch.ops.aten.ones_like.default,
-            }
+            identity_padding_targets = {torch.ops.aten.zeros_like.default}
             if inputs[0].target in identity_padding_targets:
                 identity_padding_reference = inputs[1]
                 ensure_concrete_output_qspec(identity_padding_reference)
