@@ -1,11 +1,9 @@
-from argparse import Namespace
 import argparse
+import os
 
 import torchvision.datasets as datasets
-import os
 from torch.utils.data import DataLoader
 from torchvision import transforms
-import argparse
 
 import pytorch_lightning as L
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -14,7 +12,10 @@ from imagenet_lit import ImageNet_Model_Trainer
 
 from sima_qat.misc import find_latest_file_string
 
-def get_train_dataloader(data_path, batch_size, samples_limit, crop_size):
+
+def get_train_dataloader(
+    data_path, batch_size, samples_limit, workers, crop_size, pin_memory=False
+):
     """ Function in order to get the train data loader required for training
         The train data must be in the /train folder under the imagenet data path """
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -31,14 +32,16 @@ def get_train_dataloader(data_path, batch_size, samples_limit, crop_size):
         dataset=train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
-        num_workers=127,
-        pin_memory=True, 
-        persistent_workers=True
+        num_workers=workers,
+        pin_memory=pin_memory,
+        persistent_workers=workers > 0,
     )
 
     return train_loader
     
-def get_val_dataloader(data_path, batch_size, workers, resize_size, crop_size):
+def get_val_dataloader(
+    data_path, batch_size, workers, resize_size, crop_size, pin_memory=False
+):
     """ Function in order to get the validation data loader required for validation
         The validation data must be in the /val folder under the imagenet data path"""
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -54,8 +57,8 @@ def get_val_dataloader(data_path, batch_size, workers, resize_size, crop_size):
         batch_size=batch_size,
         shuffle=False,
         num_workers=workers,
-        pin_memory=True, 
-        persistent_workers=True
+        pin_memory=pin_memory,
+        persistent_workers=workers > 0,
     )
     return val_loader
 
@@ -96,8 +99,23 @@ def run_train(args: argparse.Namespace):
     classifier.to(args.device)
 
     #NOTE : For some models like Inception_v3 the resize_size and the crop_size will be different
-    train_loader = get_train_dataloader(args.data, args.batch, args.samples_limit, crop_size=224)
-    val_loader = get_val_dataloader(args.data, args.batch, workers=4, resize_size=256, crop_size=224)
+    pin_memory = args.device.startswith("cuda")
+    train_loader = get_train_dataloader(
+        args.data,
+        args.batch,
+        args.samples_limit,
+        args.workers,
+        crop_size=224,
+        pin_memory=pin_memory,
+    )
+    val_loader = get_val_dataloader(
+        args.data,
+        args.batch,
+        args.workers,
+        resize_size=256,
+        crop_size=224,
+        pin_memory=pin_memory,
+    )
     
     checkpoint_callback = ModelCheckpoint(
         dirpath='./checkpoints',
@@ -110,7 +128,7 @@ def run_train(args: argparse.Namespace):
     trainer = L.Trainer(
         max_epochs=args.epochs, 
         accelerator=args.device, 
-        devices=[0],
+        devices=1,
         default_root_dir='.',
         callbacks=[checkpoint_callback],
     )
@@ -134,6 +152,10 @@ def get_args():
     parser.add_argument('--device', type=str, default="cpu", help='Device to use')
     parser.add_argument('--model', type=str, default="resnet18", help='Torchvision Imagenet Model to be trained')
     parser.add_argument('--samples-limit', type=int, default=1281167, help='Limit train samples to size N')
+    parser.add_argument(
+        '-j', '--workers', type=int, default=4,
+        help='DataLoader worker processes; use 0 to disable multiprocessing',
+    )
     parser.add_argument('--export-on-end', action='store_true', help='Export ONNX model at training end')
     parser.add_argument('--disable-qat', action='store_true', help='Disable QAT mode')
     parser.add_argument(

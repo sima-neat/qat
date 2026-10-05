@@ -29,6 +29,12 @@ from torch.utils._pytree import tree_flatten, tree_map
 
 
 from sima_qat import onnx_ops
+from sima_qat._batchnorm import (
+    capture_batchnorm_settings,
+    capture_folded_batchnorm_parameters,
+    restore_batchnorm_settings,
+    restore_folded_batchnorm_parameters,
+)
 from sima_qat.sima_quantizer import (
     SimaFakeQuantize,
     SimaQuantizer,
@@ -134,7 +140,9 @@ def sima_prepare_qat_model(
 
     cfg = get_sima_quantization_config(is_qat=True)
     quantizer = SimaQuantizer().set_global(cfg)
+    bn_settings = capture_batchnorm_settings(m, record_folding=True)
     gm = prepare_qat_pt2e(m, quantizer)
+    restore_batchnorm_settings(gm, bn_settings, restore_folding=True)
     sima_mod = SimaQatWrapper(source=gm, label='scaffold')
     sima_mod.to(device)
     sima_mod.train()
@@ -965,6 +973,7 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
         sima_freeze_qat(qat_model)
     print(f"Removing QAT scaffold and quantizing network ...")
     _remove_batchnorm_tracking_updates(qat_model)
+    folded_bn_parameters = capture_folded_batchnorm_parameters(qat_model)
     with warnings.catch_warnings():
         # Torch 2.8 can report a second erase for an overlapping Conv-BN
         # pattern after the node was already removed successfully. Output and
@@ -975,6 +984,9 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
             category=UserWarning,
         )
         m = convert_pt2e(qat_model, use_reference_representation=False)
+    if folded_bn_parameters:
+        # Correct PT2E's materialized folds without touching unfused/shared branches.
+        restore_folded_batchnorm_parameters(m, folded_bn_parameters)
     sima_mod = SimaQatWrapper(source=m, label='fq')
     # We must call eval() to invoke internal functions to put the GraphModule in eval state. Once we are
     # in FQ mode, we always remain in eval mode.
@@ -1103,6 +1115,7 @@ class SimaQatWrapper(GraphModule):
             mtext = {True: "train", False: "eval"}
             print(f"Switching mode to: {mtext[use_train]}")
 
+        bn_settings = capture_batchnorm_settings(self)
         if use_train:
             move_exported_model_to_train(self)
             if bool(getattr(self, "qat_frozen", torch.tensor([0])).item()):
@@ -1111,6 +1124,7 @@ class SimaQatWrapper(GraphModule):
         else:
             move_exported_model_to_eval(self)
             self.training = False
+        restore_batchnorm_settings(self, bn_settings)
         return self
 
     def eval(self, use_eval: bool = True) -> 'SimaQatWrapper':
