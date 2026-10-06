@@ -1,32 +1,3 @@
-#**************************************************************************
-#||                        SiMa.ai CONFIDENTIAL                          ||
-#||   Unpublished Copyright (c) 2024 SiMa.ai, All Rights Reserved.       ||
-#**************************************************************************
-# NOTICE:  All information contained herein is, and remains the property of
-# SiMa.ai. The intellectual and technical concepts contained herein are
-# proprietary to SiMa and may be covered by U.S. and Foreign Patents,
-# patents in process, and are protected by trade secret or copyright law.
-#
-# Dissemination of this information or reproduction of this material is
-# strictly forbidden unless prior written permission is obtained from
-# SiMa.ai.  Access to the source code contained herein is hereby forbidden
-# to anyone except current SiMa.ai employees, managers or contractors who
-# have executed Confidentiality and Non-disclosure agreements explicitly
-# covering such access.
-#
-# The copyright notice above does not evidence any actual or intended
-# publication or disclosure  of  this source code, which includes information
-# that is confidential and/or proprietary, and is a trade secret, of SiMa.ai.
-#
-# ANY REPRODUCTION, MODIFICATION, DISTRIBUTION, PUBLIC PERFORMANCE, OR PUBLIC
-# DISPLAY OF OR THROUGH USE OF THIS SOURCE CODE WITHOUT THE EXPRESS WRITTEN
-# CONSENT OF SiMa.ai IS STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE
-# LAWS AND INTERNATIONAL TREATIES. THE RECEIPT OR POSSESSION OF THIS SOURCE
-# CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS TO
-# REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE, USE, OR
-# SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
-#
-#**************************************************************************
 import os
 import logging
 import argparse
@@ -86,14 +57,35 @@ class MNIST_Validation(MNIST):
 
 
 
+def _resolve_freeze_epoch(args: Namespace) -> int | None:
+    if args.disable_qat or args.freeze_epoch == -1:
+        return None
+    freeze_epoch = args.freeze_epoch
+    if freeze_epoch is None:
+        freeze_epoch = args.epochs - 1 if args.epochs > 1 else None
+    if freeze_epoch is not None and not 1 <= freeze_epoch < args.epochs:
+        raise ValueError(
+            "--freeze-epoch must be between 1 and epochs-1, or -1 to disable recovery"
+        )
+    return freeze_epoch
+
+
 def run_train(args: Namespace):
     """ Run the training regimen.
     """
+    freeze_epoch = _resolve_freeze_epoch(args)
     if args.resume:
         ckpt = find_latest_file_string(root_path='./checkpoints', tag_str='.ckpt')
-        classifier = MNIST_Trainer.load_from_checkpoint(ckpt)
+        classifier = MNIST_Trainer.load_from_checkpoint(
+            ckpt,
+            freeze_epoch=freeze_epoch,
+        )
     else:
-        classifier = MNIST_Trainer(export_on_end=args.export_on_end, use_qat=(not args.disable_qat))
+        classifier = MNIST_Trainer(
+            export_on_end=args.export_on_end,
+            use_qat=(not args.disable_qat),
+            freeze_epoch=freeze_epoch,
+        )
 
     classifier.to(args.device)
 
@@ -150,6 +142,12 @@ def get_args():
     parser.add_argument('--samples-limit', type=int, default=50000, help='Limit train samples to size N')
     parser.add_argument('--export-on-end', action='store_true', help='Export ONNX model at training end')
     parser.add_argument('--disable-qat', action='store_true', help='Disable QAT mode')
+    parser.add_argument(
+        '--freeze-epoch',
+        type=int,
+        default=None,
+        help='Zero-based epoch for locking QAT grids; defaults to the final epoch, -1 disables recovery',
+    )
     parser.add_argument('--resume', action='store_true', help='Resume training from most recent ckpt')
     all_args = parser.parse_args()
     return all_args
@@ -161,4 +159,3 @@ if __name__ == "__main__":
     run_args = get_args()
 
     run_train(run_args)
-

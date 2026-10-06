@@ -1,32 +1,3 @@
-#**************************************************************************
-#||                        SiMa.ai CONFIDENTIAL                          ||
-#||   Unpublished Copyright (c) 2024 SiMa.ai, All Rights Reserved.       ||
-#**************************************************************************
-# NOTICE:  All information contained herein is, and remains the property of
-# SiMa.ai. The intellectual and technical concepts contained herein are
-# proprietary to SiMa and may be covered by U.S. and Foreign Patents,
-# patents in process, and are protected by trade secret or copyright law.
-#
-# Dissemination of this information or reproduction of this material is
-# strictly forbidden unless prior written permission is obtained from
-# SiMa.ai.  Access to the source code contained herein is hereby forbidden
-# to anyone except current SiMa.ai employees, managers or contractors who
-# have executed Confidentiality and Non-disclosure agreements explicitly
-# covering such access.
-#
-# The copyright notice above does not evidence any actual or intended
-# publication or disclosure  of  this source code, which includes information
-# that is confidential and/or proprietary, and is a trade secret, of SiMa.ai.
-#
-# ANY REPRODUCTION, MODIFICATION, DISTRIBUTION, PUBLIC PERFORMANCE, OR PUBLIC
-# DISPLAY OF OR THROUGH USE OF THIS SOURCE CODE WITHOUT THE EXPRESS WRITTEN
-# CONSENT OF SiMa.ai IS STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE
-# LAWS AND INTERNATIONAL TREATIES. THE RECEIPT OR POSSESSION OF THIS SOURCE
-# CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS TO
-# REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE, USE, OR
-# SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
-#
-#**************************************************************************
 """ResNet50 QAT regression on the FULL CIFAR10 dataset.
 
 Full torchvision ResNet50 (bottleneck blocks + residual adds + batchnorm), retargeted to
@@ -50,6 +21,7 @@ from torchvision import transforms
 from torchvision.datasets import CIFAR10
 from torchvision.models import resnet50
 
+pytest.importorskip("pytorch_lightning")
 import pytorch_lightning as L
 from pytorch_lightning.utilities import disable_possible_user_warnings
 
@@ -237,7 +209,7 @@ def _run_resnet50_qat(args: Namespace) -> bool:
         cc.build_dataloaders = orig_build_dataloaders
 
 
-@pytest.mark.regression
+@pytest.mark.nightly
 @pytest.mark.skipif(not torch.cuda.is_available(),
                     reason="ResNet50 full-CIFAR10 QAT run requires a CUDA GPU")
 def test_resnet50():

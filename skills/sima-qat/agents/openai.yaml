@@ -1,0 +1,4 @@
+interface:
+  display_name: "SiMa QAT"
+  short_description: "Integrate and validate SiMa QAT training"
+  default_prompt: "Use $sima-qat to add quantization-aware training to this PyTorch project and validate the exported QDQ ONNX model."

@@ -1,32 +1,3 @@
-#**************************************************************************
-#||                        SiMa.ai CONFIDENTIAL                          ||
-#||   Unpublished Copyright (c) 2024 SiMa.ai, All Rights Reserved.       ||
-#**************************************************************************
-# NOTICE:  All information contained herein is, and remains the property of
-# SiMa.ai. The intellectual and technical concepts contained herein are
-# proprietary to SiMa and may be covered by U.S. and Foreign Patents,
-# patents in process, and are protected by trade secret or copyright law.
-#
-# Dissemination of this information or reproduction of this material is
-# strictly forbidden unless prior written permission is obtained from
-# SiMa.ai.  Access to the source code contained herein is hereby forbidden
-# to anyone except current SiMa.ai employees, managers or contractors who
-# have executed Confidentiality and Non-disclosure agreements explicitly
-# covering such access.
-#
-# The copyright notice above does not evidence any actual or intended
-# publication or disclosure  of  this source code, which includes information
-# that is confidential and/or proprietary, and is a trade secret, of SiMa.ai.
-#
-# ANY REPRODUCTION, MODIFICATION, DISTRIBUTION, PUBLIC PERFORMANCE, OR PUBLIC
-# DISPLAY OF OR THROUGH USE OF THIS SOURCE CODE WITHOUT THE EXPRESS WRITTEN
-# CONSENT OF SiMa.ai IS STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE
-# LAWS AND INTERNATIONAL TREATIES. THE RECEIPT OR POSSESSION OF THIS SOURCE
-# CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS TO
-# REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE, USE, OR
-# SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
-#
-#**************************************************************************
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -39,9 +10,12 @@ from torch.fx.graph_module import GraphModule
 
 import pytorch_lightning as L
 
-from sima_qat.qat_api import (sima_prepare_qat_model, 
-                              sima_finalize_qat_model, 
-                              sima_export_onnx)
+from sima_qat import (
+    sima_export_onnx,
+    sima_finalize_qat_model,
+    sima_freeze_qat,
+    sima_prepare_qat_model,
+)
 
 
 class MNIST_Model(nn.Module):
@@ -73,7 +47,12 @@ class MNIST_Model(nn.Module):
 
 
 class MNIST_Trainer(L.LightningModule):
-    def __init__(self, use_qat: bool = True, export_on_end: bool = False):
+    def __init__(
+        self,
+        use_qat: bool = True,
+        export_on_end: bool = False,
+        freeze_epoch: int | None = None,
+    ):
         super().__init__()
         self.mnist_model = MNIST_Model()
         self.loss_fn = CrossEntropyLoss()
@@ -82,15 +61,20 @@ class MNIST_Trainer(L.LightningModule):
         self.val_batch_count = 0
         self.use_qat = use_qat
         self.export_on_end = export_on_end
+        self.freeze_epoch = freeze_epoch
         self.dump_fx_graphs = True
         self.dummy_inputs = (torch.randn(1, 1, 28, 28), )
         # Call this last once all init has been done
         self.save_hyperparameters()
 
     def configure_optimizers(self):
+        if self.use_qat:
+            # Preparation replaces the eager parameters with captured QAT
+            # parameters, so it must happen before the optimizer is built.
+            self._prepare_qat()
         optimizer = optim.AdamW(self.parameters(), lr=1e-3)
         return optimizer
-    
+
     def forward(self, imgs):
         # Forward function that is run when visualizing the graph
         return self.mnist_model(imgs)
@@ -118,7 +102,7 @@ class MNIST_Trainer(L.LightningModule):
         self.val_accuracy += torch.mean(scores.type(torch.float32))
         self.val_batch_count += 1
         return loss
-    
+
     def on_validation_end(self) -> None:
         super().on_validation_end()
         top1_acc = self.val_accuracy / self.val_batch_count
@@ -129,13 +113,10 @@ class MNIST_Trainer(L.LightningModule):
 
     def on_train_start(self) -> None:
         super().on_train_start()
-        if self.use_qat:
-            self._prepare_qat()
-        else:
+        if not self.use_qat:
             # Do a compile so we can see an FX graph
             print(f"Compiling model to FX graph ...")
             self._dump_fx_graph('compiled_graph.txt')
-        pass
 
     def on_train_end(self) -> None:
         super().on_train_end()
@@ -144,6 +125,12 @@ class MNIST_Trainer(L.LightningModule):
     def on_train_epoch_start(self) -> None:
         # For some reason Lightning doesn't switch to train mode hence, we ensure it switches to train mode here
         self.train(True)
+        if (
+            self.use_qat
+            and self.freeze_epoch is not None
+            and self.current_epoch == self.freeze_epoch
+        ):
+            sima_freeze_qat(self.mnist_model)
 
     def _prepare_qat(self) -> None:
         m = sima_prepare_qat_model(input_graph=self.mnist_model, inputs=self.dummy_inputs, device=self.device)
@@ -198,4 +185,3 @@ class MNIST_Trainer(L.LightningModule):
         if self.use_qat:
             self._prepare_qat()
         return super().on_load_checkpoint(checkpoint)
-    

@@ -1,40 +1,9 @@
-#**************************************************************************
-#||                        SiMa.ai CONFIDENTIAL                          ||
-#||   Unpublished Copyright (c) 2024 SiMa.ai, All Rights Reserved.       ||
-#**************************************************************************
-# NOTICE:  All information contained herein is, and remains the property of
-# SiMa.ai. The intellectual and technical concepts contained herein are
-# proprietary to SiMa and may be covered by U.S. and Foreign Patents,
-# patents in process, and are protected by trade secret or copyright law.
-#
-# Dissemination of this information or reproduction of this material is
-# strictly forbidden unless prior written permission is obtained from
-# SiMa.ai.  Access to the source code contained herein is hereby forbidden
-# to anyone except current SiMa.ai employees, managers or contractors who
-# have executed Confidentiality and Non-disclosure agreements explicitly
-# covering such access.
-#
-# The copyright notice above does not evidence any actual or intended
-# publication or disclosure  of  this source code, which includes information
-# that is confidential and/or proprietary, and is a trade secret, of SiMa.ai.
-#
-# ANY REPRODUCTION, MODIFICATION, DISTRIBUTION, PUBLIC PERFORMANCE, OR PUBLIC
-# DISPLAY OF OR THROUGH USE OF THIS SOURCE CODE WITHOUT THE EXPRESS WRITTEN
-# CONSENT OF SiMa.ai IS STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE
-# LAWS AND INTERNATIONAL TREATIES. THE RECEIPT OR POSSESSION OF THIS SOURCE
-# CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS TO
-# REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE, USE, OR
-# SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
-#
-#**************************************************************************
-from argparse import Namespace
 import argparse
+import os
 
 import torchvision.datasets as datasets
-import os
 from torch.utils.data import DataLoader
 from torchvision import transforms
-import argparse
 
 import pytorch_lightning as L
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -43,7 +12,10 @@ from imagenet_lit import ImageNet_Model_Trainer
 
 from sima_qat.misc import find_latest_file_string
 
-def get_train_dataloader(data_path, batch_size, samples_limit, crop_size):
+
+def get_train_dataloader(
+    data_path, batch_size, samples_limit, workers, crop_size, pin_memory=False
+):
     """ Function in order to get the train data loader required for training
         The train data must be in the /train folder under the imagenet data path """
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -60,14 +32,16 @@ def get_train_dataloader(data_path, batch_size, samples_limit, crop_size):
         dataset=train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
-        num_workers=127,
-        pin_memory=True, 
-        persistent_workers=True
+        num_workers=workers,
+        pin_memory=pin_memory,
+        persistent_workers=workers > 0,
     )
 
     return train_loader
     
-def get_val_dataloader(data_path, batch_size, workers, resize_size, crop_size):
+def get_val_dataloader(
+    data_path, batch_size, workers, resize_size, crop_size, pin_memory=False
+):
     """ Function in order to get the validation data loader required for validation
         The validation data must be in the /val folder under the imagenet data path"""
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -83,27 +57,65 @@ def get_val_dataloader(data_path, batch_size, workers, resize_size, crop_size):
         batch_size=batch_size,
         shuffle=False,
         num_workers=workers,
-        pin_memory=True, 
-        persistent_workers=True
+        pin_memory=pin_memory,
+        persistent_workers=workers > 0,
     )
     return val_loader
+
+
+def _resolve_freeze_epoch(args: argparse.Namespace) -> int | None:
+    if args.disable_qat or args.freeze_epoch == -1:
+        return None
+    freeze_epoch = args.freeze_epoch
+    if freeze_epoch is None:
+        freeze_epoch = args.epochs - 1 if args.epochs > 1 else None
+    if freeze_epoch is not None and not 1 <= freeze_epoch < args.epochs:
+        raise ValueError(
+            "--freeze-epoch must be between 1 and epochs-1, or -1 to disable recovery"
+        )
+    return freeze_epoch
 
 
 def run_train(args: argparse.Namespace):
     """ Run the training regimen.
     """
+    freeze_epoch = _resolve_freeze_epoch(args)
     if args.resume:
         ckpt = find_latest_file_string(root_path='./checkpoints', tag_str='.ckpt')
-        classifier = ImageNet_Model_Trainer.load_from_checkpoint(ckpt)
+        classifier = ImageNet_Model_Trainer.load_from_checkpoint(
+            ckpt,
+            freeze_epoch=freeze_epoch,
+        )
     else:
-        classifier = ImageNet_Model_Trainer(model=args.model, export_on_end=args.export_on_end, use_qat=(not args.disable_qat), 
-                                            batch_size=args.batch, device_train=args.device)
+        classifier = ImageNet_Model_Trainer(
+            model=args.model,
+            export_on_end=args.export_on_end,
+            use_qat=(not args.disable_qat),
+            batch_size=args.batch,
+            device_train=args.device,
+            freeze_epoch=freeze_epoch,
+        )
 
     classifier.to(args.device)
 
     #NOTE : For some models like Inception_v3 the resize_size and the crop_size will be different
-    train_loader = get_train_dataloader(args.data, args.batch, args.samples_limit, crop_size=224)
-    val_loader = get_val_dataloader(args.data, args.batch, workers=4, resize_size=256, crop_size=224)
+    pin_memory = args.device.startswith("cuda")
+    train_loader = get_train_dataloader(
+        args.data,
+        args.batch,
+        args.samples_limit,
+        args.workers,
+        crop_size=224,
+        pin_memory=pin_memory,
+    )
+    val_loader = get_val_dataloader(
+        args.data,
+        args.batch,
+        args.workers,
+        resize_size=256,
+        crop_size=224,
+        pin_memory=pin_memory,
+    )
     
     checkpoint_callback = ModelCheckpoint(
         dirpath='./checkpoints',
@@ -116,7 +128,7 @@ def run_train(args: argparse.Namespace):
     trainer = L.Trainer(
         max_epochs=args.epochs, 
         accelerator=args.device, 
-        devices=[0],
+        devices=1,
         default_root_dir='.',
         callbacks=[checkpoint_callback],
     )
@@ -140,8 +152,18 @@ def get_args():
     parser.add_argument('--device', type=str, default="cpu", help='Device to use')
     parser.add_argument('--model', type=str, default="resnet18", help='Torchvision Imagenet Model to be trained')
     parser.add_argument('--samples-limit', type=int, default=1281167, help='Limit train samples to size N')
+    parser.add_argument(
+        '-j', '--workers', type=int, default=4,
+        help='DataLoader worker processes; use 0 to disable multiprocessing',
+    )
     parser.add_argument('--export-on-end', action='store_true', help='Export ONNX model at training end')
     parser.add_argument('--disable-qat', action='store_true', help='Disable QAT mode')
+    parser.add_argument(
+        '--freeze-epoch',
+        type=int,
+        default=None,
+        help='Zero-based epoch for locking QAT grids; defaults to the final epoch, -1 disables recovery',
+    )
     parser.add_argument('--resume', action='store_true', help='Resume training from most recent checkpoint')
     all_args = parser.parse_args()
     return all_args
