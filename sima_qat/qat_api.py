@@ -954,14 +954,16 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
         qat_model: a trained QAT model to be converted into inference-only form.
 
     Returns:
-        GraphModule: an inference-only version of the QAT model, which can be run in Pytorch 
-            `eval(True)` mode, or exported via ONNX.
+        GraphModule: a CPU-resident, inference-only version of the QAT model,
+            which can be run in Pytorch `eval(True)` mode, or exported via ONNX.
     """
     if not isinstance(qat_model, nn.Module):
         raise RuntimeError(f"Input graph to finalize function must be of type nn.Module, found {type(qat_model)}")
     
+    qat_model = qat_model.to("cpu")
     if not isinstance(qat_model, GraphModule):
         return qat_model
+    qat_model = check_graph_nodes(qat_model, device="cpu")
     if qat_model.meta.get("qat_state") == "fq":
         return qat_model
     if not bool(getattr(qat_model, "qat_frozen", torch.tensor([0])).item()):
@@ -992,11 +994,12 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
     # in FQ mode, we always remain in eval mode.
     sima_mod.eval()
     sima_mod = replace_batchnorm(sima_mod)
+    sima_mod = check_graph_nodes(sima_mod, device="cpu")
     return sima_mod
 
 
 def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: str, input_names: Optional[List[str]] = None, 
-                     output_names: Optional[List[str]] = None, device: torch.device = 'cuda') -> GraphModule:
+                     output_names: Optional[List[str]] = None, device: torch.device = 'cpu') -> GraphModule:
     """This function exports a finalized QAT model to ONNX format.
 
     Args:
@@ -1006,10 +1009,15 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
         output_file: the path name of the .onnx file to generate.
         input_names: a list of tensor names used to label the ONNX model inputs.
         output_names: a list of tensor names used to label the ONNX model outputs.
+        device: the device for the returned model after export. ONNX export
+            always runs on CPU. The default keeps the model on CPU.
     """
     if not isinstance(qat_model, nn.Module):
         raise RuntimeError(f"Input graph to export function must be of type nn.Module, found {type(qat_model)}")
-    qat_model = check_graph_nodes(qat_model, device='cpu')
+    qat_model = qat_model.to("cpu")
+    if isinstance(qat_model, GraphModule):
+        qat_model = check_graph_nodes(qat_model, device="cpu")
+    export_inputs = _capture_inputs_to_cpu(inputs)
     with warnings.catch_warnings():
         # ONNX InstanceNormalization always uses input statistics, matching
         # PyTorch InstanceNorm with track_running_stats=False. The legacy
@@ -1025,7 +1033,7 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
         )
         torch.onnx.export(
             qat_model,
-            inputs,
+            export_inputs,
             output_file,
             export_params=True,
             opset_version=17,
@@ -1033,7 +1041,9 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
             input_names=input_names,
             output_names=output_names,
         )
-    qat_model = check_graph_nodes(qat_model, device=device)
+    qat_model = qat_model.to(device)
+    if isinstance(qat_model, GraphModule):
+        qat_model = check_graph_nodes(qat_model, device=device)
     return qat_model
 
 class SimaQatWrapper(GraphModule):

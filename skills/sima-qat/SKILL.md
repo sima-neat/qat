@@ -52,15 +52,18 @@ Follow these lifecycle invariants:
    and dtypes.
 3. Call `sima_prepare_qat_model(source_model, example_inputs, device)` before
    constructing the optimizer. Train the returned graph, not the source model.
+   Use the same device for the model, batches, loss, and in-training
+   validation; prefer a CUDA GPU when available.
 4. Run normal training to collect observer ranges. Measure the project's real
    validation metric during this warm-up.
 5. Call `sima_freeze_qat(qat_model)` after observer warm-up and continue
    training for at least one recovery phase with locked quantization grids.
 6. Save a resumable checkpoint before finalization, including the prepared
    model and optimizer state dictionaries.
-7. After training, move the QAT model and example inputs to CPU, call
-   `sima_finalize_qat_model`, and export with `sima_export_onnx`. Finalization
-   is inference-only.
+7. After training, call `sima_finalize_qat_model` and export with
+   `sima_export_onnx`. These APIs automatically move the model and export
+   inputs to CPU. Finalization is inference-only. Keep post-export validation
+   and Model Compiler on CPU.
 
 Choose the freeze point from validation evidence. A reasonable initial
 experiment warms observers for most of a short fine-tuning run and reserves

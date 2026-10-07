@@ -39,6 +39,12 @@ The workflow is:
 6. **Export** a standard opset-17 ONNX model containing
    `QuantizeLinear` and `DequantizeLinear` (QDQ) nodes.
 
+Use the same training device for the returned QAT model, batches, loss,
+observer warm-up, freezing, recovery training, and in-training validation.
+Prefer a CUDA GPU when one is available. After training, finalization and ONNX
+export automatically move the model and export inputs to CPU. Run post-export
+validation and Model Compiler on CPU.
+
 ## Install
 
 The QAT wheel requires Python 3.10 or newer and PyTorch 2.8.x. Install it in the
@@ -69,7 +75,8 @@ optimizer, loss, and validation calls to the existing training project.
 Prepare the model before constructing the optimizer. Preparation returns an
 isolated QAT graph; it does not modify or move the source model or example
 inputs. The input tuple must match the model's positional inputs, dtypes, and
-shapes.
+shapes. The `device` argument selects the training device for the returned QAT
+graph; use a CUDA GPU when available.
 
 ```python
 import torch
@@ -107,10 +114,11 @@ Train normally at first so the observers can measure representative activation
 ranges. Freeze the quantization parameters after this warm-up, then continue
 training so the model can recover accuracy with locked quantization grids.
 
-During validation, keep fake quantization enabled but temporarily disable
-observers so held-out data cannot change their ranges. `eval()` and
-`inference_mode()` alone do not stop observers. Restore their previous states
-in `finally`, including observers already disabled by freezing.
+Run in-training validation on the same device as training. Keep fake
+quantization enabled but temporarily disable observers so held-out data cannot
+change their ranges. `eval()` and `inference_mode()` alone do not stop
+observers. Restore their previous states in `finally`, including observers
+already disabled by freezing.
 
 ```python
 from torch.ao.quantization import disable_observer
@@ -199,19 +207,18 @@ quantization parameters used by finalization and ONNX export.
 
 ### 4. Finalize and export
 
-Finalization creates an inference-only model. Move the trained QAT model and
-example inputs to CPU, then export the finalized model as opset-17 QDQ ONNX.
+Finalization creates an inference-only CPU model. Finalization and export
+perform the CPU transition automatically without modifying the caller's
+example inputs.
 
 ```python
-final_model = sima_finalize_qat_model(qat_model.cpu())
-export_inputs = tuple(value.cpu() for value in example_inputs)
+final_model = sima_finalize_qat_model(qat_model)
 sima_export_onnx(
     final_model,
-    export_inputs,
+    example_inputs,
     "model.qdq.onnx",
     input_names=["images"],
     output_names=["predictions"],
-    device="cpu",
 )
 ```
 
@@ -241,6 +248,8 @@ the original model on the supplied example and fails with guidance to disable
 dynamic batch when it would change the model's behavior.
 
 ## Validate and compile
+
+Run post-training validation and Model Compiler on CPU.
 
 Measure the task-level metric for the original floating-point model, the
 prepared model before and after freezing, the finalized PyTorch model, and the

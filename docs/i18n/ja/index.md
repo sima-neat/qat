@@ -35,6 +35,12 @@ SiMa QAT は、モデルの既存の PyTorch 学習プロジェクト内で動�
 6. `QuantizeLinear` と `DequantizeLinear`（QDQ）ノードを含む標準の
    opset-17 ONNX モデルを **エクスポート** します。
 
+返された QAT モデル、学習バッチ、損失計算、オブザーバのウォームアップ、固定、
+回復学習、学習中の検証には、同じ学習デバイスを使用します。利用可能であれば
+CUDA GPU を推奨します。学習後は、確定処理と ONNX エクスポートによってモデルと
+エクスポート入力が自動的に CPU に移されます。エクスポート後の検証と
+Model Compiler は CPU で実行します。
+
 ## インストール
 
 QAT wheel には Python 3.10 以降と PyTorch 2.8.x が必要です。モデルの学習依存関係が
@@ -64,7 +70,8 @@ python -c "import torch, sima_qat; print(torch.__version__, sima_qat.__file__)"
 
 オプティマイザを作成する前にモデルを準備します。準備処理は独立した QAT グラフを返し、
 元のモデルや入力例を変更したり移動したりしません。入力タプルは、モデルの位置引数、
-データ型、形状と一致する必要があります。
+データ型、形状と一致する必要があります。`device` 引数は返される QAT グラフの
+学習デバイスを選択します。利用可能であれば CUDA GPU を使用してください。
 
 ```python
 import torch
@@ -102,7 +109,7 @@ criterion = torch.nn.CrossEntropyLoss()
 このウォームアップ後に量子化パラメータを固定し、固定された量子化グリッドでモデルが
 精度を回復できるように学習を続けます。
 
-検証中は偽量子化を有効に保ち、検証データが観測範囲を変更しないようにオブザーバを一時的に無効にしてください。`eval()` と `inference_mode()` だけではオブザーバは停止しません。固定処理ですでに無効になっているものも含め、`finally` で元の状態に戻してください。
+学習中の検証は学習と同じデバイスで実行してください。検証中は偽量子化を有効に保ち、検証データが観測範囲を変更しないようにオブザーバを一時的に無効にしてください。`eval()` と `inference_mode()` だけではオブザーバは停止しません。固定処理ですでに無効になっているものも含め、`finally` で元の状態に戻してください。
 
 ```python
 from torch.ao.quantization import disable_observer
@@ -191,19 +198,17 @@ start_epoch = checkpoint["epoch"] + 1
 
 ### 4. 確定とエクスポート
 
-確定処理は推論専用モデルを作成します。学習済み QAT モデルと入力例を CPU に移動し、
-確定済みモデルを opset-17 QDQ ONNX としてエクスポートします。
+確定処理は CPU 上の推論専用モデルを作成します。確定処理とエクスポートは、呼び出し元の
+入力例を変更せずに、CPU への移行を自動的に行います。
 
 ```python
-final_model = sima_finalize_qat_model(qat_model.cpu())
-export_inputs = tuple(value.cpu() for value in example_inputs)
+final_model = sima_finalize_qat_model(qat_model)
 sima_export_onnx(
     final_model,
-    export_inputs,
+    example_inputs,
     "model.qdq.onnx",
     input_names=["images"],
     output_names=["predictions"],
-    device="cpu",
 )
 ```
 
@@ -231,6 +236,8 @@ qat_model = sima_prepare_qat_model(
 元のモデルと比較し、動作が変わる場合は動的バッチを無効にするための案内とともに失敗します。
 
 ## 検証とコンパイル
+
+学習後の検証と Model Compiler は CPU で実行します。
 
 元の浮動小数点モデル、固定前後の準備済みモデル、確定済み PyTorch モデル、ONNX モデルに
 ついて、タスクレベルの指標を測定します。これにより、どのライフサイクル手順で回帰が

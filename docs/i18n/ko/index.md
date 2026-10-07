@@ -35,6 +35,11 @@ SiMa QAT는 모델의 기존 PyTorch 학습 프로젝트 안에서 실행되도�
 6. `QuantizeLinear`와 `DequantizeLinear`(QDQ) 노드가 포함된 표준 opset-17
    ONNX 모델을 **내보냅니다**.
 
+반환된 QAT 모델, 학습 배치, 손실 계산, 옵저버 워밍업, 고정, 회복 학습 및 학습 중
+검증에는 동일한 학습 디바이스를 사용하십시오. 가능한 경우 CUDA GPU를 권장합니다.
+학습이 끝나면 최종화와 ONNX 내보내기가 모델과 내보내기 입력을 자동으로 CPU로
+이동합니다. 내보낸 후의 검증과 Model Compiler는 CPU에서 실행하십시오.
+
 ## 설치
 
 QAT wheel에는 Python 3.10 이상과 PyTorch 2.8.x가 필요합니다. 모델의 학습 종속성이
@@ -64,7 +69,8 @@ python -c "import torch, sima_qat; print(torch.__version__, sima_qat.__file__)"
 
 옵티마이저를 만들기 전에 모델을 준비합니다. 준비 과정은 독립된 QAT 그래프를 반환하며
 원본 모델이나 예제 입력을 수정하거나 이동하지 않습니다. 입력 튜플은 모델의 위치 인수,
-데이터 타입 및 형상과 일치해야 합니다.
+데이터 타입 및 형상과 일치해야 합니다. `device` 인수는 반환되는 QAT 그래프의 학습
+디바이스를 선택합니다. 가능한 경우 CUDA GPU를 사용하십시오.
 
 ```python
 import torch
@@ -102,7 +108,7 @@ criterion = torch.nn.CrossEntropyLoss()
 워밍업 후 양자화 매개변수를 고정한 다음, 고정된 양자화 그리드에서 모델이 정확도를
 회복할 수 있도록 학습을 계속합니다.
 
-검증 중에는 가짜 양자화를 활성화한 채 옵저버를 일시적으로 비활성화하여 검증 데이터가 관측 범위를 바꾸지 않도록 하세요. `eval()`과 `inference_mode()`만으로는 옵저버가 멈추지 않습니다. 고정 단계에서 이미 비활성화된 옵저버도 포함하여 `finally`에서 이전 상태로 복원하세요.
+학습 중 검증은 학습과 동일한 디바이스에서 실행하십시오. 검증 중에는 가짜 양자화를 활성화한 채 옵저버를 일시적으로 비활성화하여 검증 데이터가 관측 범위를 바꾸지 않도록 하세요. `eval()`과 `inference_mode()`만으로는 옵저버가 멈추지 않습니다. 고정 단계에서 이미 비활성화된 옵저버도 포함하여 `finally`에서 이전 상태로 복원하세요.
 
 ```python
 from torch.ao.quantization import disable_observer
@@ -191,19 +197,17 @@ start_epoch = checkpoint["epoch"] + 1
 
 ### 4. 최종화 및 내보내기
 
-최종화는 추론 전용 모델을 만듭니다. 학습된 QAT 모델과 예제 입력을 CPU로 이동한 다음,
-최종화된 모델을 opset-17 QDQ ONNX로 내보냅니다.
+최종화는 CPU에 있는 추론 전용 모델을 만듭니다. 최종화와 내보내기는 호출자의 예제 입력을
+변경하지 않고 CPU 전환을 자동으로 수행합니다.
 
 ```python
-final_model = sima_finalize_qat_model(qat_model.cpu())
-export_inputs = tuple(value.cpu() for value in example_inputs)
+final_model = sima_finalize_qat_model(qat_model)
 sima_export_onnx(
     final_model,
-    export_inputs,
+    example_inputs,
     "model.qdq.onnx",
     input_names=["images"],
     output_names=["predictions"],
-    device="cpu",
 )
 ```
 
@@ -231,6 +235,8 @@ qat_model = sima_prepare_qat_model(
 동적 배치를 비활성화하라는 안내와 함께 실패합니다.
 
 ## 검증 및 컴파일
+
+학습 후 검증과 Model Compiler는 CPU에서 실행하십시오.
 
 원본 부동 소수점 모델, 고정 전후의 준비된 모델, 최종화된 PyTorch 모델 및 ONNX 모델의
 작업 수준 지표를 측정하십시오. 이를 통해 어느 수명 주기 단계에서 회귀가 발생했는지

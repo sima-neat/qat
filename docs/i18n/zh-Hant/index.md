@@ -33,6 +33,11 @@ SiMa QAT 的設計用途是在模型現有的 PyTorch 訓練專案中執行。�
 6. **匯出**包含 `QuantizeLinear` 與 `DequantizeLinear`（QDQ）節點的標準
    opset-17 ONNX 模型。
 
+傳回的 QAT 模型、訓練 Batch、損失計算、觀察器預熱、凍結、恢復訓練及訓練期間的
+驗證應使用相同的訓練裝置。如有可用的 CUDA GPU，建議優先使用。訓練完成後，完成程序與
+ONNX 匯出會自動將模型和匯出輸入移至 CPU。匯出後的驗證與 Model Compiler 請在 CPU
+上執行。
+
 ## 安裝
 
 QAT wheel 需要 Python 3.10 或更新版本以及 PyTorch 2.8.x。請將它安裝到已包含
@@ -61,6 +66,7 @@ python -c "import torch, sima_qat; print(torch.__version__, sima_qat.__file__)"
 
 請在建立最佳化器之前準備模型。準備程序會傳回獨立的 QAT 圖，不會修改或移動
 來源模型或範例輸入。輸入 tuple 必須符合模型的位置輸入、資料類型與形狀。
+`device` 引數會選擇傳回 QAT 圖的訓練裝置；如有可用的 CUDA GPU，請優先使用。
 
 ```python
 import torch
@@ -96,7 +102,7 @@ criterion = torch.nn.CrossEntropyLoss()
 一開始請照常訓練，讓觀察器測量具代表性的啟用值範圍。完成預熱後凍結量化參數，
 再繼續訓練，讓模型在鎖定的量化網格下恢復準確度。
 
-驗證時請保持偽量化啟用，但暫時停用觀察器，避免驗證資料改變觀測範圍。僅使用 `eval()` 和 `inference_mode()` 不會停止觀察器。請在 `finally` 中還原先前狀態，包括凍結時已停用的觀察器。
+訓練期間的驗證請在與訓練相同的裝置上執行。驗證時請保持偽量化啟用，但暫時停用觀察器，避免驗證資料改變觀測範圍。僅使用 `eval()` 和 `inference_mode()` 不會停止觀察器。請在 `finally` 中還原先前狀態，包括凍結時已停用的觀察器。
 
 ```python
 from torch.ao.quantization import disable_observer
@@ -184,19 +190,17 @@ start_epoch = checkpoint["epoch"] + 1
 
 ### 4. 完成與匯出
 
-完成程序會建立僅供推論使用的模型。請將已訓練的 QAT 模型與範例輸入移至 CPU，
-再將完成後的模型匯出為 opset-17 QDQ ONNX。
+完成程序會在 CPU 上建立僅供推論使用的模型。完成與匯出會自動完成 CPU 轉移，且不會
+修改呼叫端的範例輸入。
 
 ```python
-final_model = sima_finalize_qat_model(qat_model.cpu())
-export_inputs = tuple(value.cpu() for value in example_inputs)
+final_model = sima_finalize_qat_model(qat_model)
 sima_export_onnx(
     final_model,
-    export_inputs,
+    example_inputs,
     "model.qdq.onnx",
     input_names=["images"],
     output_names=["predictions"],
-    device="cpu",
 )
 ```
 
@@ -223,6 +227,8 @@ qat_model = sima_prepare_qat_model(
 擷取結果與原始模型輸出；若行為改變，則會失敗並提示停用動態批次。
 
 ## 驗證與編譯
+
+訓練後的驗證與 Model Compiler 請在 CPU 上執行。
 
 請針對原始浮點模型、凍結前後的準備模型、完成後的 PyTorch 模型，以及 ONNX 模型
 測量工作層級的指標。這能清楚顯示是哪個生命週期步驟造成準確度下降（Regression）。

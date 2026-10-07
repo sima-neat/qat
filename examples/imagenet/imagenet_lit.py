@@ -182,7 +182,11 @@ class ImageNet_Model_Trainer(L.LightningModule):
             and specialized.
         """
         self.imagenet_model.train(False)
-        self.imagenet_model = sima_export_onnx(qat_model=self.imagenet_model, inputs=self.dummy_inputs, output_file=file_path, device=self.device_train)
+        self.imagenet_model = sima_export_onnx(
+            qat_model=self.imagenet_model,
+            inputs=self.dummy_inputs,
+            output_file=file_path,
+        )
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         """ We have to apply the QAT scaffold before we load a checkpoint (if QAT is enabled),
