@@ -93,11 +93,13 @@ def test_custom_batchnorm_fold_preserves_weights_bias_and_qparams(device, dimens
         model.bn.running_mean, model.bn.running_var, source.bn.eps,
         model.bn.weight, model.bn.bias,
     )
-    expected_weight = weight_fq(expected_weight).detach()
-    scale = weight_fq.scale.detach().clone()
-    zero_point = weight_fq.zero_point.detach().clone()
+    # Finalization returns a CPU model even when QAT runs on CUDA.
+    expected_weight = weight_fq(expected_weight).detach().cpu()
+    expected_bias = expected_bias.detach().cpu()
+    scale = weight_fq.scale.detach().cpu().clone()
+    zero_point = weight_fq.zero_point.detach().cpu().clone()
     with torch.no_grad():
-        expected_output = model(inputs)
+        expected_output = model(inputs).detach().cpu()
 
     finalized = sima_finalize_qat_model(model)
     conv = next(n for n in finalized.graph.nodes if n.target == conv_op)
@@ -111,7 +113,7 @@ def test_custom_batchnorm_fold_preserves_weights_bias_and_qparams(device, dimens
     torch.testing.assert_close(args[2], zero_point, rtol=0, atol=0)
     torch.testing.assert_close(_resolve_attr(finalized, conv.args[2].target), expected_bias, rtol=0, atol=0)
     assert all(n.target != torch.ops.aten.batch_norm.default for n in finalized.graph.nodes)
-    torch.testing.assert_close(finalized(inputs), expected_output, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(finalized(inputs.cpu()), expected_output, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("standalone", [False, True])
@@ -182,9 +184,9 @@ def test_reused_convolution_preserves_distinct_batchnorm_folds(device):
     model = sima_prepare_qat_model(ReusedConvModel().to(device), (inputs,), device).eval()
     model(inputs)
     sima_freeze_qat(model)
-    expected = model(inputs).detach()
+    expected = model(inputs).detach().cpu()
     finalized = sima_finalize_qat_model(model)
-    torch.testing.assert_close(finalized(inputs), expected, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(finalized(inputs.cpu()), expected, rtol=1e-5, atol=1e-5)
 
 
 class Conv1dBnModel(torch.nn.Module):
