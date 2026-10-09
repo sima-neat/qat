@@ -39,10 +39,6 @@ The workflow is:
 QDQ nodes describe the conversion between floating-point values and INT8
 values in the exported ONNX graph.
 
-Train and validate with the model and batches on the same device. Use CUDA
-when available. Finalization keeps the model on that device. Export temporarily
-uses CPU, then restores the device of the model passed to it.
-
 ## Install
 
 The QAT wheel requires Python 3.10 or newer and PyTorch 2.8.x. Install it in the
@@ -74,7 +70,7 @@ Prepare the model before constructing the optimizer. Preparation returns an
 isolated QAT graph; it does not modify or move the source model or example
 inputs. The input tuple must match the model's positional inputs, dtypes, and
 shapes. The `device` argument selects the training device for the returned QAT
-graph; use a CUDA GPU when available.
+graph. Keep training and validation batches on that device.
 
 ```python
 import torch
@@ -102,9 +98,6 @@ qat_model = sima_prepare_qat_model(
 optimizer = torch.optim.AdamW(qat_model.parameters(), lr=1e-5)
 criterion = torch.nn.CrossEntropyLoss()
 ```
-
-Build the optimizer from `qat_model`, not `source_model`, because training
-updates the prepared graph.
 
 ### 2. Train, freeze, and recover
 
@@ -219,8 +212,7 @@ quantization parameters used by finalization and ONNX export.
 
 ### 4. Finalize and export
 
-Save your training checkpoint first: the finalized model is for inference
-and cannot resume training. No manual CPU move is needed.
+Finalized models are for inference and cannot resume training.
 
 ```python
 final_model = sima_finalize_qat_model(qat_model)
@@ -236,13 +228,13 @@ sima_export_onnx(
 
 | Operation | Device behavior |
 |---|---|
-| Prepare | Returns a QAT model on your selected training device; the source model stays unchanged. |
-| Finalize | Returns an inference-only model on the same device as the QAT model. |
-| Export | Temporarily uses CPU, then restores the supplied model's device and graph device settings, even on failure. Example inputs stay unchanged. |
+| Prepare | Uses your selected training device. |
+| Finalize | Stays on the QAT model's device. |
+| Export | Uses CPU temporarily, then restores the model even on failure. Inputs stay unchanged. |
 
-Usually, omit export's `device` argument. Passing `device="cuda"` or
-`device="cpu"` explicitly moves the supplied model there after successful
-export. This option controls the PyTorch model, not the ONNX runtime device.
+Omit export's `device` argument to keep the model's device. An explicit value
+moves the PyTorch model after successful export; it does not select the ONNX
+runtime device.
 
 ## Batch size
 

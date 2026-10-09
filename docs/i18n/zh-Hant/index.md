@@ -34,9 +34,6 @@ sidebar_position: 1
 
 QDQ 節點描述匯出 ONNX 圖中浮點值與 INT8 值之間的轉換。
 
-訓練與驗證時，模型和批次資料應位於相同裝置；可用時請使用 CUDA。完成程序維持模型的
-原本裝置。匯出會暫時使用 CPU，之後還原傳入模型的裝置。
-
 ## 安裝
 
 QAT wheel 需要 Python 3.10 或更新版本以及 PyTorch 2.8.x。請將它安裝到已包含
@@ -65,7 +62,7 @@ python -c "import torch, sima_qat; print(torch.__version__, sima_qat.__file__)"
 
 請在建立最佳化器之前準備模型。準備程序會傳回獨立的 QAT 圖，不會修改或移動
 來源模型或範例輸入。輸入 tuple 必須符合模型的位置輸入、資料類型與形狀。
-`device` 引數會選擇傳回 QAT 圖的訓練裝置；如有可用的 CUDA GPU，請優先使用。
+`device` 引數會選擇傳回 QAT 圖的訓練裝置。訓練與驗證的批次資料也應位於該裝置。
 
 ```python
 import torch
@@ -93,8 +90,6 @@ qat_model = sima_prepare_qat_model(
 optimizer = torch.optim.AdamW(qat_model.parameters(), lr=1e-5)
 criterion = torch.nn.CrossEntropyLoss()
 ```
-
-由於訓練會更新準備後的圖，請從 `qat_model` 而非 `source_model` 建立最佳化器。
 
 ### 2. 訓練、凍結與恢復
 
@@ -204,7 +199,7 @@ start_epoch = checkpoint["epoch"] + 1
 
 ### 4. 完成與匯出
 
-請先儲存訓練檢查點：完成後的模型僅供推論，無法繼續訓練。不需要手動移至 CPU。
+完成後的模型僅供推論，無法繼續訓練。
 
 ```python
 final_model = sima_finalize_qat_model(qat_model)
@@ -220,12 +215,12 @@ sima_export_onnx(
 
 | 操作 | 裝置行為 |
 |---|---|
-| 準備 | 傳回所選訓練裝置上的 QAT 模型；原始模型維持不變。 |
-| 完成 | 傳回與 QAT 模型位於相同裝置、僅供推論使用的模型。 |
-| 匯出 | 暫時使用 CPU，之後還原模型裝置與圖中的裝置設定，即使失敗也會還原。範例輸入維持不變。 |
+| 準備 | 使用所選的訓練裝置。 |
+| 完成 | 維持 QAT 模型的裝置。 |
+| 匯出 | 暫時使用 CPU，之後將模型移回原本裝置，即使失敗也會還原。輸入維持不變。 |
 
-通常可省略匯出的 `device` 引數。明確指定 `device="cuda"` 或 `device="cpu"`，會在
-匯出成功後將模型移至該裝置。這個選項控制 PyTorch 模型，而非 ONNX 的執行裝置。
+省略匯出的 `device` 引數即可維持模型的裝置。明確指定值會在匯出成功後移動
+PyTorch 模型，而非指定 ONNX 的執行裝置。
 
 ## 批次大小
 
