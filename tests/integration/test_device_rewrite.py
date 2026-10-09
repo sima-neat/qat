@@ -3,13 +3,14 @@
 import pytest
 import torch
 
+from sima_qat import qat_api
 from sima_qat import (
     sima_export_onnx,
     sima_finalize_qat_model,
     sima_freeze_qat,
     sima_prepare_qat_model,
 )
-from sima_qat.qat_api import check_graph_nodes, device_modifier_ops
+from sima_qat.qat_api import device_modifier_ops
 
 
 pytestmark = pytest.mark.regression
@@ -147,29 +148,32 @@ def _device_kwargs(model):
     ]
 
 
-def test_finalization_moves_the_model_and_device_kwargs_to_cpu() -> None:
-    inputs = torch.randn(2, 3, 8, 8)
-    prepared = sima_prepare_qat_model(RandomMaskModel(), (inputs,), "cpu")
+@pytest.mark.parametrize("device", ["cpu", CUDA])
+def test_finalization_runs_on_original_device(device, monkeypatch) -> None:
+    inputs = torch.randn(2, 3, 8, 8, device=device)
+    prepared = sima_prepare_qat_model(RandomMaskModel(), (inputs,), device)
     assert _device_kwargs(prepared)
-    assert all(device == "cpu" for device in _device_kwargs(prepared))
-
-    check_graph_nodes(prepared, "cuda")
-    assert all(device == "cuda" for device in _device_kwargs(prepared))
-
-    check_graph_nodes(prepared, "cpu")
     prepared(inputs)
     sima_freeze_qat(prepared)
-    check_graph_nodes(prepared, "cuda")
+    original_kwargs = _device_kwargs(prepared)
+    native_convert = qat_api.convert_pt2e
+
+    def convert_on_original_device(model, *args, **kwargs):
+        assert all(tensor.device.type == device for tensor in [*model.parameters(), *model.buffers()])
+        assert _device_kwargs(model) == original_kwargs
+        return native_convert(model, *args, **kwargs)
+
+    monkeypatch.setattr(qat_api, "convert_pt2e", convert_on_original_device)
     finalized = sima_finalize_qat_model(prepared)
 
-    assert all(tensor.device.type == "cpu" for tensor in finalized.parameters())
-    assert all(tensor.device.type == "cpu" for tensor in finalized.buffers())
-    assert all(device == "cpu" for device in _device_kwargs(finalized))
+    assert all(tensor.device.type == device for tensor in [*finalized.parameters(), *finalized.buffers()])
+    assert _device_kwargs(finalized) == original_kwargs
     assert torch.isfinite(finalized(inputs)).all()
+    assert sima_finalize_qat_model(finalized) is finalized
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_training_model_finalizes_and_exports_on_cpu(
+def test_cuda_training_model_preserves_device_through_finalize_and_export(
     tmp_path, monkeypatch
 ) -> None:
     inputs = torch.randn(2, 3, 8, 8, device="cuda")
@@ -178,8 +182,8 @@ def test_cuda_training_model_finalizes_and_exports_on_cpu(
     sima_freeze_qat(prepared)
 
     finalized = sima_finalize_qat_model(prepared)
-    assert all(tensor.device.type == "cpu" for tensor in finalized.buffers())
-    assert all(device == "cpu" for device in _device_kwargs(finalized))
+    assert all(tensor.device.type == "cuda" for tensor in finalized.buffers())
+    original_kwargs = _device_kwargs(finalized)
 
     observed = {}
 
@@ -201,4 +205,6 @@ def test_cuda_training_model_finalizes_and_exports_on_cpu(
         "input_devices": {"cpu"},
     }
     assert inputs.device.type == "cuda"
-    assert all(tensor.device.type == "cpu" for tensor in exported_model.buffers())
+    assert all(tensor.device.type == "cuda" for tensor in exported_model.buffers())
+    assert _device_kwargs(exported_model) == original_kwargs
+    assert torch.isfinite(exported_model(inputs)).all()

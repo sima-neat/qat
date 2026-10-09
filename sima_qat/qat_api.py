@@ -954,18 +954,18 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
         qat_model: a trained QAT model to be converted into inference-only form.
 
     Returns:
-        GraphModule: a CPU-resident, inference-only version of the QAT model,
+        GraphModule: an inference-only version on the QAT model's existing device,
             which can be run in Pytorch `eval(True)` mode, or exported via ONNX.
     """
     if not isinstance(qat_model, nn.Module):
         raise RuntimeError(f"Input graph to finalize function must be of type nn.Module, found {type(qat_model)}")
     
-    qat_model = qat_model.to("cpu")
     if not isinstance(qat_model, GraphModule):
         return qat_model
-    qat_model = check_graph_nodes(qat_model, device="cpu")
     if qat_model.meta.get("qat_state") == "fq":
         return qat_model
+    first_tensor = next(chain(qat_model.parameters(), qat_model.buffers()), None)
+    state_device = first_tensor.device if first_tensor is not None else None
     if not bool(getattr(qat_model, "qat_frozen", torch.tensor([0])).item()):
         warnings.warn(
             "Finalizing a shift-aware model before sima_freeze_qat(); scales will be locked now. "
@@ -989,12 +989,11 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
     if folded_bn_parameters:
         # Correct PT2E's materialized folds without touching unfused/shared branches.
         restore_folded_batchnorm_parameters(m, folded_bn_parameters)
-    sima_mod = SimaQatWrapper(source=m, label='fq')
+    sima_mod = SimaQatWrapper(source=m, label='fq', state_device=state_device)
     # We must call eval() to invoke internal functions to put the GraphModule in eval state. Once we are
     # in FQ mode, we always remain in eval mode.
     sima_mod.eval()
     sima_mod = replace_batchnorm(sima_mod)
-    sima_mod = check_graph_nodes(sima_mod, device="cpu")
     return sima_mod
 
 
@@ -1083,7 +1082,7 @@ class SimaQatWrapper(GraphModule):
         'fq': 1,
     }
 
-    def __init__(self, source: GraphModule, label: str):
+    def __init__(self, source: GraphModule, label: str, state_device: Optional[torch.device] = None):
         """This constructor creates a wrapper from a GraphModule. We can only create this object
         from an existing GraphModule class. Every time we create a wrapper, we also need to
         specify which phase of QAT we are representing, since each phase has different 
@@ -1093,6 +1092,8 @@ class SimaQatWrapper(GraphModule):
             source: A `GraphModule` produced by Pytorch call to some PT2E initialization. Must be
                 a compiled FX graph.
             label: One of the legal enumerated labels matching the phase of the QAT process.
+            state_device: preserve wrapper state placement if conversion removes
+                all of the source graph's parameters and buffers.
         """
         if not isinstance(source, GraphModule):
             raise RuntimeError(f"Sima supports only compiled graphs, found {type(source)}")
@@ -1115,11 +1116,12 @@ class SimaQatWrapper(GraphModule):
         # rewriting to reject it during finalization.
         graph_tensors = chain(source.parameters(), source.buffers())
         first_graph_tensor = next(graph_tensors, None)
-        state_device = (
-            first_graph_tensor.device
-            if first_graph_tensor is not None
-            else torch.device("cpu")
-        )
+        if state_device is None:
+            state_device = (
+                first_graph_tensor.device
+                if first_graph_tensor is not None
+                else torch.device("cpu")
+            )
         self.register_buffer(
             "qat_state",
             torch.tensor([state_id], dtype=torch.int8, device=state_device),

@@ -42,8 +42,9 @@ This installs the package in editable mode, its dependencies, and test tools.
 
 The recommended workflow is **prepare → warm up → freeze → fine-tune → finalize → export**.
 Train and validate on the same device, using CUDA when available. Finalization
-returns an inference-only CPU model. Export temporarily uses CPU and restores
-the model's device afterward, including on failure. No manual CPU move is needed.
+returns an inference-only model on that device. Export temporarily uses CPU
+and restores the model's device afterward, including on failure. No manual
+CPU move is needed.
 
 ```python
 import torch
@@ -68,7 +69,7 @@ optimizer = torch.optim.AdamW(qat_model.parameters(), lr=1e-5)
 sima_freeze_qat(qat_model)
 # ... continue training qat_model ...
 
-# 4. Finalize for inference. The returned model is on CPU.
+# 4. Finalize for inference on the same device.
 final_model = sima_finalize_qat_model(qat_model)
 
 # 5. Export to an INT8 Q/DQ ONNX graph

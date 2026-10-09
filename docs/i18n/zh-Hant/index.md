@@ -34,8 +34,8 @@ sidebar_position: 1
 
 QDQ 節點描述匯出 ONNX 圖中浮點值與 INT8 值之間的轉換。
 
-訓練與驗證時，模型和批次資料應位於相同裝置；可用時請使用 CUDA。完成程序會傳回
-CPU 模型，而匯出會保留傳入模型的裝置。
+訓練與驗證時，模型和批次資料應位於相同裝置；可用時請使用 CUDA。完成程序維持模型的
+原本裝置。匯出會暫時使用 CPU，之後還原傳入模型的裝置。
 
 ## 安裝
 
@@ -208,7 +208,7 @@ start_epoch = checkpoint["epoch"] + 1
 
 ```python
 final_model = sima_finalize_qat_model(qat_model)
-accuracy = validate(final_model, validation_loader, "cpu")
+accuracy = validate(final_model, validation_loader, device)
 sima_export_onnx(
     final_model,
     example_inputs,
@@ -221,7 +221,7 @@ sima_export_onnx(
 | 操作 | 裝置行為 |
 |---|---|
 | 準備 | 傳回所選訓練裝置上的 QAT 模型；原始模型維持不變。 |
-| 完成 | 將傳入的 QAT 模型移至 CPU，並傳回 CPU 上僅供推論使用的模型。 |
+| 完成 | 傳回與 QAT 模型位於相同裝置、僅供推論使用的模型。 |
 | 匯出 | 暫時使用 CPU，之後還原模型裝置與圖中的裝置設定，即使失敗也會還原。範例輸入維持不變。 |
 
 通常可省略匯出的 `device` 引數。明確指定 `device="cuda"` 或 `device="cpu"`，會在

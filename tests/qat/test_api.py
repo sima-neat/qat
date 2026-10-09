@@ -225,7 +225,7 @@ def test_dynamic_validation_does_not_mutate_returned_batchnorm_state() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-def test_finalize_moves_cuda_wrapper_state_to_cpu() -> None:
+def test_finalize_preserves_cuda_wrapper_device() -> None:
     inputs = torch.randn(2, 3, 8, 8, device="cuda")
     prepared = sima_prepare_qat_model(Conv2dModel(), (inputs,), "cuda")
     prepared(inputs)
@@ -233,6 +233,6 @@ def test_finalize_moves_cuda_wrapper_state_to_cpu() -> None:
 
     finalized = sima_finalize_qat_model(prepared)
 
-    assert finalized.qat_state.device.type == "cpu"
-    assert finalized.qat_frozen.device.type == "cpu"
-    assert torch.isfinite(finalized(inputs.cpu())).all()
+    assert finalized.qat_state.device.type == "cuda"
+    assert finalized.qat_frozen.device.type == "cuda"
+    assert torch.isfinite(finalized(inputs)).all()

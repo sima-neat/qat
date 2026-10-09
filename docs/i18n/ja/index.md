@@ -37,7 +37,8 @@ QDQ ノードは、エクスポートされた ONNX グラフ内で浮動小数�
 変換を表します。
 
 学習と検証ではモデルとバッチを同じデバイスに置き、利用可能なら CUDA を使用します。
-確定処理は CPU モデルを返します。エクスポートは渡されたモデルのデバイスを維持します。
+確定処理はモデルのデバイスを維持します。エクスポートは一時的に CPU を使用し、
+その後、渡されたモデルのデバイスを復元します。
 
 ## インストール
 
@@ -216,7 +217,7 @@ start_epoch = checkpoint["epoch"] + 1
 
 ```python
 final_model = sima_finalize_qat_model(qat_model)
-accuracy = validate(final_model, validation_loader, "cpu")
+accuracy = validate(final_model, validation_loader, device)
 sima_export_onnx(
     final_model,
     example_inputs,
@@ -229,7 +230,7 @@ sima_export_onnx(
 | 操作 | デバイスの動作 |
 |---|---|
 | 準備 | 選択した学習デバイス上の QAT モデルを返します。元のモデルは変更しません。 |
-| 確定 | 渡された QAT モデルを CPU に移し、CPU 上の推論専用モデルを返します。 |
+| 確定 | QAT モデルと同じデバイス上の推論専用モデルを返します。 |
 | エクスポート | 一時的に CPU を使用し、失敗時もモデルのデバイスとグラフのデバイス設定を復元します。入力例は変更しません。 |
 
 通常はエクスポートの `device` 引数を省略してください。`device="cuda"` または

@@ -40,8 +40,8 @@ QDQ nodes describe the conversion between floating-point values and INT8
 values in the exported ONNX graph.
 
 Train and validate with the model and batches on the same device. Use CUDA
-when available. Finalization returns a CPU model; export preserves the device
-of the model passed to it.
+when available. Finalization keeps the model on that device. Export temporarily
+uses CPU, then restores the device of the model passed to it.
 
 ## Install
 
@@ -224,7 +224,7 @@ and cannot resume training. No manual CPU move is needed.
 
 ```python
 final_model = sima_finalize_qat_model(qat_model)
-accuracy = validate(final_model, validation_loader, "cpu")
+accuracy = validate(final_model, validation_loader, device)
 sima_export_onnx(
     final_model,
     example_inputs,
@@ -237,7 +237,7 @@ sima_export_onnx(
 | Operation | Device behavior |
 |---|---|
 | Prepare | Returns a QAT model on your selected training device; the source model stays unchanged. |
-| Finalize | Moves the supplied QAT model to CPU and returns an inference-only CPU model. |
+| Finalize | Returns an inference-only model on the same device as the QAT model. |
 | Export | Temporarily uses CPU, then restores the supplied model's device and graph device settings, even on failure. Example inputs stay unchanged. |
 
 Usually, omit export's `device` argument. Passing `device="cuda"` or

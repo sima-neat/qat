@@ -31,10 +31,11 @@ for working code, validation, and checkpoint examples.
    freeze point from validation evidence and leave time for recovery.
 5. Save the prepared model and optimizer state before finalization.
 6. Call `sima_finalize_qat_model(qat_model)`, then `sima_export_onnx` with the
-   finalized model and example inputs. Validate the finalized model with CPU
-   batches. It is inference-only and cannot resume training.
+   finalized model and example inputs. Validate it on the same device as
+   training. It is inference-only and cannot resume training.
 
-Finalization moves the supplied model to CPU and returns a CPU inference model.
+Finalization runs on the model's existing device and returns an inference model
+on that device.
 Export temporarily uses CPU and restores the supplied model's device and graph
 device settings, even on failure; caller inputs stay unchanged. Usually omit
 export's `device` argument. An explicit value selects the PyTorch model's

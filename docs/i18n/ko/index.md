@@ -37,7 +37,8 @@ QDQ 노드는 내보낸 ONNX 그래프에서 부동 소수점 값과 INT8 값 �
 표현합니다.
 
 학습과 검증에서는 모델과 배치를 같은 디바이스에 두고, 가능하면 CUDA를 사용하십시오.
-최종화는 CPU 모델을 반환하며, 내보내기는 전달된 모델의 디바이스를 유지합니다.
+최종화는 모델의 디바이스를 유지합니다. 내보내기는 일시적으로 CPU를 사용한 뒤
+전달된 모델의 디바이스를 복원합니다.
 
 ## 설치
 
@@ -216,7 +217,7 @@ start_epoch = checkpoint["epoch"] + 1
 
 ```python
 final_model = sima_finalize_qat_model(qat_model)
-accuracy = validate(final_model, validation_loader, "cpu")
+accuracy = validate(final_model, validation_loader, device)
 sima_export_onnx(
     final_model,
     example_inputs,
@@ -229,7 +230,7 @@ sima_export_onnx(
 | 작업 | 디바이스 동작 |
 |---|---|
 | 준비 | 선택한 학습 디바이스의 QAT 모델을 반환하며 원본 모델은 변경하지 않습니다. |
-| 최종화 | 전달된 QAT 모델을 CPU로 이동하고 CPU의 추론 전용 모델을 반환합니다. |
+| 최종화 | QAT 모델과 같은 디바이스의 추론 전용 모델을 반환합니다. |
 | 내보내기 | 일시적으로 CPU를 사용한 뒤 실패해도 모델 디바이스와 그래프의 디바이스 설정을 복원합니다. 예제 입력은 변경하지 않습니다. |
 
 일반적으로 내보내기의 `device` 인수를 생략하십시오. `device="cuda"` 또는
