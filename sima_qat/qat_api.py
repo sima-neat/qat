@@ -1015,17 +1015,21 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
     """
     if not isinstance(qat_model, nn.Module):
         raise RuntimeError(f"Input graph to export function must be of type nn.Module, found {type(qat_model)}")
-    original_kwargs = [
-        (node, dict(node.kwargs))
-        for node in qat_model.graph.nodes
-        if node.target in device_modifier_ops
-    ] if isinstance(qat_model, GraphModule) else []
+    original_kwargs = []
+    if isinstance(qat_model, GraphModule):
+        for node in qat_model.graph.nodes:
+            if node.target in device_modifier_ops:
+                original_kwargs.append((node, dict(node.kwargs)))
     tensor = next(chain(qat_model.parameters(), qat_model.buffers()), None)
-    # Tensor-free graphs can still carry explicit factory-node devices.
-    original_device = tensor.device if tensor is not None else torch.device(next(
-        (kwargs["device"] for _, kwargs in original_kwargs if kwargs.get("device") is not None),
-        "cpu",
-    ))
+    if tensor is not None:
+        original_device = tensor.device
+    else:
+        # Tensor-free graphs can still carry explicit factory-node devices.
+        original_device = torch.device("cpu")
+        for _, kwargs in original_kwargs:
+            if kwargs.get("device") is not None:
+                original_device = torch.device(kwargs["device"])
+                break
     return_device = original_device if device is None else torch.device(device)
     export_succeeded = False
     try:
