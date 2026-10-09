@@ -167,7 +167,7 @@ The example uses two warm-up epochs and two recovery epochs. Treat this as a
 starting point: choose the freeze epoch and recovery duration from validation
 results.
 
-### 3. Save and resume training
+### 3. Save a checkpoint
 
 Save the prepared model before finalization so training can be resumed. A
 checkpoint should contain both the QAT model and optimizer state.
@@ -187,8 +187,8 @@ torch.save(
 )
 ```
 
-To resume, recreate and prepare the same model with the same example-input and
-batch contract before loading the saved states:
+**To resume later (optional)**, recreate and prepare the same model with the
+same example-input and batch contract before loading the saved states:
 
 ```python
 checkpoint = torch.load("checkpoints/qat-03.pt", map_location="cpu")
@@ -212,7 +212,8 @@ quantization parameters used by finalization and ONNX export.
 
 ### 4. Finalize and export
 
-Finalized models are for inference and cannot resume training.
+Finalization converts the trained QAT model into an inference-only graph;
+export writes that graph to ONNX. Finalized models cannot resume training.
 
 ```python
 final_model = sima_finalize_qat_model(qat_model)
