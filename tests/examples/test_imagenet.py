@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import importlib.util
 import sys
 from pathlib import Path
 
 import pytest
+from PIL import Image
+from torch.utils.data import Subset
 
 
 EXAMPLE = Path(__file__).parents[2] / "examples" / "imagenet"
@@ -82,7 +85,10 @@ def test_train_loader_handles_worker_count(monkeypatch, workers, persistent):
     captured = {}
 
     class Dataset:
-        samples = list(range(10))
+        samples = [(f"image{index}.jpg", index // 2) for index in range(10)]
+
+        def __len__(self):
+            return len(self.samples)
 
     monkeypatch.setattr(train.datasets, "ImageFolder", lambda *args, **kwargs: Dataset())
 
@@ -95,3 +101,64 @@ def test_train_loader_handles_worker_count(monkeypatch, workers, persistent):
 
     assert captured["num_workers"] == workers
     assert captured["persistent_workers"] is persistent
+
+
+def test_worker_default_and_explicit_override(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["train.py"])
+    assert train.get_args().workers == 0
+    monkeypatch.setattr(sys, "argv", ["train.py", "--workers", "4"])
+    assert train.get_args().workers == 4
+
+
+def _imagefolder(tmp_path, counts):
+    for label, count in enumerate(counts):
+        directory = tmp_path / "train" / f"class{label}"
+        directory.mkdir(parents=True)
+        for index in range(count):
+            Image.new("RGB", (8, 8), (label * 40, index * 20, 0)).save(
+                directory / f"{index}.png"
+            )
+    return str(tmp_path)
+
+
+@pytest.mark.parametrize("limit", [3, 7, 8])
+def test_sample_limit_is_balanced_reproducible_and_preserves_metadata(tmp_path, limit):
+    data_path = _imagefolder(tmp_path, [5, 5, 5, 5])
+    loader = train.get_train_dataloader(data_path, 4, limit, 0, 8)
+    subset = loader.dataset
+    assert isinstance(subset, Subset)
+    assert len(subset) == limit
+    assert len(set(subset.indices)) == limit
+
+    counts = Counter(int(label) for _, labels in loader for label in labels)
+    assert len(counts) == min(limit, 4)
+    assert max(counts.values()) - min(counts.values()) <= 1
+
+    repeated = train.get_train_dataloader(data_path, 4, limit, 0, 8)
+    assert subset.indices == repeated.dataset.indices
+    source = subset.dataset
+    assert len(source) == 20
+    assert source.samples == source.imgs
+    assert source.targets == [label for _, label in source.samples]
+
+
+def test_sample_limit_redistributes_exhausted_classes(tmp_path):
+    data_path = _imagefolder(tmp_path, [1, 2, 5])
+    loader = train.get_train_dataloader(data_path, 4, 6, 0, 8)
+    counts = Counter(int(label) for _, labels in loader for label in labels)
+    assert counts == {0: 1, 1: 2, 2: 3}
+
+
+@pytest.mark.parametrize("limit", [8, 10])
+def test_sample_limit_keeps_full_dataset_when_limit_is_large(tmp_path, limit):
+    data_path = _imagefolder(tmp_path, [4, 4])
+    loader = train.get_train_dataloader(data_path, 4, limit, 0, 8)
+    assert not isinstance(loader.dataset, Subset)
+    assert len(loader.dataset) == 8
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_sample_limit_rejects_nonpositive_limits(tmp_path, limit):
+    data_path = _imagefolder(tmp_path, [4, 4])
+    with pytest.raises(ValueError, match="--samples-limit must be positive"):
+        train.get_train_dataloader(data_path, 4, limit, 0, 8)

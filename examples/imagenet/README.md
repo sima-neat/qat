@@ -53,7 +53,8 @@ Below are the descriptions of the arguments:
 | `-d, --data`            | `"."`         | The path where the dataset is located. If not present, the dataset can be downloaded to this path with `--download`. | `--data /path/to/dataset`        |
 | `--model`            | `resnet18`           | The torchvision Imagenet Model to be trained, the pre-trained model is loaded from torchvision.                                      | `--model model_name`                      |
 | `--device`              | `"cpu"`       | The device to use for training: `"mps"` for Apple Silicon GPUs, `"cuda"` for NVIDIA GPUs, or `"cpu"` for CPU.      | `--device cuda`                   |
-| `--samples-limit`       | `1281167`       | Limits the number of training samples used. Useful for testing or debugging with a smaller dataset.                  | `--samples-limit 10000`          |
+| `--samples-limit`       | `1281167`       | Selects up to N training samples evenly across classes, using seed 42. When N is smaller than the class count, participating classes are randomly selected.                  | `--samples-limit 10000`          |
+| `-j, --workers`         | `0`             | DataLoader worker processes. Zero avoids multiprocessing shared-memory pressure in containers; increase when sufficient shared memory is available.                  | `--workers 4`          |
 | `--export-on-end`       | `False`           | Export the trained model to ONNX format at the end of training.                                                     | `--export-on-end`                 |
 | `--disable-qat`         | `False`           | Disable Quantization Aware Training (QAT), which prepares the model for quantization during training.               | `--disable-qat`                   |
 | `--freeze-epoch`        | final epoch       | Zero-based epoch at which QAT grids are frozen. Use `-1` to retain finalize-only freezing.                          | `--freeze-epoch 8`                |
