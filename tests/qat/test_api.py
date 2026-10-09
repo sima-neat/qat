@@ -167,9 +167,10 @@ def test_dynamic_training_model_exports_static_batch_one(tmp_path) -> None:
         str(output_path),
         input_names=["tokens"],
         output_names=["output"],
-        device="cpu",
     )
 
+    assert all(tensor.device.type == "cpu" for tensor in finalized.parameters())
+    assert all(tensor.device.type == "cpu" for tensor in finalized.buffers())
     exported = onnx.load(output_path)
     batch_dimension = exported.graph.input[0].type.tensor_type.shape.dim[0]
     assert batch_dimension.dim_value == 1
@@ -224,7 +225,7 @@ def test_dynamic_validation_does_not_mutate_returned_batchnorm_state() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-def test_finalize_keeps_wrapper_state_on_cuda_graph_device() -> None:
+def test_finalize_preserves_cuda_wrapper_device() -> None:
     inputs = torch.randn(2, 3, 8, 8, device="cuda")
     prepared = sima_prepare_qat_model(Conv2dModel(), (inputs,), "cuda")
     prepared(inputs)
