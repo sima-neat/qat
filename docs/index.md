@@ -41,9 +41,10 @@ The workflow is:
 
 Use the same training device for the returned QAT model, batches, loss,
 observer warm-up, freezing, recovery training, and in-training validation.
-Prefer a CUDA GPU when one is available. After training, finalization and ONNX
-export automatically move the model and export inputs to CPU. Run post-export
-validation and Model Compiler on CPU.
+Prefer a CUDA GPU when one is available. After training, finalization returns
+an inference-only CPU model. ONNX export temporarily uses CPU, then restores
+the model's incoming device, even if export fails. Run post-export validation
+and Model Compiler on CPU for the finalized workflow.
 
 ## Install
 
@@ -207,9 +208,12 @@ quantization parameters used by finalization and ONNX export.
 
 ### 4. Finalize and export
 
-Finalization creates an inference-only CPU model. Finalization and export
-perform the CPU transition automatically without modifying the caller's
-example inputs.
+Finalization creates an inference-only CPU model. ONNX export temporarily
+moves the supplied model to CPU in place and uses CPU copies of the example
+inputs. By default, it restores the model's incoming device and graph device
+settings, even if export fails. The caller's example inputs stay unchanged.
+An explicit `device="cuda"` or `device="cpu"` selects where the supplied model
+is moved after a successful export; it does not select the ONNX runtime device.
 
 ```python
 final_model = sima_finalize_qat_model(qat_model)

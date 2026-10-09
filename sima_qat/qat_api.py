@@ -999,7 +999,7 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
 
 
 def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: str, input_names: Optional[List[str]] = None, 
-                     output_names: Optional[List[str]] = None, device: torch.device = 'cpu') -> GraphModule:
+                     output_names: Optional[List[str]] = None, device: Optional[torch.device | str] = None) -> GraphModule:
     """This function exports a finalized QAT model to ONNX format.
 
     Args:
@@ -1010,40 +1010,63 @@ def sima_export_onnx(qat_model: nn.Module, inputs: Tuple[Tensor], output_file: s
         input_names: a list of tensor names used to label the ONNX model inputs.
         output_names: a list of tensor names used to label the ONNX model outputs.
         device: the device for the returned model after export. ONNX export
-            always runs on CPU. The default keeps the model on CPU.
+            always runs on CPU. By default, the supplied model is restored to
+            its original device, including if export fails. An explicit device
+            moves the supplied model there after a successful export.
     """
     if not isinstance(qat_model, nn.Module):
         raise RuntimeError(f"Input graph to export function must be of type nn.Module, found {type(qat_model)}")
-    qat_model = qat_model.to("cpu")
-    if isinstance(qat_model, GraphModule):
-        qat_model = check_graph_nodes(qat_model, device="cpu")
-    export_inputs = _capture_inputs_to_cpu(inputs)
-    with warnings.catch_warnings():
-        # ONNX InstanceNormalization always uses input statistics, matching
-        # PyTorch InstanceNorm with track_running_stats=False. The legacy
-        # exporter labels that valid behavior as train=True and warns solely
-        # because the surrounding export is in evaluation mode.
-        warnings.filterwarnings(
-            "ignore",
-            message=(
-                r"ONNX export mode is set to TrainingMode\.EVAL, but operator "
-                r"'instance_norm' is set to train=True\..*"
-            ),
-            category=UserWarning,
-        )
-        torch.onnx.export(
-            qat_model,
-            export_inputs,
-            output_file,
-            export_params=True,
-            opset_version=17,
-            do_constant_folding=True,
-            input_names=input_names,
-            output_names=output_names,
-        )
-    qat_model = qat_model.to(device)
-    if isinstance(qat_model, GraphModule):
-        qat_model = check_graph_nodes(qat_model, device=device)
+    original_kwargs = [
+        (node, dict(node.kwargs))
+        for node in qat_model.graph.nodes
+        if node.target in device_modifier_ops
+    ] if isinstance(qat_model, GraphModule) else []
+    tensor = next(chain(qat_model.parameters(), qat_model.buffers()), None)
+    # Tensor-free graphs can still carry explicit factory-node devices.
+    original_device = tensor.device if tensor is not None else torch.device(next(
+        (kwargs["device"] for _, kwargs in original_kwargs if kwargs.get("device") is not None),
+        "cpu",
+    ))
+    return_device = original_device if device is None else torch.device(device)
+    export_succeeded = False
+    try:
+        qat_model.to("cpu")
+        if isinstance(qat_model, GraphModule):
+            check_graph_nodes(qat_model, device="cpu")
+        export_inputs = _capture_inputs_to_cpu(inputs)
+        with warnings.catch_warnings():
+            # ONNX InstanceNormalization always uses input statistics, matching
+            # PyTorch InstanceNorm with track_running_stats=False. The legacy
+            # exporter labels that valid behavior as train=True and warns solely
+            # because the surrounding export is in evaluation mode.
+            warnings.filterwarnings(
+                "ignore",
+                message=(
+                    r"ONNX export mode is set to TrainingMode\.EVAL, but operator "
+                    r"'instance_norm' is set to train=True\..*"
+                ),
+                category=UserWarning,
+            )
+            torch.onnx.export(
+                qat_model,
+                export_inputs,
+                output_file,
+                export_params=True,
+                opset_version=17,
+                do_constant_folding=True,
+                input_names=input_names,
+                output_names=output_names,
+            )
+        export_succeeded = True
+    finally:
+        qat_model.to(return_device if export_succeeded else original_device)
+        if isinstance(qat_model, GraphModule):
+            if export_succeeded and device is not None:
+                check_graph_nodes(qat_model, device=return_device)
+            else:
+                for node, kwargs in original_kwargs:
+                    node.kwargs = kwargs
+                qat_model.recompile()
     return qat_model
 
 class SimaQatWrapper(GraphModule):

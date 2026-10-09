@@ -42,8 +42,9 @@ This installs the package in editable mode, its dependencies, and test tools.
 
 The recommended workflow is **prepare → warm up → freeze → fine-tune → finalize → export**.
 Keep training and in-training validation on the selected training device,
-preferably a CUDA GPU when available. Finalization and ONNX export
-automatically transition the model and export inputs to CPU.
+preferably a CUDA GPU when available. Finalization returns an inference-only
+CPU model. ONNX export temporarily uses CPU and restores the model's incoming
+device, even if export fails. The caller's example inputs stay unchanged.
 
 ```python
 import torch
@@ -124,7 +125,7 @@ left unchanged on both successful and failed capture.
 | `sima_prepare_qat_model(model, inputs, device, *, dynamic_batch=True)` | Capture the model and insert SiMa shift-aware fake-quant annotations. Set `dynamic_batch=False` only for intentionally fixed-batch models. |
 | `sima_freeze_qat(qat_model)` | Freeze observers and lock shift-aware weight scales before final fine-tuning. |
 | `sima_finalize_qat_model(qat_model)` | Fold the trained scaffolding into an inference-only quantized graph. |
-| `sima_export_onnx(qat_model, inputs, output_file, ...)` | Export the finalized model to an ONNX QuantizeLinear/DequantizeLinear graph. |
+| `sima_export_onnx(qat_model, inputs, output_file, ..., device=None)` | Export on CPU, then restore the model's incoming device. An explicit `device` selects the model's device after successful export. |
 
 ## Examples
 

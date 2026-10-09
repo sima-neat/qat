@@ -61,9 +61,12 @@ Follow these lifecycle invariants:
 6. Save a resumable checkpoint before finalization, including the prepared
    model and optimizer state dictionaries.
 7. After training, call `sima_finalize_qat_model` and export with
-   `sima_export_onnx`. These APIs automatically move the model and export
-   inputs to CPU. Finalization is inference-only. Keep post-export validation
-   and Model Compiler on CPU.
+   `sima_export_onnx`. Finalization returns an inference-only CPU model. Export
+   temporarily uses CPU and restores the model's incoming device and graph
+   device settings, even if export fails; caller inputs stay unchanged. An
+   explicit `device` selects the model's device after a successful export.
+   Keep post-export validation and Model Compiler on CPU for the finalized
+   workflow.
 
 Choose the freeze point from validation evidence. A reasonable initial
 experiment warms observers for most of a short fine-tuning run and reserves
