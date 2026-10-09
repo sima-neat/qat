@@ -41,10 +41,9 @@ This installs the package in editable mode, its dependencies, and test tools.
 ## Usage
 
 The recommended workflow is **prepare → warm up → freeze → fine-tune → finalize → export**.
-Keep training and in-training validation on the selected training device,
-preferably a CUDA GPU when available. Finalization returns an inference-only
-CPU model. ONNX export temporarily uses CPU and restores the model's incoming
-device, even if export fails. The caller's example inputs stay unchanged.
+Train and validate on the same device, using CUDA when available. Finalization
+returns an inference-only CPU model. Export temporarily uses CPU and restores
+the model's device afterward, including on failure. No manual CPU move is needed.
 
 ```python
 import torch
@@ -59,13 +58,13 @@ model = ...                                  # your pretrained torch.nn.Module
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 example_inputs = (torch.randn(1, 3, 224, 224),)
 
-# 1. Insert shift-aware fake-quant scaffolding.
+# 1. Prepare the model to simulate INT8 during training.
 qat_model = sima_prepare_qat_model(model, example_inputs, device=device)
 optimizer = torch.optim.AdamW(qat_model.parameters(), lr=1e-5)
 
 # 2. Warm up observers with your normal training loop ...
 
-# 3. Lock shift-aware power-of-two scales, then fine-tune for a few more epochs.
+# 3. Freeze quantization ranges and scales. Weights remain trainable.
 sima_freeze_qat(qat_model)
 # ... continue training qat_model ...
 
@@ -81,10 +80,9 @@ During validation, temporarily disable observers while retaining fake quantizati
 then restore their previous enabled states. See the [user guide](docs/index.md)
 for the complete training, validation, checkpoint, and export workflow.
 
-Shift-aware QAT constrains each convolution or linear weight scale to a power-of-two relationship
-with its input and output activation grids. Calling `sima_freeze_qat` explicitly leaves time to
-fine-tune against those locked scales. Finalization locks them automatically if necessary, but
-fine-tuning after the explicit call generally gives better accuracy.
+Freeze before the end of training and leave time for the weights to adapt to
+the fixed quantization settings. Finalization freezes automatically if needed,
+but doing it earlier gives the model time to recover accuracy.
 
 ## Operator contract
 

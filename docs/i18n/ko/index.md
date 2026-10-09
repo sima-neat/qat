@@ -10,10 +10,8 @@ sidebar_position: 1
 미세 조정합니다. 학습 후 양자화로 인해 허용할 수 없는 정확도 손실이 발생하고 대표적인
 데이터로 모델을 다시 학습할 수 있을 때 사용합니다.
 
-SiMa QAT는 모델의 기존 PyTorch 학습 프로젝트 안에서 실행되도록 설계되었습니다.
-데이터 세트, 데이터 증강, 손실 함수, 옵티마이저 또는 검증 지표를 대체하지 않습니다.
-이러한 요소는 대개 부동 소수점 모델의 정확도를 만든 기반이므로 원래 프로젝트의 구성을
-유지하는 것이 중요합니다.
+기존 PyTorch 학습 프로젝트에 SiMa QAT를 추가하십시오. 데이터 세트, 전처리,
+데이터 증강, 손실, 옵티마이저 설정 및 검증 지표는 유지하십시오.
 
 가능하면 사전 학습된 부동 소수점 체크포인트에서 시작하십시오. 무작위 초기화부터 학습하는
 것도 지원하지만 일반적으로 훨씬 더 많은 시간과 데이터가 필요합니다.
@@ -35,12 +33,11 @@ SiMa QAT는 모델의 기존 PyTorch 학습 프로젝트 안에서 실행되도�
 6. `QuantizeLinear`와 `DequantizeLinear`(QDQ) 노드가 포함된 표준 opset-17
    ONNX 모델을 **내보냅니다**.
 
-반환된 QAT 모델, 학습 배치, 손실 계산, 옵저버 워밍업, 고정, 회복 학습 및 학습 중
-검증에는 동일한 학습 디바이스를 사용하십시오. 가능한 경우 CUDA GPU를 권장합니다.
-학습이 끝나면 최종화는 CPU의 추론 전용 모델을 반환합니다. ONNX 내보내기는 일시적으로
-CPU를 사용한 뒤 모델을 호출 전 디바이스로 복원하며, 내보내기가 실패해도 복원합니다.
-최종화된 모델을 사용하는 워크플로에서는 내보낸 후의 검증과 Model Compiler를 CPU에서
-실행하십시오.
+QDQ 노드는 내보낸 ONNX 그래프에서 부동 소수점 값과 INT8 값 사이의 변환을
+표현합니다.
+
+학습과 검증에서는 모델과 배치를 같은 디바이스에 두고, 가능하면 CUDA를 사용하십시오.
+최종화는 CPU 모델을 반환하며, 내보내기는 전달된 모델의 디바이스를 유지합니다.
 
 ## 설치
 
@@ -106,15 +103,41 @@ criterion = torch.nn.CrossEntropyLoss()
 
 ### 2. 학습, 고정 및 회복
 
-처음에는 일반적으로 학습하여 옵저버가 대표적인 활성화 범위를 측정하도록 합니다.
-워밍업 후 양자화 매개변수를 고정한 다음, 고정된 양자화 그리드에서 모델이 정확도를
-회복할 수 있도록 학습을 계속합니다.
+워밍업 중에는 옵저버가 활성화 범위를 측정하고 가짜 양자화도 이미 INT8을 시뮬레이션합니다.
+고정은 범위와 스케일 업데이트를 멈추며, **가중치 학습은 계속됩니다**. 고정된 설정에서
+정확도를 회복할 수 있도록 이후에도 학습을 계속하십시오.
 
-학습 중 검증은 학습과 동일한 디바이스에서 실행하십시오. 검증 중에는 가짜 양자화를 활성화한 채 옵저버를 일시적으로 비활성화하여 검증 데이터가 관측 범위를 바꾸지 않도록 하세요. `eval()`과 `inference_mode()`만으로는 옵저버가 멈추지 않습니다. 고정 단계에서 이미 비활성화된 옵저버도 포함하여 `finally`에서 이전 상태로 복원하세요.
+검증 중에는 가짜 양자화를 유지하고 옵저버를 비활성화하여 검증 데이터가 측정 범위를
+바꾸지 않도록 해야 합니다. `eval()`만으로는 옵저버가 멈추지 않습니다. 이 분류용 헬퍼는
+고정 단계에서 이미 비활성화된 옵저버를 포함하여 이전 모드와 상태를 복원합니다.
+탐지 등 다른 작업에서는 지표를 바꾸십시오.
 
 ```python
 from torch.ao.quantization import disable_observer
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
+
+def validate(model, loader, device):
+    was_training = model.training
+    observer_states = [
+        (module, module.observer_enabled.clone())
+        for module in model.modules()
+        if isinstance(module, FakeQuantizeBase)
+    ]
+    correct = total = 0
+    try:
+        model.eval()
+        model.apply(disable_observer)
+        with torch.inference_mode():
+            for images, labels in loader:
+                images, labels = images.to(device), labels.to(device)
+                predictions = model(images).argmax(dim=1)
+                correct += (predictions == labels).sum().item()
+                total += labels.numel()
+    finally:
+        model.train(was_training)
+        for module, enabled in observer_states:
+            module.observer_enabled.copy_(enabled)
+    return correct / total
 
 freeze_epoch = 2
 num_epochs = 4
@@ -136,23 +159,12 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
-    observer_states = [
-        (module, module.observer_enabled.clone())
-        for module in qat_model.modules()
-        if isinstance(module, FakeQuantizeBase)
-    ]
-    try:
-        qat_model.apply(disable_observer)
-        validate(qat_model, validation_loader, device)
-    finally:
-        for module, enabled in observer_states:
-            module.observer_enabled.copy_(enabled)
+    accuracy = validate(qat_model, validation_loader, device)
+    print(f"Epoch {epoch}: validation accuracy {accuracy:.2%}")
 ```
 
-고정 에포크는 모델에 따라 다릅니다. 짧은 미세 조정 실행의 대부분 동안 옵저버를 워밍업하고
-마지막 한 개 이상의 에포크를 회복 학습에 사용하는 것이 좋은 출발점입니다. 고정 전후의
-검증 정확도를 추적하십시오. 정확도가 급격히 떨어지면 더 일찍 고정하고 회복 학습 기간을
-늘리십시오.
+이 예제는 워밍업 2 에포크와 회복 2 에포크를 사용합니다. 이를 시작점으로 삼고, 검증
+결과에 따라 고정 에포크와 회복 기간을 선택하십시오.
 
 ### 3. 학습 저장 및 재개
 
@@ -199,15 +211,12 @@ start_epoch = checkpoint["epoch"] + 1
 
 ### 4. 최종화 및 내보내기
 
-최종화는 CPU에 있는 추론 전용 모델을 만듭니다. ONNX 내보내기는 전달된 모델 자체를
-일시적으로 CPU로 이동하고 예제 입력의 CPU 복사본을 사용합니다. 기본적으로 내보내기가
-실패해도 모델의 디바이스와 그래프의 디바이스 설정을 호출 전 상태로 복원합니다.
-호출자의 예제 입력은 변경하지 않습니다. 명시적인 `device="cuda"` 또는 `device="cpu"`는
-내보내기에 성공한 후 모델을 이동할 디바이스를 지정하며, ONNX 실행 디바이스를
-지정하지 않습니다.
+학습 체크포인트를 먼저 저장하십시오. 최종화된 모델은 추론 전용이며 학습을 재개할 수
+없습니다. 수동으로 CPU로 이동할 필요는 없습니다.
 
 ```python
 final_model = sima_finalize_qat_model(qat_model)
+accuracy = validate(final_model, validation_loader, "cpu")
 sima_export_onnx(
     final_model,
     example_inputs,
@@ -216,6 +225,16 @@ sima_export_onnx(
     output_names=["predictions"],
 )
 ```
+
+| 작업 | 디바이스 동작 |
+|---|---|
+| 준비 | 선택한 학습 디바이스의 QAT 모델을 반환하며 원본 모델은 변경하지 않습니다. |
+| 최종화 | 전달된 QAT 모델을 CPU로 이동하고 CPU의 추론 전용 모델을 반환합니다. |
+| 내보내기 | 일시적으로 CPU를 사용한 뒤 실패해도 모델 디바이스와 그래프의 디바이스 설정을 복원합니다. 예제 입력은 변경하지 않습니다. |
+
+일반적으로 내보내기의 `device` 인수를 생략하십시오. `device="cuda"` 또는
+`device="cpu"`를 명시하면 성공 후 모델을 해당 디바이스로 이동합니다. 이 옵션은
+PyTorch 모델의 디바이스를 제어하며 ONNX 실행 디바이스를 지정하지 않습니다.
 
 ## 배치 크기
 
@@ -242,8 +261,6 @@ qat_model = sima_prepare_qat_model(
 
 ## 검증 및 컴파일
 
-학습 후 검증과 Model Compiler는 CPU에서 실행하십시오.
-
 원본 부동 소수점 모델, 고정 전후의 준비된 모델, 최종화된 PyTorch 모델 및 ONNX 모델의
 작업 수준 지표를 측정하십시오. 이를 통해 어느 수명 주기 단계에서 회귀가 발생했는지
 명확하게 확인할 수 있습니다.
@@ -269,7 +286,7 @@ PY
 Embedding/Gather, GridSample, ReduceMin 및 CumSum은 학습할 수 있지만 이번 릴리스에서는
 QAT 어노테이션 대상이 아닙니다.
 
-내보낸 QDQ ONNX 모델이 Model Compiler로 전달되는 지점입니다. 가져오기, 파티셔닝,
+내보낸 QDQ ONNX 모델을 CPU의 Model Compiler에 전달하십시오. 가져오기, 파티셔닝,
 최적화 및 하드웨어 할당은 별도의 컴파일 단계입니다.
 
 ## 실행 가능한 예제

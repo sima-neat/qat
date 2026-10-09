@@ -11,11 +11,8 @@ the numerical effects of INT8 inference. Use it when post-training quantization
 causes an unacceptable accuracy loss and you can retrain the model with
 representative data.
 
-SiMa QAT is designed to run inside the model's existing PyTorch training
-project. It does not replace the dataset, augmentations, loss function,
-optimizer, or validation metric. Keeping those parts of the original project
-is important because they are usually what made the floating-point model
-accurate in the first place.
+Add SiMa QAT to your existing PyTorch training project. Keep its dataset,
+preprocessing, augmentations, loss, optimizer settings, and validation metric.
 
 Start from a pretrained floating-point checkpoint when possible. Training from
 random initialization is supported, but usually requires substantially more
@@ -39,12 +36,12 @@ The workflow is:
 6. **Export** a standard opset-17 ONNX model containing
    `QuantizeLinear` and `DequantizeLinear` (QDQ) nodes.
 
-Use the same training device for the returned QAT model, batches, loss,
-observer warm-up, freezing, recovery training, and in-training validation.
-Prefer a CUDA GPU when one is available. After training, finalization returns
-an inference-only CPU model. ONNX export temporarily uses CPU, then restores
-the model's incoming device, even if export fails. Run post-export validation
-and Model Compiler on CPU for the finalized workflow.
+QDQ nodes describe the conversion between floating-point values and INT8
+values in the exported ONNX graph.
+
+Train and validate with the model and batches on the same device. Use CUDA
+when available. Finalization returns a CPU model; export preserves the device
+of the model passed to it.
 
 ## Install
 
@@ -111,19 +108,43 @@ updates the prepared graph.
 
 ### 2. Train, freeze, and recover
 
-Train normally at first so the observers can measure representative activation
-ranges. Freeze the quantization parameters after this warm-up, then continue
-training so the model can recover accuracy with locked quantization grids.
+During warm-up, observers measure activation ranges while fake quantization
+already simulates INT8. Freezing stops range and scale updates, **not weight
+training**. Keep training afterward so the weights can recover accuracy with
+those fixed settings.
 
-Run in-training validation on the same device as training. Keep fake
-quantization enabled but temporarily disable observers so held-out data cannot
-change their ranges. `eval()` and `inference_mode()` alone do not stop
-observers. Restore their previous states in `finally`, including observers
-already disabled by freezing.
+Validation must keep fake quantization enabled and observers disabled so
+held-out data cannot change the measured ranges. `eval()` alone does not stop
+observers. This classification helper restores the previous mode and observer
+states, including observers already disabled by freezing. Adapt the metric
+for detection or other tasks.
 
 ```python
 from torch.ao.quantization import disable_observer
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
+
+def validate(model, loader, device):
+    was_training = model.training
+    observer_states = [
+        (module, module.observer_enabled.clone())
+        for module in model.modules()
+        if isinstance(module, FakeQuantizeBase)
+    ]
+    correct = total = 0
+    try:
+        model.eval()
+        model.apply(disable_observer)
+        with torch.inference_mode():
+            for images, labels in loader:
+                images, labels = images.to(device), labels.to(device)
+                predictions = model(images).argmax(dim=1)
+                correct += (predictions == labels).sum().item()
+                total += labels.numel()
+    finally:
+        model.train(was_training)
+        for module, enabled in observer_states:
+            module.observer_enabled.copy_(enabled)
+    return correct / total
 
 freeze_epoch = 2
 num_epochs = 4
@@ -145,23 +166,13 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
-    observer_states = [
-        (module, module.observer_enabled.clone())
-        for module in qat_model.modules()
-        if isinstance(module, FakeQuantizeBase)
-    ]
-    try:
-        qat_model.apply(disable_observer)
-        validate(qat_model, validation_loader, device)
-    finally:
-        for module, enabled in observer_states:
-            module.observer_enabled.copy_(enabled)
+    accuracy = validate(qat_model, validation_loader, device)
+    print(f"Epoch {epoch}: validation accuracy {accuracy:.2%}")
 ```
 
-The freeze epoch is model-dependent. A useful starting point is to warm up
-observers for most of a short fine-tuning run and reserve at least one final
-epoch for recovery. Track validation accuracy before and after freezing. If
-accuracy drops sharply, freeze earlier and allow more recovery training.
+The example uses two warm-up epochs and two recovery epochs. Treat this as a
+starting point: choose the freeze epoch and recovery duration from validation
+results.
 
 ### 3. Save and resume training
 
@@ -208,15 +219,12 @@ quantization parameters used by finalization and ONNX export.
 
 ### 4. Finalize and export
 
-Finalization creates an inference-only CPU model. ONNX export temporarily
-moves the supplied model to CPU in place and uses CPU copies of the example
-inputs. By default, it restores the model's incoming device and graph device
-settings, even if export fails. The caller's example inputs stay unchanged.
-An explicit `device="cuda"` or `device="cpu"` selects where the supplied model
-is moved after a successful export; it does not select the ONNX runtime device.
+Save your training checkpoint first: the finalized model is for inference
+and cannot resume training. No manual CPU move is needed.
 
 ```python
 final_model = sima_finalize_qat_model(qat_model)
+accuracy = validate(final_model, validation_loader, "cpu")
 sima_export_onnx(
     final_model,
     example_inputs,
@@ -225,6 +233,16 @@ sima_export_onnx(
     output_names=["predictions"],
 )
 ```
+
+| Operation | Device behavior |
+|---|---|
+| Prepare | Returns a QAT model on your selected training device; the source model stays unchanged. |
+| Finalize | Moves the supplied QAT model to CPU and returns an inference-only CPU model. |
+| Export | Temporarily uses CPU, then restores the supplied model's device and graph device settings, even on failure. Example inputs stay unchanged. |
+
+Usually, omit export's `device` argument. Passing `device="cuda"` or
+`device="cpu"` explicitly moves the supplied model there after successful
+export. This option controls the PyTorch model, not the ONNX runtime device.
 
 ## Batch size
 
@@ -253,8 +271,6 @@ dynamic batch when it would change the model's behavior.
 
 ## Validate and compile
 
-Run post-training validation and Model Compiler on CPU.
-
 Measure the task-level metric for the original floating-point model, the
 prepared model before and after freezing, the finalized PyTorch model, and the
 ONNX model. This makes it clear which lifecycle step introduced a regression.
@@ -281,7 +297,7 @@ shape/layout operations are covered. `ArgMax` and `TopK` keep index outputs as
 integers. PReLU, ConvTranspose, Embedding/Gather, GridSample, ReduceMin, and
 CumSum remain trainable but are not QAT-annotated in this release.
 
-The exported QDQ ONNX model is the handoff to Model Compiler. Import,
+Pass the exported QDQ ONNX model to Model Compiler on CPU. Import,
 partitioning, optimization, and hardware assignment are separate compilation
 steps.
 
