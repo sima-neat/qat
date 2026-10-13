@@ -19,7 +19,7 @@ from typing import Callable, Dict, List, Iterable
 
 from sima_qat.misc import find_latest_file_string
 
-import lightning as L
+import pytorch_lightning as L
 
 # Helper class to iterate over ImageNet samples
 class ImageNetIterator(object):

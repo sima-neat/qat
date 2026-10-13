@@ -51,7 +51,6 @@ class ImageNet_Model_Trainer(L.LightningModule):
         self.lr = 1e-5
         self.weight_decay = 1e-4
         self.batch_size = batch_size
-        self.workers = 4
         self.device_train = device_train
         # Call this last once all init has been done
         self.save_hyperparameters()
