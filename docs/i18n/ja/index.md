@@ -10,10 +10,8 @@ sidebar_position: 1
 PyTorch モデルを微調整します。学習後量子化による精度低下が許容できず、
 代表的なデータを使用してモデルを再学習できる場合に使用します。
 
-SiMa QAT は、モデルの既存の PyTorch 学習プロジェクト内で動作するように設計されています。
-データセット、データ拡張、損失関数、オプティマイザ、検証指標を置き換えるものではありません。
-これらは通常、浮動小数点モデルの精度を支える要素であるため、元のプロジェクトの構成を
-維持することが重要です。
+既存の PyTorch 学習プロジェクトに SiMa QAT を追加します。データセット、前処理、
+データ拡張、損失、オプティマイザの設定、検証指標は維持してください。
 
 可能な場合は、事前学習済みの浮動小数点チェックポイントから開始してください。
 ランダムな初期値からの学習も可能ですが、通常は大幅に多くの時間とデータが必要です。
@@ -34,6 +32,9 @@ SiMa QAT は、モデルの既存の PyTorch 学習プロジェクト内で動�
 5. 推論用にモデルを **確定** します。
 6. `QuantizeLinear` と `DequantizeLinear`（QDQ）ノードを含む標準の
    opset-17 ONNX モデルを **エクスポート** します。
+
+QDQ ノードは、エクスポートされた ONNX グラフ内で浮動小数点値と INT8 値の
+変換を表します。
 
 ## インストール
 
@@ -64,7 +65,8 @@ python -c "import torch, sima_qat; print(torch.__version__, sima_qat.__file__)"
 
 オプティマイザを作成する前にモデルを準備します。準備処理は独立した QAT グラフを返し、
 元のモデルや入力例を変更したり移動したりしません。入力タプルは、モデルの位置引数、
-データ型、形状と一致する必要があります。
+データ型、形状と一致する必要があります。`device` 引数は返される QAT グラフの
+学習デバイスを選択します。学習と検証のバッチもそのデバイスに置いてください。
 
 ```python
 import torch
@@ -93,20 +95,43 @@ optimizer = torch.optim.AdamW(qat_model.parameters(), lr=1e-5)
 criterion = torch.nn.CrossEntropyLoss()
 ```
 
-学習では準備済みグラフが更新されるため、`source_model` ではなく `qat_model` から
-オプティマイザを作成してください。
-
 ### 2. 学習、固定、回復
 
-最初は通常どおり学習し、オブザーバが代表的な活性化範囲を測定できるようにします。
-このウォームアップ後に量子化パラメータを固定し、固定された量子化グリッドでモデルが
-精度を回復できるように学習を続けます。
+ウォームアップ中は、オブザーバが活性化範囲を測定し、偽量子化もすでに INT8 を
+シミュレートしています。固定するのは範囲とスケールの更新であり、**重みの学習では
+ありません**。その後も学習を続け、固定された設定で精度を回復させます。
 
-検証中は偽量子化を有効に保ち、検証データが観測範囲を変更しないようにオブザーバを一時的に無効にしてください。`eval()` と `inference_mode()` だけではオブザーバは停止しません。固定処理ですでに無効になっているものも含め、`finally` で元の状態に戻してください。
+検証では偽量子化を有効に保ち、オブザーバを無効にして検証データによる範囲の変更を
+防ぎます。`eval()` だけではオブザーバは停止しません。この分類用ヘルパーは、固定により
+無効になっているオブザーバも含め、以前のモードと状態を復元します。検出などの
+タスクでは指標を変更してください。
 
 ```python
 from torch.ao.quantization import disable_observer
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
+
+def validate(model, loader, device):
+    was_training = model.training
+    observer_states = [
+        (module, module.observer_enabled.clone())
+        for module in model.modules()
+        if isinstance(module, FakeQuantizeBase)
+    ]
+    correct = total = 0
+    try:
+        model.eval()
+        model.apply(disable_observer)
+        with torch.inference_mode():
+            for images, labels in loader:
+                images, labels = images.to(device), labels.to(device)
+                predictions = model(images).argmax(dim=1)
+                correct += (predictions == labels).sum().item()
+                total += labels.numel()
+    finally:
+        model.train(was_training)
+        for module, enabled in observer_states:
+            module.observer_enabled.copy_(enabled)
+    return correct / total
 
 freeze_epoch = 2
 num_epochs = 4
@@ -128,25 +153,14 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
-    observer_states = [
-        (module, module.observer_enabled.clone())
-        for module in qat_model.modules()
-        if isinstance(module, FakeQuantizeBase)
-    ]
-    try:
-        qat_model.apply(disable_observer)
-        validate(qat_model, validation_loader, device)
-    finally:
-        for module, enabled in observer_states:
-            module.observer_enabled.copy_(enabled)
+    accuracy = validate(qat_model, validation_loader, device)
+    print(f"Epoch {epoch}: validation accuracy {accuracy:.2%}")
 ```
 
-固定するエポックはモデルによって異なります。短い微調整の大部分でオブザーバを
-ウォームアップし、少なくとも最後の 1 エポックを回復用に確保するのが有用な開始点です。
-固定の前後で検証精度を追跡してください。精度が急激に低下する場合は、より早く固定し、
-回復学習の期間を長くします。
+この例ではウォームアップと回復にそれぞれ 2 エポックを使用します。開始点として考え、
+検証結果に基づいて固定するエポックと回復期間を選んでください。
 
-### 3. 学習の保存と再開
+### 3. チェックポイントの保存
 
 学習を再開できるように、確定処理の前に準備済みモデルを保存します。チェックポイントには
 QAT モデルとオプティマイザの両方の状態を含めます。
@@ -166,7 +180,7 @@ torch.save(
 )
 ```
 
-再開するには、保存した状態を読み込む前に、同じ入力例とバッチ契約を使用して同じモデルを
+**後で学習を再開する場合（任意）**、保存した状態を読み込む前に、同じ入力例とバッチ契約を使用して同じモデルを
 再作成し、準備します。
 
 ```python
@@ -191,21 +205,29 @@ start_epoch = checkpoint["epoch"] + 1
 
 ### 4. 確定とエクスポート
 
-確定処理は推論専用モデルを作成します。学習済み QAT モデルと入力例を CPU に移動し、
-確定済みモデルを opset-17 QDQ ONNX としてエクスポートします。
+確定処理は学習済み QAT モデルを推論専用グラフに変換し、エクスポートはそのグラフを
+ONNX に書き出します。確定済みモデルから学習を再開することはできません。
 
 ```python
-final_model = sima_finalize_qat_model(qat_model.cpu())
-export_inputs = tuple(value.cpu() for value in example_inputs)
+final_model = sima_finalize_qat_model(qat_model)
+accuracy = validate(final_model, validation_loader, device)
 sima_export_onnx(
     final_model,
-    export_inputs,
+    example_inputs,
     "model.qdq.onnx",
     input_names=["images"],
     output_names=["predictions"],
-    device="cpu",
 )
 ```
+
+| 操作 | デバイスの動作 |
+|---|---|
+| 準備 | 選択した学習デバイスを使用します。 |
+| 確定 | QAT モデルのデバイスを維持します。 |
+| エクスポート | 一時的に CPU を使用し、失敗時もモデルを元のデバイスに戻します。入力は変更しません。 |
+
+モデルのデバイスを維持するには、エクスポートの `device` 引数を省略してください。
+明示した値は成功後の PyTorch モデルの移動先を指定し、ONNX の実行デバイスは指定しません。
 
 ## バッチサイズ
 
@@ -257,7 +279,7 @@ PY
 ConvTranspose、Embedding/Gather、GridSample、ReduceMin、CumSum は学習可能ですが、
 このリリースでは QAT アノテーションの対象外です。
 
-エクスポートした QDQ ONNX モデルが Model Compiler への受け渡し点です。インポート、
+エクスポートした QDQ ONNX モデルを CPU 上の Model Compiler に渡します。インポート、
 パーティショニング、最適化、ハードウェア割り当ては、別のコンパイル手順です。
 
 ## 実行可能な例

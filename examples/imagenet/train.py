@@ -1,8 +1,10 @@
 import argparse
+import itertools
 import os
+import random
 
 import torchvision.datasets as datasets
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 
 import pytorch_lightning as L
@@ -11,6 +13,31 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from imagenet_lit import ImageNet_Model_Trainer
 
 from sima_qat.misc import find_latest_file_string
+
+
+def _stratified_subset(dataset, samples_limit):
+    """Select a reproducible subset across classes without changing ImageFolder."""
+    if samples_limit <= 0:
+        raise ValueError("--samples-limit must be positive")
+    if samples_limit >= len(dataset):
+        return dataset
+
+    by_class = {}
+    for index, (_, label) in enumerate(dataset.samples):
+        by_class.setdefault(label, []).append(index)
+    groups = list(by_class.values())
+    rng = random.Random(42)
+    for indices in groups:
+        rng.shuffle(indices)
+    # Randomize class order too, including limits smaller than the class count.
+    rng.shuffle(groups)
+    indices = (
+        index
+        for row in itertools.zip_longest(*groups)
+        for index in row
+        if index is not None
+    )
+    return Subset(dataset, list(itertools.islice(indices, samples_limit)))
 
 
 def get_train_dataloader(
@@ -27,7 +54,7 @@ def get_train_dataloader(
             [transforms.RandomResizedCrop(crop_size), transforms.RandomHorizontalFlip(), transforms.ToTensor(), normalize]
         ),
     )
-    train_dataset.samples = train_dataset.samples[:samples_limit]
+    train_dataset = _stratified_subset(train_dataset, samples_limit)
     train_loader = DataLoader(
         dataset=train_dataset, 
         batch_size=batch_size, 
@@ -151,10 +178,10 @@ def get_args():
     parser.add_argument('-d', '--data', type=str, default=".", help='Dataset location')
     parser.add_argument('--device', type=str, default="cpu", help='Device to use')
     parser.add_argument('--model', type=str, default="resnet18", help='Torchvision Imagenet Model to be trained')
-    parser.add_argument('--samples-limit', type=int, default=1281167, help='Limit train samples to size N')
+    parser.add_argument('--samples-limit', type=int, default=1281167, help='Limit train samples to a class-balanced subset of size N (seed 42)')
     parser.add_argument(
-        '-j', '--workers', type=int, default=4,
-        help='DataLoader worker processes; use 0 to disable multiprocessing',
+        '-j', '--workers', type=int, default=0,
+        help='DataLoader worker processes; defaults to 0 to avoid shared-memory pressure',
     )
     parser.add_argument('--export-on-end', action='store_true', help='Export ONNX model at training end')
     parser.add_argument('--disable-qat', action='store_true', help='Disable QAT mode')

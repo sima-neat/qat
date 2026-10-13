@@ -238,7 +238,6 @@ def main() -> None:
 
     if args.no_export:
         return
-    qat_model = qat_model.cpu()
     final_model = sima_finalize_qat_model(qat_model)
     export_input = torch.zeros(1, 3, args.image_size, args.image_size)
     full_onnx = output_directory / "yolo26n_qat_training_outputs.onnx"
@@ -260,7 +259,6 @@ def main() -> None:
         str(full_onnx),
         input_names=["images"],
         output_names=output_names,
-        device=torch.device("cpu"),
     )
     print(f"Exported full QDQ graph: {full_onnx}")
 

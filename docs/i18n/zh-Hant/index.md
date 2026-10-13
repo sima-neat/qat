@@ -10,9 +10,8 @@ sidebar_position: 1
 當訓練後量化造成無法接受的準確度損失，而且您可以使用具代表性的資料重新訓練模型時，
 請使用 QAT。
 
-SiMa QAT 的設計用途是在模型現有的 PyTorch 訓練專案中執行。它不會取代資料集、
-資料增強、損失函數、最佳化器或驗證指標。保留原始專案的這些部分很重要，因為它們
-通常正是浮點模型能夠達到良好準確度的原因。
+將 SiMa QAT 加入現有的 PyTorch 訓練專案。保留資料集、前處理、資料增強、損失函數、
+最佳化器設定與驗證指標。
 
 盡可能從預先訓練的浮點檢查點開始。系統也支援從隨機初始化開始訓練，但通常需要
 更多時間與資料。
@@ -32,6 +31,8 @@ SiMa QAT 的設計用途是在模型現有的 PyTorch 訓練專案中執行。�
 5. **完成**用於推論的模型。
 6. **匯出**包含 `QuantizeLinear` 與 `DequantizeLinear`（QDQ）節點的標準
    opset-17 ONNX 模型。
+
+QDQ 節點描述匯出 ONNX 圖中浮點值與 INT8 值之間的轉換。
 
 ## 安裝
 
@@ -61,6 +62,7 @@ python -c "import torch, sima_qat; print(torch.__version__, sima_qat.__file__)"
 
 請在建立最佳化器之前準備模型。準備程序會傳回獨立的 QAT 圖，不會修改或移動
 來源模型或範例輸入。輸入 tuple 必須符合模型的位置輸入、資料類型與形狀。
+`device` 引數會選擇傳回 QAT 圖的訓練裝置。訓練與驗證的批次資料也應位於該裝置。
 
 ```python
 import torch
@@ -89,18 +91,41 @@ optimizer = torch.optim.AdamW(qat_model.parameters(), lr=1e-5)
 criterion = torch.nn.CrossEntropyLoss()
 ```
 
-由於訓練會更新準備後的圖，請從 `qat_model` 而非 `source_model` 建立最佳化器。
-
 ### 2. 訓練、凍結與恢復
 
-一開始請照常訓練，讓觀察器測量具代表性的啟用值範圍。完成預熱後凍結量化參數，
-再繼續訓練，讓模型在鎖定的量化網格下恢復準確度。
+預熱時，觀察器會測量啟用值範圍，而假量化也已開始模擬 INT8。凍結會停止範圍與
+縮放因子的更新，**不會停止權重訓練**。之後請繼續訓練，讓權重在固定設定下恢復準確度。
 
-驗證時請保持偽量化啟用，但暫時停用觀察器，避免驗證資料改變觀測範圍。僅使用 `eval()` 和 `inference_mode()` 不會停止觀察器。請在 `finally` 中還原先前狀態，包括凍結時已停用的觀察器。
+驗證時必須保留假量化並停用觀察器，避免驗證資料改變測量範圍。僅使用 `eval()`
+不會停止觀察器。這個分類輔助函式會還原先前的模式與觀察器狀態，包括凍結時已停用
+的觀察器。偵測或其他任務請調整指標。
 
 ```python
 from torch.ao.quantization import disable_observer
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
+
+def validate(model, loader, device):
+    was_training = model.training
+    observer_states = [
+        (module, module.observer_enabled.clone())
+        for module in model.modules()
+        if isinstance(module, FakeQuantizeBase)
+    ]
+    correct = total = 0
+    try:
+        model.eval()
+        model.apply(disable_observer)
+        with torch.inference_mode():
+            for images, labels in loader:
+                images, labels = images.to(device), labels.to(device)
+                predictions = model(images).argmax(dim=1)
+                correct += (predictions == labels).sum().item()
+                total += labels.numel()
+    finally:
+        model.train(was_training)
+        for module, enabled in observer_states:
+            module.observer_enabled.copy_(enabled)
+    return correct / total
 
 freeze_epoch = 2
 num_epochs = 4
@@ -122,24 +147,14 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
-    observer_states = [
-        (module, module.observer_enabled.clone())
-        for module in qat_model.modules()
-        if isinstance(module, FakeQuantizeBase)
-    ]
-    try:
-        qat_model.apply(disable_observer)
-        validate(qat_model, validation_loader, device)
-    finally:
-        for module, enabled in observer_states:
-            module.observer_enabled.copy_(enabled)
+    accuracy = validate(qat_model, validation_loader, device)
+    print(f"Epoch {epoch}: validation accuracy {accuracy:.2%}")
 ```
 
-凍結 epoch 取決於模型。實用的起點是在短期微調的大部分時間預熱觀察器，並保留
-至少最後一個 epoch 進行恢復訓練。請追蹤凍結前後的驗證準確度。如果準確度大幅下降，
-請提早凍結並增加恢復訓練時間。
+此範例使用兩個預熱 epoch 與兩個恢復 epoch。請將它視為起點，依驗證結果選擇
+凍結的 epoch 與恢復訓練的時間。
 
-### 3. 儲存與繼續訓練
+### 3. 儲存檢查點
 
 請在完成模型前儲存準備後的模型，以便繼續訓練。檢查點應同時包含 QAT 模型與
 最佳化器狀態。
@@ -159,7 +174,7 @@ torch.save(
 )
 ```
 
-若要繼續訓練，請使用相同的範例輸入與批次規格重新建立並準備相同模型，再載入
+**若要稍後繼續訓練（選用）**，請使用相同的範例輸入與批次規格重新建立並準備相同模型，再載入
 儲存的狀態：
 
 ```python
@@ -184,21 +199,29 @@ start_epoch = checkpoint["epoch"] + 1
 
 ### 4. 完成與匯出
 
-完成程序會建立僅供推論使用的模型。請將已訓練的 QAT 模型與範例輸入移至 CPU，
-再將完成後的模型匯出為 opset-17 QDQ ONNX。
+完成程序會將訓練後的 QAT 模型轉換成僅供推論的圖；匯出則會將該圖寫入 ONNX。
+完成後的模型無法繼續訓練。
 
 ```python
-final_model = sima_finalize_qat_model(qat_model.cpu())
-export_inputs = tuple(value.cpu() for value in example_inputs)
+final_model = sima_finalize_qat_model(qat_model)
+accuracy = validate(final_model, validation_loader, device)
 sima_export_onnx(
     final_model,
-    export_inputs,
+    example_inputs,
     "model.qdq.onnx",
     input_names=["images"],
     output_names=["predictions"],
-    device="cpu",
 )
 ```
+
+| 操作 | 裝置行為 |
+|---|---|
+| 準備 | 使用所選的訓練裝置。 |
+| 完成 | 維持 QAT 模型的裝置。 |
+| 匯出 | 暫時使用 CPU，之後將模型移回原本裝置，即使失敗也會還原。輸入維持不變。 |
+
+省略匯出的 `device` 引數即可維持模型的裝置。明確指定值會在匯出成功後移動
+PyTorch 模型，而非指定 ONNX 的執行裝置。
 
 ## 批次大小
 
@@ -246,8 +269,8 @@ PY
 `ArgMax` 與 `TopK` 的索引輸出維持整數。PReLU、ConvTranspose、Embedding/Gather、
 GridSample、ReduceMin 和 CumSum 仍可訓練，但此版本不會為它們加上 QAT 註解。
 
-匯出的 QDQ ONNX 模型是交付 Model Compiler 的介面。匯入、分割、最佳化與硬體指派
-屬於後續且獨立的編譯步驟。
+將匯出的 QDQ ONNX 模型交給 CPU 上的 Model Compiler。匯入、分割、最佳化與硬體
+指派屬於獨立的編譯步驟。
 
 ## 可執行的範例
 
