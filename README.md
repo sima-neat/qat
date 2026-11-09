@@ -189,6 +189,10 @@ pytest -m nightly tests/end_to_end
 
 Generated ONNX models are written to `exported_models/` (gitignored).
 
+For read-only checks of export eligibility, checkpoint identity and captured
+PyTorch/ONNX output bit patterns, see [export validation](docs/export-validation.md).
+An executable diagnostic reference is not automatically a Model Compiler input.
+
 ## CI/CD
 
 `.github/workflows/vulcan-ci.yml` builds the wheel on a public Ubuntu runner,
