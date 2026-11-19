@@ -1,4 +1,4 @@
-"""Fake-quantized division denominators must not round to zero."""
+"""Fake-quantized division denominators that the model guards must not round to zero."""
 
 import onnx
 import onnxruntime
@@ -33,9 +33,24 @@ class Divide(nn.Module):
         return x / y
 
 
+class ClampDivide(nn.Module):
+    def forward(self, x, y):
+        return x / y.clamp_min(1e-6)
+
+
+class SelfRatio(nn.Module):
+    def __init__(self, clone: bool):
+        super().__init__()
+        self.clone = clone
+
+    def forward(self, x):
+        d = x.clamp_min(1e-6)
+        return d / (d.clone() if self.clone else d)
+
+
 class SumRatio(nn.Module):
     def forward(self, x):
-        total = x.sum()
+        total = torch.relu(x).sum()
         return total / (total + 1.0)
 
 
@@ -44,6 +59,10 @@ def _softmax_input():
     x = torch.randn(2, 4, 64)
     x[..., :16] = -12.0
     return x
+
+
+def _floors(model) -> int:
+    return sum(1 for node in model.graph.nodes if "sima_denominator_floor" in node.meta)
 
 
 def test_small_denominator_stays_finite_through_training() -> None:
@@ -92,20 +111,49 @@ def test_frozen_floor_exports_as_clip_at_one_step(tmp_path) -> None:
     assert torch.allclose(torch.from_numpy(actual), expected, atol=1e-6)
 
 
-def test_signed_denominator_is_not_floored() -> None:
-    x = torch.ones(2, 8)
-    y = torch.linspace(-1.0, 1.0, 16).view(2, 8)
+@pytest.mark.parametrize(
+    "denominator",
+    [[0.0, 0.1, 0.5, 1.0], [-1e-4, 0.1, 0.5, 1.0]],
+    ids=["raw_zero", "small_negative"],
+)
+def test_unguarded_denominator_is_not_floored(denominator) -> None:
+    x = torch.ones(1, 4)
+    y = torch.tensor([denominator])
     qat_model = sima_prepare_qat_model(Divide(), (x, y), "cpu")
-    assert (qat_model(x, y) < 0).any()
+    assert _floors(qat_model) == 0
+    assert not torch.isfinite(qat_model(x, y)[0, 0])
 
-    sima_freeze_qat(qat_model)
-    final = sima_finalize_qat_model(qat_model)
+
+def test_frozen_checkpoint_loads_into_unguarded_model() -> None:
+    x = torch.ones(2, 8)
+    y = torch.linspace(0.1, 1.0, 16).view(2, 8)
+    trained = sima_prepare_qat_model(Divide(), (x, y), "cpu")
+    trained(x, y)
+    sima_freeze_qat(trained)
+    expected = sima_finalize_qat_model(trained)(x, y)
+
+    loaded = sima_prepare_qat_model(Divide(), (x, y), "cpu")
+    loaded.load_state_dict(trained.state_dict())
+    sima_freeze_qat(loaded)
+    final = sima_finalize_qat_model(loaded)
     assert torch.ops.aten.clamp_min.default not in [node.target for node in final.graph.nodes]
+    torch.testing.assert_close(final(x, y), expected)
+
+
+def test_self_division_floors_only_the_denominator() -> None:
+    x = torch.tensor([[0.0, 0.1, 0.5, 1.0]])
+    shared = sima_prepare_qat_model(SelfRatio(clone=False), (x,), "cpu")
+    cloned = sima_prepare_qat_model(SelfRatio(clone=True), (x,), "cpu")
+    assert _floors(shared) == _floors(cloned) == 1
+    output = shared(x)
+    assert output[0, 0] == 0
+    torch.testing.assert_close(output, cloned(x))
 
 
 def test_scalar_denominator_keeps_its_shape() -> None:
     x = torch.rand(2, 8)
     qat_model = sima_prepare_qat_model(SumRatio(), (x,), "cpu")
+    assert _floors(qat_model) == 1
     qat_model(x)
     assert qat_model(x).shape == torch.Size([])
 
@@ -113,7 +161,8 @@ def test_scalar_denominator_keeps_its_shape() -> None:
 def test_disabled_fake_quant_divides_in_float() -> None:
     x = torch.ones(2, 8)
     y = torch.linspace(1e-4, 1.0, 16).view(2, 8)
-    qat_model = sima_prepare_qat_model(Divide(), (x, y), "cpu")
+    qat_model = sima_prepare_qat_model(ClampDivide(), (x, y), "cpu")
+    assert _floors(qat_model) == 1
     qat_model(x, y)
 
     qat_model.apply(disable_fake_quant)
