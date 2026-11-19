@@ -2,8 +2,8 @@
 
 INT8 fake quantization rounds a small denominator, such as ``sum + 1e-6``, to
 the zero code, so the division returns ``0 / 0`` and training fails on NaN.
-While the denominator's grid starts at zero, floor it at one grid step, the
-smallest positive value the grid holds. Finalization freezes the floor, which
+While the denominator's grid starts at zero and fake quantization is enabled,
+floor it at one grid step, the smallest positive value the grid holds. Finalization freezes the floor, which
 ONNX exports as a scalar Clip.
 """
 
@@ -15,9 +15,15 @@ _aten = torch.ops.aten
 _FLOOR_META = "sima_denominator_floor"
 
 
-def denominator_floor(scale: torch.Tensor, zero_point: torch.Tensor, quant_min: int) -> torch.Tensor:
-    """Return one grid step on a nonnegative grid, and -inf (no floor) otherwise."""
-    return torch.where(zero_point == quant_min, scale, torch.full_like(scale, float("-inf")))
+def denominator_floor(
+    scale: torch.Tensor, zero_point: torch.Tensor, fake_quant_enabled: torch.Tensor, quant_min: int
+) -> torch.Tensor:
+    """Return one grid step on an enabled nonnegative grid, and -inf (no floor) otherwise.
+
+    The floor is zero-dimensional so a scalar denominator keeps its shape.
+    """
+    active = (zero_point == quant_min) & fake_quant_enabled.bool()
+    return torch.where(active, scale, torch.full_like(scale, float("-inf"))).reshape(())
 
 
 def insert_denominator_floors(gm: GraphModule) -> None:
@@ -35,7 +41,8 @@ def insert_denominator_floors(gm: GraphModule) -> None:
         with gm.graph.inserting_before(division):
             scale = gm.graph.get_attr(f"{denominator.target}.scale")
             zero_point = gm.graph.get_attr(f"{denominator.target}.zero_point")
-            floor = gm.graph.call_function(denominator_floor, (scale, zero_point, quant_min))
+            enabled = gm.graph.get_attr(f"{denominator.target}.fake_quant_enabled")
+            floor = gm.graph.call_function(denominator_floor, (scale, zero_point, enabled, quant_min))
             floored = gm.graph.call_function(_aten.clamp_min.Tensor, (denominator, floor))
         floored.meta[_FLOOR_META] = str(denominator.target)
         division.replace_input_with(denominator, floored)
@@ -49,13 +56,15 @@ def freeze_denominator_floors(gm: GraphModule) -> None:
             continue
         quantizer = gm.get_submodule(floored.meta[_FLOOR_META])
         denominator, floor = floored.args
-        scale, zero_point, quant_min = floor.args
-        step = float(denominator_floor(quantizer.scale, quantizer.zero_point, quant_min))
+        scale, zero_point, enabled, quant_min = floor.args
+        # The converted model always quantizes, so the frozen floor ignores the switch.
+        always = torch.ones_like(quantizer.fake_quant_enabled)
+        step = float(denominator_floor(quantizer.scale, quantizer.zero_point, always, quant_min))
         replacement = denominator
         if step > 0:
             with gm.graph.inserting_before(floored):
                 replacement = gm.graph.call_function(_aten.clamp_min.default, (denominator, step))
         floored.replace_all_uses_with(replacement)
-        for node in (floored, floor, scale, zero_point):
+        for node in (floored, floor, scale, zero_point, enabled):
             gm.graph.erase_node(node)
     gm.recompile()

@@ -5,6 +5,7 @@ import onnxruntime
 import pytest
 import torch
 from torch import nn
+from torch.ao.quantization import disable_fake_quant, disable_observer
 
 from sima_qat import (
     sima_export_onnx,
@@ -30,6 +31,12 @@ class SumNormalize(nn.Module):
 class Divide(nn.Module):
     def forward(self, x, y):
         return x / y
+
+
+class SumRatio(nn.Module):
+    def forward(self, x):
+        total = x.sum()
+        return total / (total + 1.0)
 
 
 def _softmax_input():
@@ -94,3 +101,21 @@ def test_signed_denominator_is_not_floored() -> None:
     sima_freeze_qat(qat_model)
     final = sima_finalize_qat_model(qat_model)
     assert torch.ops.aten.clamp_min.default not in [node.target for node in final.graph.nodes]
+
+
+def test_scalar_denominator_keeps_its_shape() -> None:
+    x = torch.rand(2, 8)
+    qat_model = sima_prepare_qat_model(SumRatio(), (x,), "cpu")
+    qat_model(x)
+    assert qat_model(x).shape == torch.Size([])
+
+
+def test_disabled_fake_quant_divides_in_float() -> None:
+    x = torch.ones(2, 8)
+    y = torch.linspace(1e-4, 1.0, 16).view(2, 8)
+    qat_model = sima_prepare_qat_model(Divide(), (x, y), "cpu")
+    qat_model(x, y)
+
+    qat_model.apply(disable_fake_quant)
+    qat_model.apply(disable_observer)
+    torch.testing.assert_close(qat_model(x, y), x / y)
