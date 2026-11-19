@@ -36,8 +36,8 @@ from sima_qat._batchnorm import (
     restore_folded_batchnorm_parameters,
 )
 from sima_qat._denominator_guard import (
-    freeze_denominator_guards,
-    insert_denominator_guards,
+    freeze_denominator_floors,
+    insert_denominator_floors,
 )
 from sima_qat.sima_quantizer import (
     SimaFakeQuantize,
@@ -147,7 +147,7 @@ def sima_prepare_qat_model(
     bn_settings = capture_batchnorm_settings(m, record_folding=True)
     gm = prepare_qat_pt2e(m, quantizer)
     restore_batchnorm_settings(gm, bn_settings, restore_folding=True)
-    insert_denominator_guards(gm)
+    insert_denominator_floors(gm)
     sima_mod = SimaQatWrapper(source=gm, label='scaffold')
     sima_mod.to(device)
     sima_mod.train()
@@ -980,7 +980,7 @@ def sima_finalize_qat_model(qat_model: GraphModule) -> GraphModule:
         sima_freeze_qat(qat_model)
     print(f"Removing QAT scaffold and quantizing network ...")
     _remove_batchnorm_tracking_updates(qat_model)
-    freeze_denominator_guards(qat_model)
+    freeze_denominator_floors(qat_model)
     folded_bn_parameters = capture_folded_batchnorm_parameters(qat_model)
     with warnings.catch_warnings():
         # Torch 2.8 can report a second erase for an overlapping Conv-BN
